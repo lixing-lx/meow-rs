@@ -167,3 +167,15 @@ test('no DHCP clients shows a hint to enable ARP steering', () => {
   view.showSteer(true);
   assert.equal(body[1].style.display, 'none');
 });
+
+test('newly bypassed neighbours remain visible when steering is hidden', () => {
+  const { view } = load({ ...base, arp: { enabled: '1' } });
+  const tree = view.render([null, null, hints, leases]);
+  const laptop = tableRows(tree).find(r => r.children[4]?.children === 'aa:bb:cc:00:00:01');
+  view.bypassChecks['aa:bb:cc:00:00:01'].checked = true;
+  view.showSteer(false);
+  assert.notEqual(laptop.style.display, 'none');
+  view.bypassChecks['aa:bb:cc:00:00:01'].checked = false;
+  view.showSteer(false);
+  assert.equal(laptop.style.display, 'none');
+});

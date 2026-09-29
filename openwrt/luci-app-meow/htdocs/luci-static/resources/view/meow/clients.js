@@ -160,10 +160,11 @@ return view.extend({
 
 		this.bypassChecks = {};
 		this.steerChecks = {};
-		// Shown only while ARP steering is enabled (Steer column, neighbour-only
-		// rows), and only while it is disabled (DHCP-only empty state).
+		// Steer cells and the DHCP-only empty state follow the ARP toggle.
+		// Neighbour rows also stay visible when their current Bypass tick is set.
 		this.arpOnly = [];
 		this.dhcpOnly = [];
+		this.neighbourRows = [];
 		this.initial = { arpEnabled: arpEnabled, steer: steer.slice().sort().join(' ') };
 
 		function arpOnly(node) { self.arpOnly.push(node); return node; }
@@ -227,7 +228,9 @@ return view.extend({
 				E('td', { 'class': 'td' }, c.mac),
 				E('td', { 'class': 'td' }, sourceLabel[c.source])
 			]);
-			rows.push(dhcpVisible(c) ? tr : arpOnly(tr));
+			rows.push(tr);
+			if (c.source === 'neighbour')
+				self.neighbourRows.push({ node: tr, bypass: bp });
 		});
 
 		var intro = E('p', {}, [
@@ -283,7 +286,11 @@ return view.extend({
 
 	showSteer: function(on) {
 		this.arpOnly.forEach(function(n) { n.style.display = on ? '' : 'none'; });
-		this.dhcpOnly.forEach(function(n) { n.style.display = on ? 'none' : ''; });
+		this.neighbourRows.forEach(function(row) {
+			row.node.style.display = on || row.bypass.checked ? '' : 'none';
+		});
+		var hasBypass = this.neighbourRows.some(function(row) { return row.bypass.checked; });
+		this.dhcpOnly.forEach(function(n) { n.style.display = on || hasBypass ? 'none' : ''; });
 	},
 
 	handleSaveApply: function() {

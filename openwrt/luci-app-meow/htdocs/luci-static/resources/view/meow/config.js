@@ -12,8 +12,6 @@
 // service is explicitly restarted after saving. Runtime changes through the
 // panel are written back to this file by its "Save Config" button.
 
-var SCRATCH = '/tmp/meow-luci-check.yaml';
-
 // YAML subscriptions can exceed ubus request limits. Use the same authenticated
 // multipart upload as LuCI's file picker; cgi-io enforces the file ACLs.
 function writeConfig(path, content) {
@@ -42,9 +40,15 @@ return view.extend({
 	},
 
 	validate: function(content) {
+		// Isolate simultaneous saves/validations, including other browser tabs.
+		// Reuse the token path supported by the validator and upload ACL.
+		var token = Array.from(crypto.getRandomValues(new Uint32Array(4)), function(n) {
+			return n.toString(16).padStart(8, '0');
+		}).join('');
+		var scratch = '/tmp/meow-luci-settings-' + token + '.yaml';
 
-		return writeConfig(SCRATCH, content).then(function() {
-			return fs.exec('/usr/libexec/meow-validate', ['check']);
+		return writeConfig(scratch, content).then(function() {
+			return fs.exec('/usr/libexec/meow-validate', [token]);
 		}).then(function(res) {
 			if (res.code === 0)
 				return null;
@@ -54,7 +58,7 @@ return view.extend({
 			var errors = out.filter(function(l) { return /ERROR|Error/.test(l); });
 			return (errors.length ? errors : out).join('\n') || _('Configuration test failed');
 		}).finally(function() {
-			return fs.remove(SCRATCH).catch(function() {});
+			return fs.remove(scratch).catch(function() {});
 		});
 	},
 
@@ -74,12 +78,15 @@ return view.extend({
 	},
 
 	handleSave: function(ev, path) {
+		if (this.saving) return this.saving;
 		var self = this;
-		var content = document.getElementById('meow-yaml').value.replace(/\r\n/g, '\n');
+		var textarea = document.getElementById('meow-yaml');
+		var original = textarea.value;
+		var content = original.replace(/\r\n/g, '\n');
 		if (!/\n$/.test(content))
 			content += '\n';
 
-		return Promise.resolve().then(function() {
+		return this.saving = Promise.resolve().then(function() {
 			content = settings.prepare(content);
 			return this.validate(content);
 		}.bind(this)).then(function(err) {
@@ -88,7 +95,8 @@ return view.extend({
 				return;
 			}
 			return writeConfig(path, content).then(function() {
-				document.getElementById('meow-yaml').value = content;
+				// Keep edits entered while validation/upload was in progress.
+				if (textarea.value === original) textarea.value = content;
 				self.saved = content;
 				self.updateStatus();
 				return meow.serviceRunning().then(function(running) {
@@ -110,6 +118,8 @@ return view.extend({
 			});
 		}).catch(function(e) {
 			ui.addNotification(null, E('p', _('Unable to save: %s').format(e.message)));
+		}).finally(function() {
+			self.saving = null;
 		});
 	},
 

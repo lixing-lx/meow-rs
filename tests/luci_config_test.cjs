@@ -6,14 +6,14 @@ const { test } = require('node:test');
 const vm = require('node:vm');
 const source = readFileSync(require('node:path').join(__dirname,
   '../openwrt/luci-app-meow/htdocs/luci-static/resources/view/meow/config.js'), 'utf8');
-const scratch = '/tmp/meow-luci-check.yaml';
+const scratchPattern = /^\/tmp\/meow-luci-settings-[0-9a-f]{32}\.yaml$/;
 const path = '/etc/meow/config.yaml';
 
 function setup(options = {}) {
   const uploads = [], notifications = [], removed = [], calls = [];
   const content = options.content ?? 'rules:\r\n  - MATCH,🎯Direct';
   const context = vm.createContext({
-    Blob, FormData,
+    Blob, FormData, crypto: require('node:crypto').webcrypto,
     meow: { serviceRunning: async () => !!options.running },
     settings: { prepare: value => {
       if (options.transformError) throw new Error(options.transformError);
@@ -45,7 +45,7 @@ function setup(options = {}) {
           return options.restartResult ?? { code: 0 };
         }
         assert.equal(command, '/usr/libexec/meow-validate');
-        assert.deepEqual(Array.from(args), ['check']);
+        assert.match(args[0], /^[0-9a-f]{32}$/);
         calls.push('validate');
         if (options.execError) throw new Error(options.execError);
         return options.result ?? { code: 0 };
@@ -60,6 +60,7 @@ function setup(options = {}) {
       const payload = await data.get('filedata').text();
       uploads.push({ target, payload });
       calls.push(target);
+      if (options.onUpload) await options.onUpload(target, payload);
       if (target === path && options.saveError) throw new Error(options.saveError);
       if (options.networkError) throw new Error(options.networkError);
       return {
@@ -86,9 +87,11 @@ test('large Unicode YAML loads and saves without RPC file transfers', async () =
   assert.deepEqual(actions.map(b => String(b.children)), ['Revert', 'Validate', 'Save']);
   assert.ok(actions.every(b => b.attrs.type === 'button'));
   await actions[2].attrs.click({});
+  const scratch = state.uploads[0].target;
+  assert.match(scratch, scratchPattern);
   assert.deepEqual(state.calls, [scratch, 'validate', path]);
   assert.deepEqual(state.uploads.map(u => u.payload), Array(2).fill(state.content.replace(/\r\n/g, '\n')));
-  assert.deepEqual(state.removed, [scratch]);
+  assert.deepEqual(state.removed, [state.uploads[0].target]);
   assert.match(messages(state), /Configuration saved/);
   assert.doesNotMatch(JSON.stringify(tree), /<code>/);
 });
@@ -105,7 +108,7 @@ for (const result of [{ code: 1, stderr: '\x1b[31mERROR bad YAML\x1b[0m' }, { co
     await state.view.handleSave(null, path);
     assert.equal(state.uploads.length, 1);
     assert.match(messages(state), /Invalid configuration, not saved/);
-    assert.deepEqual(state.removed, [scratch]);
+    assert.deepEqual(state.removed, [state.uploads[0].target]);
   });
 }
 
@@ -119,7 +122,7 @@ for (const options of [
     const state = setup(options);
     await state.view.handleSave(null, path);
     assert.equal(state.uploads.length, 1);
-    assert.deepEqual(state.removed, [scratch]);
+    assert.deepEqual(state.removed, [state.uploads[0].target]);
     assert.match(messages(state), /Unable to save/);
     assert.doesNotMatch(messages(state), /Configuration saved/);
   });
@@ -134,6 +137,8 @@ test('Validate reports transport errors', async () => {
 test('a failed final upload does not claim the configuration was saved', async () => {
   const state = setup({ saveError: 'No space left on device' });
   await state.view.handleSave(null, path);
+  const scratch = state.uploads[0].target;
+  assert.match(scratch, scratchPattern);
   assert.deepEqual(state.calls, [scratch, 'validate', path]);
   assert.match(messages(state), /Unable to save.*No space left on device/);
   assert.doesNotMatch(messages(state), /Configuration saved/);
@@ -157,6 +162,8 @@ test('Configuration Save reapplies LuCI settings before validation and live uplo
   })[key] } });
   const state = setup({ content: 'rules: []\ndns: {enable: true, listen: 127.0.0.1:7874}\n', prepare: helper.prepare });
   await state.view.handleSave(null, path);
+  const scratch = state.uploads[0].target;
+  assert.match(scratch, scratchPattern);
   assert.deepEqual(state.calls, [scratch, 'validate', path]);
   const saved = yaml.parseDocument(state.uploads[1].payload).toJS();
   assert.equal(saved.listeners[0].port, 7893);
@@ -173,6 +180,8 @@ test('YAML synchronization errors prevent uploads and are reported', async () =>
 test('saving reloads a running service after writing the validated YAML', async () => {
   const state = setup({ running: true });
   await state.view.handleSave(null, path);
+  const scratch = state.uploads[0].target;
+  assert.match(scratch, scratchPattern);
   assert.deepEqual(state.calls, [scratch, 'validate', path, 'restart']);
   assert.match(messages(state), /service restarted/);
 });
@@ -223,4 +232,70 @@ test('editor tracks unsaved changes, reverts, and indents with spaces', async ()
   for (let i = 0; i < 20 && state.view.dirty; i++) await new Promise(r => setTimeout(r, 5));
   assert.equal(state.uploads.at(-1).payload, 'a: 2\n');
   assert.equal(state.view.dirty, false);
+});
+
+// Hold an upload open to exercise keyboard/button races without timing sleeps.
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test('overlapping keyboard saves share one operation and preserve newer edits', { timeout: 2000 }, async () => {
+  const entered = deferred(), release = deferred();
+  const textarea = { value: 'a: 1\n' };
+  const state = setup({ textarea, onUpload: async target => {
+    if (target === path) { entered.resolve(); await release.promise; }
+  } });
+  state.view.render({ path, content: textarea.value });
+  const saving = state.view.handleSave(null, path);
+  await entered.promise;
+  textarea.value = 'a: 2\n';
+  state.view.updateStatus();
+  const repeated = state.view.handleSave(null, path);
+  release.resolve();
+  await Promise.all([saving, repeated]);
+  assert.equal(state.uploads.filter(u => u.target === path).length, 1);
+  assert.equal(textarea.value, 'a: 2\n');
+  assert.equal(state.view.saved, 'a: 1\n');
+  assert.equal(state.view.dirty, true);
+  await state.view.handleSave(null, path);
+  assert.equal(state.view.saved, 'a: 2\n');
+  assert.equal(state.view.dirty, false);
+});
+
+test('concurrent validations use separate scratch files', async () => {
+  const state = setup();
+  await Promise.all([state.view.validate('a: 1\n'), state.view.validate('a: 2\n')]);
+  const targets = state.uploads.map(u => u.target);
+  assert.ok(targets.every(t => scratchPattern.test(t)));
+  assert.equal(new Set(targets).size, 2);
+  assert.deepEqual(state.removed.sort(), targets.sort());
+});
+
+test('edits typed during an upload are retained as unsaved', { timeout: 2000 }, async () => {
+  const entered = deferred(), release = deferred();
+  const textarea = { value: 'a: 1\n' };
+  const state = setup({ textarea, onUpload: async target => {
+    if (target === path) { entered.resolve(); await release.promise; }
+  } });
+  state.view.render({ path, content: textarea.value });
+  const saving = state.view.handleSave(null, path);
+  await entered.promise;
+  textarea.value = 'a: 2\n';
+  release.resolve();
+  await saving;
+  assert.equal(textarea.value, 'a: 2\n');
+  assert.equal(state.view.saved, 'a: 1\n');
+  assert.equal(state.view.dirty, true);
+});
+
+test('a failed save releases the guard so the user can retry', async () => {
+  const options = { saveError: 'No space left' };
+  const state = setup(options);
+  await state.view.handleSave(null, path);
+  options.saveError = null;
+  await state.view.handleSave(null, path);
+  assert.equal(state.uploads.filter(u => u.target === path).length, 2);
+  assert.match(messages(state), /Configuration saved/);
 });
