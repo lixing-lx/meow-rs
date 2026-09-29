@@ -10,6 +10,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **SOCKS5 UDP ASSOCIATE through `dialer-proxy` chains** — a socks5 node's
+  relay datagrams now ride the front proxy's own `dial_udp` association to
+  the server-advertised `BND.ADDR` relay endpoint (mihomo
+  `proxyDialer.ListenPacket`), reusing the `dial_udp_conn`/`supports_udp`
+  dialer plumbing from the Shadowsocks chain. The TCP control connection
+  chains as before and keeps governing the association's lifetime; a
+  `0.0.0.0` bound address is rewritten to the resolved server IP before
+  the front is dialed. Chained reads restore the connected-socket filter
+  (foreign wire sources and malformed datagrams drop per-packet), writes
+  verify frame size and atomicity, and a UDP-less front refuses at dial
+  time with `NotSupported` — no raw-socket fallback.
+
 - **Shadowsocks UDP relay through `dialer-proxy` chains** — an SS node's
   plain UDP association now rides the front proxy's own UDP relay
   (`dial_udp`) instead of being refused, matching mihomo's

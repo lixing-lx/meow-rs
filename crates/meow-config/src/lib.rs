@@ -1097,12 +1097,13 @@ const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 /// `ss` + external SIP003). The fallback never degrades to a direct dial, so
 /// a configured chain cannot be silently bypassed.
 ///
-/// UDP: Shadowsocks plain relay now chains — the front proxy opens a UDP
-/// association to the SS server's endpoint and the ciphertext rides it
-/// (mihomo `proxyDialer.ListenPacket` parity), failing closed when the
-/// front cannot carry UDP. Transports that still cannot chain (SOCKS5 UDP
-/// ASSOCIATE) refuse rather than leak the real source path; mux-based UDP
-/// rides the dialer over TCP and is unaffected.
+/// UDP: Shadowsocks plain relay and SOCKS5 UDP ASSOCIATE now chain — the
+/// front proxy opens a UDP association to the inner node's datagram
+/// endpoint and the protocol framing rides it (mihomo
+/// `proxyDialer.ListenPacket` parity), failing closed when the front
+/// cannot carry UDP. Datagram transports that still cannot chain refuse
+/// rather than leak the real source path; mux-based UDP rides the dialer
+/// over TCP and is unaffected.
 ///
 /// A self-referencing dialer, a reference to a name the config does not
 /// declare, or a dialer cycle is a hard config error — silently falling back to

@@ -713,10 +713,12 @@ The following are unsupported or intentionally rejected:
     `trojan`, `anytls`, and `ss` — except `ss` with an external SIP003 plugin)
     and otherwise fails loudly at dial time (`hysteria2` stays unsupported:
     QUIC cannot ride a TCP stream). It never degrades to a silent direct dial.
-  - *UDP* — associations whose datagrams ride a raw socket cannot follow the TCP
-    chain (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE) and are refused
-    rather than leaking the real source path. UDP carried inside a mux session
-    (`smux`/`yamux`/`h2mux`) does traverse the chain and keeps working.
+  - *UDP* — datagram associations now follow the chain too (Shadowsocks plain
+    relay, SOCKS5 UDP ASSOCIATE): the front proxy opens its own UDP
+    association to the inner node's advertised datagram endpoint and the
+    protocol framing rides it, failing closed when the front cannot carry
+    UDP rather than leaking the real source path. UDP carried inside a mux
+    session (`smux`/`yamux`/`h2mux`) traverses the chain as before.
 
   `dialer-proxy` on **provider-sourced nodes** is honoured too (issue #489):
   the name resolves against the live route map at dial time — static proxies

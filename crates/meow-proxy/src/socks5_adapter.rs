@@ -7,10 +7,12 @@
 //!   0x01 (IPv4) or 0x04 (IPv6) otherwise.
 //! - Optional TLS-wrapping of the TCP control connection to the proxy server.
 //! - `CMD UDP ASSOCIATE` (0x03) when `udp: true` — relays UDP (incl. QUIC /
-//!   HTTP/3) via a side UDP socket, wrapping each datagram in the RFC 1928 §7
-//!   header. The TCP control connection is held open for the association's
+//!   HTTP/3) via a side UDP transport, wrapping each datagram in the RFC 1928
+//!   §7 header. The TCP control connection is held open for the association's
 //!   lifetime. The UDP relay path is plain (not TLS-wrapped), per the SOCKS5
-//!   spec.
+//!   spec. Under `dialer-proxy` the relay datagrams ride the front proxy's
+//!   own `dial_udp` association to the advertised relay endpoint (mihomo
+//!   `proxyDialer.ListenPacket`); a UDP-less front fails closed.
 //!
 //! upstream: `adapter/outbound/socks5.go`
 
@@ -374,14 +376,34 @@ impl Socks5Adapter {
         }
 
         let relay = read_socks5_addr(stream, resp_hdr[3]).await?;
+        // A zero BND port is not a usable relay endpoint (mihomo rejects it
+        // as a malformed server address) — refuse rather than blackhole.
+        if relay.port() == 0 {
+            return Err(MeowError::Proxy(format!(
+                "socks5: server advertised unusable relay {relay}"
+            )));
+        }
         // Rewrite a wildcard bound address to the proxy server's own address.
+        // Prefer a candidate in the wildcard's own family — `0.0.0.0` BND
+        // means "same host, on this v4 socket": a dual-stack hostname must
+        // not substitute a v6 address the relay never bound (mihomo resolves
+        // with the node's IPv4-prefer for the same reason). Note the resolve
+        // is *local* while the control conn's endpoint was resolved by the
+        // front: split-horizon/GeoDNS can in principle bind the relay to a
+        // different backend — a domain-carrying `dial_udp_conn` is the real
+        // fix; until then this matches mihomo's exposure.
         if relay.ip().is_unspecified() {
             let candidates = meow_common::resolve_host_all(&self.server, relay.port())
                 .await
                 .map_err(MeowError::Io)?;
-            return candidates.into_iter().next().ok_or_else(|| {
-                MeowError::Proxy(format!("socks5: cannot resolve relay host {}", self.server))
-            });
+            return candidates
+                .iter()
+                .find(|c| c.is_ipv4() == relay.is_ipv4())
+                .or_else(|| candidates.first())
+                .copied()
+                .ok_or_else(|| {
+                    MeowError::Proxy(format!("socks5: cannot resolve relay host {}", self.server))
+                });
         }
         Ok(relay)
     }
@@ -545,10 +567,19 @@ impl ProxyAdapter for Socks5Adapter {
     }
 
     fn support_udp(&self) -> bool {
-        // UDP ASSOCIATE sends datagrams to the server-provided relay endpoint
-        // over a raw socket that bypasses the TCP dialer, so it cannot ride a
-        // `dialer-proxy` chain — see `dial_udp` for the enforcement.
-        self.udp && !self.dialer.is_proxy()
+        // The UDP-ASSOCIATE datagrams ride the front proxy's own `dial_udp`
+        // under `dialer-proxy` (mihomo `proxyDialer.ListenPacket`), so a
+        // proxy dialer is fine *when the front advertises UDP* — a
+        // point-in-time snapshot for group fronts; `dial_udp` re-checks at
+        // dial time and fails closed on a front that cannot carry UDP.
+        //
+        // Two consumers read this advertisement: the rule probe treats a
+        // UDP flow matched to a `!support_udp` target as ineligible and
+        // skips to the next rule (tunnel.rs `RouteTargetProbe`), and
+        // LoadBalance filters members by it.  It is NOT the enforcement
+        // point — `dial_udp` refuses on its own, so a stale optimistic
+        // snapshot cannot open a raw socket.
+        self.udp && (!self.dialer.is_proxy() || self.dialer.supports_udp())
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -575,19 +606,19 @@ impl ProxyAdapter for Socks5Adapter {
             ));
         }
 
-        // Only the TCP control connection below goes through `self.dialer`.
-        // The datagram socket is bound raw and connected straight to the
-        // relay endpoint the server advertises, so with a `ProxyDialer`
-        // installed the UDP payload would egress from the real source path
-        // while TCP rides the front proxy.  Refuse rather than leak
-        // (Class A, ADR-0002).  Enforced here because the tunnel's UDP
-        // dispatch calls `dial_udp` without consulting `support_udp`.
-        if self.dialer.is_proxy() {
-            return Err(MeowError::NotSupported(
-                "socks5: UDP ASSOCIATE bypasses `dialer-proxy` (raw relay \
-                 socket); refusing to leak the real source path"
-                    .into(),
-            ));
+        // Fail-closed (Class A, ADR-0002): a front that cannot carry UDP
+        // refuses here — *before* the control connection is spent — with
+        // `NotSupported`, the capability-refusal class exempt from group
+        // dead-marking.  The raw-socket path below stays unreachable under
+        // `dialer-proxy`: no silent real-source egress.  Enforced here
+        // because the tunnel's UDP dispatch calls `dial_udp` without
+        // consulting `support_udp`.
+        if self.dialer.is_proxy() && !self.dialer.supports_udp() {
+            return Err(MeowError::NotSupported(format!(
+                "socks5: `dialer-proxy` front cannot carry UDP (unsupported \
+                 or unresolvable); refusing to leak the real source path ({})",
+                self.addr_str
+            )));
         }
 
         // The UDP association is bound to the lifetime of this TCP control
@@ -600,6 +631,34 @@ impl ProxyAdapter for Socks5Adapter {
             self.server, self.port, relay
         );
 
+        // mihomo `proxyDialer.ListenPacket`: under `dialer-proxy` the relay
+        // datagrams ride the front proxy's own `dial_udp` association bound
+        // to the advertised relay endpoint — the SOCKS5 UDP header still
+        // wraps the per-packet destinations, the front only sees `relay`.
+        if self.dialer.is_proxy() {
+            let conn = self
+                .dialer
+                .dial_udp_conn(relay, metadata.is_internal())
+                .await
+                .map_err(|e| {
+                    // The dialer maps front `NotSupported`/`UdpNotSupported`
+                    // to `ErrorKind::Unsupported` — a capability refusal, not
+                    // a transport failure: keep the class so the node is not
+                    // dead-marked over a UDP-less front.
+                    if e.kind() == std::io::ErrorKind::Unsupported {
+                        MeowError::NotSupported(format!("socks5 udp via dialer-proxy {relay}: {e}"))
+                    } else {
+                        MeowError::Io(e)
+                    }
+                })?;
+            debug!("socks5: UDP chained to relay {relay} via {}", self.addr_str);
+            return Ok(Box::new(Socks5UdpConn {
+                transport: Socks5UdpTransport::Chained(conn),
+                relay,
+                _control: ControlGuard::spawn(control),
+            }));
+        }
+
         let bind: SocketAddr = if relay.is_ipv4() {
             "0.0.0.0:0".parse().expect("static")
         } else {
@@ -609,7 +668,8 @@ impl ProxyAdapter for Socks5Adapter {
         socket.connect(relay).await.map_err(MeowError::Io)?;
 
         Ok(Box::new(Socks5UdpConn {
-            socket,
+            transport: Socks5UdpTransport::Raw(socket),
+            relay,
             _control: ControlGuard::spawn(control),
         }))
     }
@@ -679,10 +739,19 @@ impl Drop for ControlGuard {
 }
 
 /// A SOCKS5 UDP-ASSOCIATE relay socket. Each datagram is wrapped/unwrapped in
-/// the RFC 1928 §7 UDP request header; the socket is `connect()`ed to the
-/// proxy's relay endpoint.
+/// the RFC 1928 §7 UDP request header; the transport is `connect()`ed to the
+/// proxy's relay endpoint — a raw socket directly, or the front proxy's own
+/// `dial_udp` association under `dialer-proxy`.
+enum Socks5UdpTransport {
+    Raw(UdpSocket),
+    Chained(Arc<dyn ProxyPacketConn>),
+}
+
 struct Socks5UdpConn {
-    socket: UdpSocket,
+    transport: Socks5UdpTransport,
+    /// The advertised relay endpoint: chained datagrams are written to it
+    /// and chained reads are filtered against it (connected-socket parity).
+    relay: SocketAddr,
     _control: ControlGuard,
 }
 
@@ -690,11 +759,34 @@ struct Socks5UdpConn {
 impl ProxyPacketConn for Socks5UdpConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         // A malformed relay datagram is per-datagram: it is already
-        // consumed from the socket, so skip it instead of letting one
-        // junk packet kill the whole association (upstream mihomo treats
-        // decode failures the same way).
+        // consumed from the transport, so skip it instead of letting one
+        // junk packet kill the whole association (mihomo propagates the
+        // decode error and tears the session down; dropping is strictly
+        // more resilient and matches this crate's SS arm).
         loop {
-            let n = self.socket.recv(buf).await.map_err(MeowError::Io)?;
+            let n = match &self.transport {
+                Socks5UdpTransport::Raw(socket) => socket.recv(buf).await.map_err(MeowError::Io)?,
+                Socks5UdpTransport::Chained(conn) => {
+                    let (rn, outer_src) = conn.read_packet(buf).await?;
+                    // Per-packet fronts report the real wire source and can
+                    // deliver datagrams from arbitrary remotes — restore the
+                    // connected-socket filter the Raw arm has.  Bound conns
+                    // report `relay` or an unspecified addr (no source info);
+                    // unspecified skips the check rather than breaking them.
+                    // `to_canonical` collapses IPv4-mapped IPv6 forms so a
+                    // representation difference can't wedge the association.
+                    let same_src = outer_src.ip().to_canonical() == self.relay.ip().to_canonical()
+                        && outer_src.port() == self.relay.port();
+                    if !same_src && !outer_src.ip().to_canonical().is_unspecified() {
+                        debug!(
+                            "socks5 udp: dropped chained datagram from {outer_src} (expected {})",
+                            self.relay
+                        );
+                        continue;
+                    }
+                    rn
+                }
+            };
             match decode_udp_datagram(buf, n) {
                 Ok(ok) => return Ok(ok),
                 Err(e) => debug!("socks5 udp: dropping malformed relay datagram: {e}"),
@@ -706,16 +798,48 @@ impl ProxyPacketConn for Socks5UdpConn {
         let mut pkt: SmallVec<[u8; 1500]> = SmallVec::new();
         encode_udp_header(&mut pkt, addr);
         pkt.extend_from_slice(data);
-        self.socket.send(&pkt).await.map_err(MeowError::Io)?;
+        match &self.transport {
+            Socks5UdpTransport::Raw(socket) => {
+                socket.send(&pkt).await.map_err(MeowError::Io)?;
+            }
+            Socks5UdpTransport::Chained(conn) => {
+                // The wire destination is always the relay endpoint — the
+                // caller's `addr` already went inside the SOCKS5 header.
+                // Reject frames a stream-framed front could not carry
+                // (u16 length prefix) and verify datagram atomicity.
+                if pkt.len() > u16::MAX as usize {
+                    return Err(MeowError::Proxy(format!(
+                        "socks5 udp: {}B datagram exceeds the u16 frame limit",
+                        pkt.len()
+                    )));
+                }
+                let n = conn.write_packet(&pkt, &self.relay).await?;
+                if n != pkt.len() {
+                    return Err(MeowError::Proxy(format!(
+                        "socks5 udp: short write on chained conn ({n} < {})",
+                        pkt.len()
+                    )));
+                }
+            }
+        }
         Ok(data.len())
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().map_err(MeowError::Io)
+        match &self.transport {
+            Socks5UdpTransport::Raw(socket) => socket.local_addr().map_err(MeowError::Io),
+            Socks5UdpTransport::Chained(conn) => conn.local_addr(),
+        }
     }
 
     fn close(&self) -> Result<()> {
-        Ok(())
+        // Closing the control conn ends the association server-side
+        // (RFC 1928 §7) — mihomo's `packetConn.Close()` does the same.
+        self._control.0.abort();
+        match &self.transport {
+            Socks5UdpTransport::Chained(conn) => conn.close(),
+            Socks5UdpTransport::Raw(_) => Ok(()),
+        }
     }
 }
 
@@ -730,6 +854,9 @@ mod tests {
 
     use super::*;
     use meow_common::MeowError;
+
+    /// "command not supported" — only the refusal test needs it.
+    const REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 
     // ─── Mock SOCKS5 server ───────────────────────────────────────────────────
 
@@ -918,10 +1045,10 @@ mod tests {
         }
     }
 
-    /// Regression: only the TCP control connection follows the dialer. The
-    /// datagram socket is bound raw and connected to the server-advertised
-    /// relay, so under a proxy dialer the association must be refused rather
-    /// than egressing from the real source path.
+    /// Fail-closed under `dialer-proxy`: a front that cannot carry UDP must
+    /// refuse the association — `NotSupported`, the capability-refusal class
+    /// exempt from group dead-marking — rather than egressing the relay
+    /// datagrams from a raw socket on the real source path.
     ///
     /// Enforced in `dial_udp` because the tunnel's UDP dispatch calls it
     /// directly without consulting `support_udp()`.
@@ -1018,6 +1145,504 @@ mod tests {
             *dialer.seen.lock().unwrap(),
             Some(false),
             "user dial must propagate internal=false"
+        );
+    }
+
+    // ─── Chained UDP (`dialer-proxy`) ────────────────────────────────────────
+
+    /// Mock SOCKS5 server that answers `UDP ASSOCIATE` with a fixed
+    /// `BND.ADDR`, then holds the control connection open until the client
+    /// drops it (association lifetime, RFC 1928 §7).
+    async fn spawn_associate_server(
+        bnd: SocketAddr,
+        rep: u8,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Method negotiation → no-auth.
+            let mut hdr = [0u8; 2];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut methods = vec![0u8; hdr[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VERSION, METHOD_NO_AUTH]).await.unwrap();
+            // Request header; assert it is UDP ASSOCIATE.
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).await.unwrap();
+            assert_eq!(req[0], VERSION);
+            assert_eq!(req[1], CMD_UDP_ASSOCIATE);
+            drain_socks5_addr(&mut s, req[3]).await.unwrap();
+            // Reply VER REP RSV ATYP BND.ADDR BND.PORT.
+            let mut resp = vec![VERSION, rep, RESERVED];
+            match bnd.ip() {
+                IpAddr::V4(v4) => {
+                    resp.push(ATYP_IPV4);
+                    resp.extend_from_slice(&v4.octets());
+                }
+                IpAddr::V6(v6) => {
+                    resp.push(ATYP_IPV6);
+                    resp.extend_from_slice(&v6.octets());
+                }
+            }
+            resp.extend_from_slice(&bnd.port().to_be_bytes());
+            s.write_all(&resp).await.unwrap();
+            // Hold the control conn open until the client hangs up.
+            let mut sink = [0u8; 64];
+            while s.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+        (addr, handle)
+    }
+
+    /// Scripted front `ProxyPacketConn`: reads yield injected
+    /// `(datagram, wire-src)` pairs, writes record `(frame, wire-dst)`.
+    struct ScriptedFront {
+        inbound: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+        written: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+        bound: SocketAddr,
+        /// Truncate every `write_packet` to half the frame — exercises the
+        /// datagram-atomicity check on the chained arm.
+        short_write: std::sync::atomic::AtomicBool,
+        /// Set by `close()` — proves the Chained arm delegates teardown.
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for ScriptedFront {
+        async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+            let (data, src) = self
+                .inbound
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| MeowError::Proxy("scripted front closed".into()))?;
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok((n, src))
+        }
+
+        async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
+            self.written.lock().unwrap().push((buf.to_vec(), *addr));
+            if self.short_write.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(buf.len() / 2);
+            }
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(self.bound)
+        }
+
+        fn close(&self) -> Result<()> {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// `dialer-proxy` fake: the TCP control conn is a real connection to the
+    /// mock SOCKS5 server; `dial_udp_conn` returns the scripted front conn —
+    /// or a scripted error, for the stale-capability-snapshot arm.
+    struct ChainedDialer {
+        server_addr: std::net::SocketAddr,
+        front: std::sync::Mutex<Option<Arc<ScriptedFront>>>,
+        udp_dialed: std::sync::Mutex<Vec<SocketAddr>>,
+        udp_ok: bool,
+        /// When set, `dial_udp_conn` fails with this `ErrorKind` — models a
+        /// group front that rotated to a UDP-less member between the
+        /// `supports_udp()` snapshot and the dial.
+        dial_udp_err: Option<std::io::ErrorKind>,
+        /// `internal` flags seen on `dial_udp_conn` — proves metadata
+        /// propagation through the chained leg.
+        seen_internal: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for ChainedDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+            _internal: bool,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Ok(Box::new(TcpStream::connect(self.server_addr).await?))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+
+        fn supports_udp(&self) -> bool {
+            self.udp_ok
+        }
+
+        async fn dial_udp_conn(
+            &self,
+            remote: SocketAddr,
+            internal: bool,
+        ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
+            self.seen_internal.lock().unwrap().push(internal);
+            if let Some(kind) = self.dial_udp_err {
+                return Err(std::io::Error::new(kind, "scripted dial_udp_conn failure"));
+            }
+            self.udp_dialed.lock().unwrap().push(remote);
+            self.front
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|f| f as Arc<dyn ProxyPacketConn>)
+                .ok_or_else(|| std::io::Error::other("no scripted front"))
+        }
+    }
+
+    fn encode_socks5_datagram(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut pkt: SmallVec<[u8; 1500]> = SmallVec::new();
+        encode_udp_header(&mut pkt, &src);
+        pkt.extend_from_slice(payload);
+        pkt.to_vec()
+    }
+
+    /// The chained dial must reach the *advertised* relay endpoint — the
+    /// inner datagram target stays inside the SOCKS5 UDP header.
+    #[tokio::test]
+    async fn chained_udp_dials_front_to_advertised_relay() {
+        let relay: SocketAddr = "10.200.1.1:5300".parse().unwrap();
+        let (srv, server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        assert!(adapter.support_udp(), "capable front must advertise UDP");
+
+        let conn = adapter
+            .dial_udp(&meta_with_host("example.com", 443))
+            .await
+            .expect("dial_udp");
+        assert_eq!(
+            dialer.udp_dialed.lock().unwrap().as_slice(),
+            &[relay],
+            "the front association must be bound to the advertised relay"
+        );
+        assert_eq!(
+            dialer.seen_internal.lock().unwrap().as_slice(),
+            &[false],
+            "user metadata must propagate internal=false to the front dial"
+        );
+
+        // Write: wire dst is `relay`; the caller's target lives in the header.
+        let target: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        conn.write_packet(b"payload", &target).await.unwrap();
+        let (frame, wire_dst) = front.written.lock().unwrap().remove(0);
+        assert_eq!(wire_dst, relay);
+        let mut dec = frame.clone();
+        let (data_len, inner_src) = decode_udp_datagram(&mut dec, frame.len()).unwrap();
+        assert_eq!(inner_src, target);
+        assert_eq!(&dec[..data_len], b"payload");
+
+        // Read: a well-formed reply from the relay decodes back to the target.
+        tx.send((encode_socks5_datagram(target, b"pong"), relay))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (n, src) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(src, target);
+        assert_eq!(&buf[..n], b"pong");
+
+        // close() delegates to the front conn and aborts the control-conn
+        // guard; the drop path then finishes the teardown chain — the mock
+        // server observes EOF and exits (RFC 1928 §7 association teardown).
+        conn.close().unwrap();
+        assert!(
+            front.closed.load(std::sync::atomic::Ordering::Relaxed),
+            "close() must delegate to the front conn"
+        );
+        drop(conn);
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server must observe control-conn EOF")
+            .expect("server task");
+    }
+
+    /// A server-side ASSOCIATE refusal (`rep != 0`) surfaces as
+    /// `Socks5ConnectFailed` — same on the chained arm — and the control
+    /// conn is dropped so the server sees the teardown.
+    #[tokio::test]
+    async fn chained_udp_associate_refusal_is_connect_failed() {
+        let relay: SocketAddr = "10.200.1.9:5300".parse().unwrap();
+        let (srv, server) = spawn_associate_server(relay, REPLY_COMMAND_NOT_SUPPORTED).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+
+        match adapter.dial_udp(&meta_with_host("example.com", 443)).await {
+            Err(MeowError::Socks5ConnectFailed(REPLY_COMMAND_NOT_SUPPORTED)) => {}
+            Err(e) => panic!("expected Socks5ConnectFailed, got: {e:?}"),
+            Ok(_) => panic!("a refused ASSOCIATE must not produce a conn"),
+        }
+        assert!(
+            dialer.udp_dialed.lock().unwrap().is_empty(),
+            "no front association may be spent on a refused ASSOCIATE"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server must observe control-conn EOF")
+            .expect("server task");
+    }
+
+    /// Chained reads restore the connected-socket filter: datagrams whose
+    /// wire source is a specified address other than the relay — and
+    /// malformed relay datagrams — are per-datagram drops, never fatal.
+    #[tokio::test]
+    async fn chained_udp_drops_foreign_source_and_junk() {
+        let relay: SocketAddr = "10.200.1.2:5300".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            dialer as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let conn = adapter
+            .dial_udp(&meta_with_host("example.com", 443))
+            .await
+            .expect("dial_udp");
+
+        let target: SocketAddr = "5.6.7.8:53".parse().unwrap();
+        // Foreign wire source → dropped.
+        let foreign: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+        tx.send((encode_socks5_datagram(target, b"spoof"), foreign))
+            .await
+            .unwrap();
+        // Malformed relay datagram → dropped.
+        tx.send((b"\xde\xad".to_vec(), relay)).await.unwrap();
+        // FRAG ≠ 0 (we do not reassemble) → dropped.
+        let mut frag = encode_socks5_datagram(target, b"frag");
+        frag[2] = 1;
+        tx.send((frag, relay)).await.unwrap();
+        // Bound conns report no wire source (`0.0.0.0:0` — e.g. a VLESS
+        // UoT front): the filter must skip the check, not wedge them.
+        let unspecified: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        tx.send((encode_socks5_datagram(target, b"ok"), unspecified))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 256];
+        let (n, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("read must skip junk, not hang")
+        .unwrap();
+        assert_eq!(src, target);
+        assert_eq!(&buf[..n], b"ok");
+    }
+
+    /// A `0.0.0.0` BND address ("same host as the control connection") must
+    /// be rewritten to the resolved server address before the front is
+    /// dialed — the `SocketAddr`-keyed `dial_udp_conn` cannot carry a
+    /// wildcard. Matches mihomo's unspecified-BND substitution.
+    #[tokio::test]
+    async fn chained_udp_wildcard_bnd_rewritten_to_server_ip() {
+        let relay: SocketAddr = "0.0.0.0:5301".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: "127.0.0.1:5301".parse().unwrap(),
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let _conn = adapter
+            .dial_udp(&meta_with_host("example.com", 443))
+            .await
+            .expect("dial_udp");
+        let dialed = dialer.udp_dialed.lock().unwrap().clone();
+        assert_eq!(dialed.len(), 1);
+        assert_eq!(dialed[0].ip().to_string(), "127.0.0.1");
+        assert_eq!(dialed[0].port(), 5301);
+    }
+
+    /// Stale capability snapshot: `supports_udp()` passed, but the front
+    /// refuses at dial time (e.g. a group rotated to a UDP-less member).
+    /// The dialer's `ErrorKind::Unsupported` must reconstitute
+    /// `MeowError::NotSupported` — the exact variant that stays exempt from
+    /// group dead-marking.
+    #[tokio::test]
+    async fn chained_udp_maps_unsupported_to_notsupported() {
+        let relay: SocketAddr = "10.200.1.3:5300".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: Some(std::io::ErrorKind::Unsupported),
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            dialer as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+
+        match adapter.dial_udp(&meta_with_host("example.com", 443)).await {
+            Err(MeowError::NotSupported(_)) => {}
+            Err(e) => panic!("expected NotSupported, got: {e:?}"),
+            Ok(_) => panic!("a front refusal must not produce a live conn"),
+        }
+    }
+
+    /// Chained writes must reject a frame that exceeds the u16 limit a
+    /// stream-framed front could carry, and any short write on the front
+    /// conn (datagram atomicity — a torn SOCKS5 datagram would desync).
+    #[tokio::test]
+    async fn chained_udp_rejects_oversized_and_short_writes() {
+        let relay: SocketAddr = "10.200.1.4:5300".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            dialer as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let conn = adapter
+            .dial_udp(&meta_with_host("example.com", 443))
+            .await
+            .expect("dial_udp");
+        let target: SocketAddr = "1.2.3.4:443".parse().unwrap();
+
+        // header(10) + u16::MAX payload already overflows the frame limit.
+        let huge = vec![0u8; u16::MAX as usize];
+        assert!(
+            conn.write_packet(&huge, &target).await.is_err(),
+            "oversized frame must be rejected, not wrapped into the stream"
+        );
+
+        front
+            .short_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            conn.write_packet(b"payload", &target).await.is_err(),
+            "short write on the front conn must error"
         );
     }
 

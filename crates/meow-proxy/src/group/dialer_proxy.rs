@@ -25,13 +25,15 @@
 //! groups clone their members before the `dialer-proxy` pass replaces them, so
 //! a grouped node would silently bypass its chain (issue #513).
 //!
-//! ## Limitations (first implementation)
+//! ## Limitations
 //!
-//! - **UDP**: routing a UDP association through an arbitrary dialer requires
-//!   per-protocol UDP-over-proxy framing that meow-rs does not yet implement.
-//!   Dialling UDP *directly* would silently leak the real source path, so
-//!   `dial_udp` returns [`MeowError::UdpNotSupported`] (Class A, ADR-0002) when a
-//!   dialer-proxy is configured.
+//! - **UDP**: this *wrapper* is the fallback for transports that own their
+//!   framing and cannot accept an injected dialer — routing a UDP
+//!   association through an arbitrary dialer needs per-protocol
+//!   UDP-over-proxy framing, so `dial_udp` returns
+//!   [`MeowError::UdpNotSupported`] (Class A, ADR-0002) here. Protocols
+//!   that do accept an injected `TcpDialer` (e.g. Shadowsocks, SOCKS5)
+//!   chain UDP natively and never reach this adapter.
 //! - **As a relay hop**: when a dialer-proxy outbound itself appears inside a
 //!   `relay` chain, `connect_over` delegates to the inner adapter — the relay
 //!   chain already defines the path, so the per-outbound dialer is not applied a
@@ -89,7 +91,7 @@ impl ProxyAdapter for DialerProxyAdapter {
         self.inner.addr()
     }
 
-    /// UDP through an arbitrary dialer is not yet supported; see module docs.
+    /// UDP through this fallback wrapper is not supported; see module docs.
     fn support_udp(&self) -> bool {
         false
     }

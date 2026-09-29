@@ -2316,12 +2316,14 @@ header:
         );
     }
 
-    /// UDP on a chained provider node must be refused, not silently
-    /// direct-dialled: `support_udp()` reports false and `dial_udp` errors
+    /// A chained provider node whose named front cannot be resolved must
+    /// fail closed on UDP: `supports_udp()` snapshots `false` for the
+    /// unresolvable front so `support_udp()` reports false, and `dial_udp`
+    /// refuses rather than binding a raw socket on the real source path
     /// (enforced inside the adapter because the tunnel's UDP dispatch does
     /// not consult `support_udp`).
     #[tokio::test]
-    async fn provider_chained_node_udp_is_refused() {
+    async fn provider_chained_node_udp_fails_closed_with_missing_front() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("nodes.yaml"),
