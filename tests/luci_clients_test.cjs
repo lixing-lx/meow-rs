@@ -92,7 +92,7 @@ test('Steer column is hidden unless ARP steering is enabled', () => {
     assert.equal(header.children, 'Steer');
     assert.equal(header.attrs.style, enabled === '1' ? '' : 'display: none;');
     view.showSteer(true);
-    assert.ok(view.steerCells.every(c => c.style.display === ''));
+    assert.ok(view.arpOnly.every(c => c.style.display === ''));
   }
 });
 
@@ -141,4 +141,29 @@ test('host hints are limited to LAN clients; leases and selected MACs always sta
   const loose = plain(view.buildClients(noisy, {}, {}, [], [], []));
   assert.deepEqual(loose.map(r => r.mac).sort(),
     ['02:00:00:00:00:07', '08:b3:39:91:76:ae', '46:1c:00:8d:e5:73', 'd4:0d:ab:8f:cb:81']);
+});
+
+test('without ARP steering only DHCP clients are shown; toggling reveals neighbours', () => {
+  const { view } = load({ ...base, tproxy: { enabled: '1', bypass_mac: 'aa:bb:cc:00:00:02' } });
+  const tree = view.render([null, null, hints, leases]);
+  const rows = tableRows(tree).slice(1);
+  const visible = () => rows.filter(r => !(r.attrs.style === 'display: none;' && r.style.display !== '') &&
+    r.style.display !== 'none').map(r => r.children[4].children);
+  // laptop and nas are neighbour-only; 00:02 stays because it is bypassed.
+  assert.deepEqual(plain(visible()), ['aa:bb:cc:00:00:04', 'aa:bb:cc:00:00:02']);
+  view.showSteer(true);
+  assert.equal(visible().length, 4);
+  view.showSteer(false);
+  assert.deepEqual(plain(visible()), ['aa:bb:cc:00:00:04', 'aa:bb:cc:00:00:02']);
+});
+
+test('no DHCP clients shows a hint to enable ARP steering', () => {
+  const { view } = load(base);
+  const tree = view.render([null, null, hints, {}]);
+  const body = tableRows(tree);
+  assert.equal(body.length, 5);
+  assert.match(text(body[1]), /No DHCP clients/);
+  assert.equal(body[1].attrs.style, '');
+  view.showSteer(true);
+  assert.equal(body[1].style.display, 'none');
 });

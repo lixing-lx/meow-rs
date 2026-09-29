@@ -153,20 +153,27 @@ return view.extend({
 		var arpEnabled = uci.get('meow', 'arp', 'enabled') === '1';
 		var tproxyEnabled = uci.get('meow', 'tproxy', 'enabled') === '1';
 		var clients = this.buildClients(data[2], data[3], statics, bypass, steer, data[4]);
-		var steerStyle = arpEnabled ? '' : 'display: none;';
+		var hidden = 'display: none;';
 		var sourceLabel = {
 			dhcp: _('DHCP'), static: _('Static'), neighbour: _('Neighbour'), offline: _('Offline')
 		};
 
 		this.bypassChecks = {};
 		this.steerChecks = {};
-		this.steerCells = [];
+		// Shown only while ARP steering is enabled (Steer column, neighbour-only
+		// rows), and only while it is disabled (DHCP-only empty state).
+		this.arpOnly = [];
+		this.dhcpOnly = [];
 		this.initial = { arpEnabled: arpEnabled, steer: steer.slice().sort().join(' ') };
 
+		function arpOnly(node) { self.arpOnly.push(node); return node; }
 		function steerCell(tag, content) {
-			var cell = E(tag, { 'class': tag === 'th' ? 'th' : 'td', 'style': steerStyle }, content);
-			self.steerCells.push(cell);
-			return cell;
+			return arpOnly(E(tag, { 'class': tag === 'th' ? 'th' : 'td', 'style': arpEnabled ? '' : hidden }, content));
+		}
+		// Without ARP steering only DHCP clients (leases and static leases) are
+		// listed; neighbour-only hosts stay visible when already bypassed.
+		function dhcpVisible(c) {
+			return c.source !== 'neighbour' || bypass.indexOf(c.mac) !== -1;
 		}
 
 		var rows = [
@@ -185,6 +192,11 @@ return view.extend({
 				E('td', { 'class': 'td', 'colspan': '6' },
 					E('em', {}, _('No LAN clients known yet. DHCP leases and neighbours appear here once clients are active.')))
 			]));
+		} else if (!clients.some(dhcpVisible)) {
+			rows.push(this.dhcpOnly[this.dhcpOnly.push(E('tr', { 'class': 'tr', 'style': arpEnabled ? hidden : '' }, [
+				E('td', { 'class': 'td', 'colspan': '6' },
+					E('em', {}, _('No DHCP clients. Enable ARP client steering below to list other LAN neighbours.')))
+			])) - 1]);
 		}
 
 		clients.forEach(function(c) {
@@ -207,14 +219,15 @@ return view.extend({
 			if (c.ip6.length)
 				ips.push(E('br'), E('small', { 'style': 'color: #888;' }, c.ip6.join(', ')));
 
-			rows.push(E('tr', { 'class': 'tr' }, [
+			var tr = E('tr', { 'class': 'tr', 'style': arpEnabled || dhcpVisible(c) ? '' : hidden }, [
 				E('td', { 'class': 'td' }, bp),
 				steerCell('td', st),
 				E('td', { 'class': 'td' }, c.name || '-'),
 				E('td', { 'class': 'td' }, ips),
 				E('td', { 'class': 'td' }, c.mac),
 				E('td', { 'class': 'td' }, sourceLabel[c.source])
-			]));
+			]);
+			rows.push(dhcpVisible(c) ? tr : arpOnly(tr));
 		});
 
 		var intro = E('p', {}, [
@@ -246,7 +259,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-value-field' }, [
 					this.arpToggle,
 					E('span', { 'style': 'margin-left: .5em; color: #888;' },
-						_('Master switch. Shows the Steer column; when off, no client is steered.'))
+						_('Master switch. Shows the Steer column and non-DHCP LAN neighbours; when off, no client is steered.'))
 				])
 			])
 		]);
@@ -273,7 +286,8 @@ return view.extend({
 	},
 
 	showSteer: function(on) {
-		this.steerCells.forEach(function(cell) { cell.style.display = on ? '' : 'none'; });
+		this.arpOnly.forEach(function(n) { n.style.display = on ? '' : 'none'; });
+		this.dhcpOnly.forEach(function(n) { n.style.display = on ? 'none' : ''; });
 	},
 
 	handleSaveApply: function() {
