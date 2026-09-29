@@ -152,7 +152,8 @@ test('Settings map synchronizes after parsing and rolls back when UCI save fails
     const state = setup();
     const calls = [];
     function Map() {}
-    Map.prototype.section = () => ({ option: () => ({ value() {}, depends() {} }) });
+    const option = () => ({ value() {}, depends() {} });
+    Map.prototype.section = () => ({ option, taboption: option, tab() {} });
     Map.prototype.render = function() { return this; };
     Map.prototype.save = async function(cb) {
       calls.push('parse');

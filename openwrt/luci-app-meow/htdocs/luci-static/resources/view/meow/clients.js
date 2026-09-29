@@ -270,18 +270,14 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('table', { 'class': 'table cbi-section-table' }, rows)
 			]),
-			arp,
-			E('div', { 'class': 'cbi-page-actions' }, [
-				E('button', {
-					'class': 'cbi-button cbi-button-save',
-					'click': ui.createHandlerFn(this, 'handleSaveApply')
-				}, _('Save & Apply')),
-				' ',
+			// Saving uses LuCI's standard page footer (Save & Apply).
+			E('div', { 'style': 'margin: .5em 0;' }, [
 				E('button', {
 					'class': 'cbi-button',
 					'click': function() { location.reload(); }
 				}, _('Reload list'))
-			])
+			]),
+			arp
 		]);
 	},
 

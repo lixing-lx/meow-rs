@@ -22,8 +22,8 @@ function setup(options = {}) {
     view: { extend: value => value },
     L: { env: { sessionid: 'test-session', cgi_base: '/cgi-bin' } },
     _: value => value,
-    E: (tag, attrs, children) => ({ tag, attrs, children }),
-    document: { getElementById: () => ({ value: content }) },
+    E: (tag, attrs, children) => ({ tag, attrs, children, style: {} }),
+    document: { getElementById: () => options.textarea ?? ({ value: content }) },
     uci: { load: async () => {}, get: () => undefined },
     ui: {
       addNotification: (...args) => notifications.push(args),
@@ -82,9 +82,9 @@ test('large Unicode YAML loads and saves without RPC file transfers', async () =
   assert.equal((await state.view.load()).content, state.content);
   // Invoke the actual rendered Save handler, including its bound path.
   const tree = state.view.render({ path, content: state.content });
-  const actions = tree.children[3].children;
-  assert.equal(actions[0].attrs.type, 'button');
-  assert.equal(actions[2].attrs.type, 'button');
+  const actions = Array.from(tree.children[3].children).filter(n => n && n.tag === 'button');
+  assert.deepEqual(actions.map(b => String(b.children)), ['Revert', 'Validate', 'Save']);
+  assert.ok(actions.every(b => b.attrs.type === 'button'));
   await actions[2].attrs.click({});
   assert.deepEqual(state.calls, [scratch, 'validate', path]);
   assert.deepEqual(state.uploads.map(u => u.payload), Array(2).fill(state.content.replace(/\r\n/g, '\n')));
@@ -189,4 +189,38 @@ test('restart failure is distinguished from a successful disk save', async () =>
   await state.view.handleSave(null, path);
   assert.match(messages(state), /saved, but restart failed/);
   assert.doesNotMatch(messages(state), /service restarted/);
+});
+
+test('editor tracks unsaved changes, reverts, and indents with spaces', async () => {
+  const textarea = { value: 'a: 1\n', selectionStart: 0, selectionEnd: 0 };
+  const state = setup({ textarea, content: 'a: 1\n' });
+  state.view.render({ path, content: 'a: 1\n' });
+  state.view.updateStatus();
+  assert.equal(state.view.dirty, false);
+  assert.equal(state.view.revert.disabled, true);
+  assert.match(state.view.status.textContent, /Saved/);
+
+  // Tab inserts two spaces at the caret instead of moving focus.
+  let prevented = 0;
+  textarea.selectionStart = textarea.selectionEnd = 3;
+  state.view.handleKey(path, { key: 'Tab', target: textarea, preventDefault: () => prevented++ });
+  assert.equal(textarea.value, 'a:   1\n');
+  assert.equal(textarea.selectionStart, 5);
+  assert.equal(prevented, 1);
+  assert.equal(state.view.dirty, true);
+  assert.equal(state.view.revert.disabled, false);
+  assert.match(state.view.status.textContent, /Unsaved changes/);
+
+  state.view.handleRevert();
+  assert.equal(textarea.value, 'a: 1\n');
+  assert.equal(state.view.dirty, false);
+
+  // Ctrl/Cmd+S saves; a successful save clears the dirty state.
+  textarea.value = 'a: 2\n';
+  state.view.updateStatus();
+  state.view.handleKey(path, { key: 's', metaKey: true, target: textarea, preventDefault: () => prevented++ });
+  await new Promise(r => setImmediate(r));
+  for (let i = 0; i < 20 && state.view.dirty; i++) await new Promise(r => setTimeout(r, 5));
+  assert.equal(state.uploads.at(-1).payload, 'a: 2\n');
+  assert.equal(state.view.dirty, false);
 });
