@@ -40,6 +40,8 @@ load_config() {
 	config_get dns_port tproxy dns_port 1053
 	config_get_bool ipv6 tproxy ipv6 0
 	config_get bypass tproxy bypass ''
+	config_get bypass_mac tproxy bypass_mac ''
+	bypass_mac=$(echo "$bypass_mac" | tr 'A-F' 'a-f')
 }
 
 validate_config() {
@@ -53,6 +55,10 @@ validate_config() {
     for cidr in $bypass; do
         case "$cidr" in *[!0-9a-fA-F.:/]*|'') return 1 ;; esac
     done
+    local h='[0-9a-f][0-9a-f]'
+    for mac in $bypass_mac; do
+        case "$mac" in $h:$h:$h:$h:$h:$h) ;; *) return 1 ;; esac
+    done
 }
 
 port_listening() {
@@ -64,13 +70,16 @@ port_listening() {
 }
 
 gen_rules() {
-	local device="$1" extra4="" extra6="" cidr
+	local device="$1" extra4="" extra6="" macs="" cidr mac
 
 	for cidr in $bypass; do
 		case "$cidr" in
 			*:*) extra6="$extra6, $cidr" ;;
 			*) extra4="$extra4, $cidr" ;;
 		esac
+	done
+	for mac in $bypass_mac; do
+		macs="${macs:+$macs, }$mac"
 	done
 
 	# TCP goes through nat REDIRECT in BOTH modes (dstnat chain): meow's TCP
@@ -93,11 +102,19 @@ gen_rules() {
 			type ipv6_addr; flags interval; auto-merge
 			elements = { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8$extra6 }
 		}
+		# LAN clients (by MAC) that skip both capture and the DNS hijack.
+		set bypass_src {
+			type ether_addr
+	NFT
+	[ -n "$macs" ] && echo "		elements = { $macs }"
+	cat <<-NFT
+		}
 
 		chain dstnat {
 			type nat hook prerouting priority dstnat - 5; policy accept;
 			iifname != "$device" return
 			meta mark $ROUTING_MARK return
+			ether saddr @bypass_src return
 	NFT
 	[ "$dns_hijack" -eq 1 ] &&
 		echo "		meta nfproto ipv4 meta l4proto udp th dport 53 redirect to :$dns_port"
@@ -118,6 +135,7 @@ gen_rules() {
 			type filter hook prerouting priority mangle; policy accept;
 			iifname != "$device" return
 			meta mark $ROUTING_MARK return
+			ether saddr @bypass_src return
 		NFT
 		[ "$dns_hijack" -eq 1 ] && echo "		meta l4proto udp th dport 53 return"
 		[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"

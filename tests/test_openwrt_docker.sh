@@ -298,6 +298,7 @@ check "REST API /version"          "version"    rexec '/usr/libexec/meow-api GET
 check "built-in panel /ui"         "meow-rs"    rexec 'uclient-fetch -q -O - http://127.0.0.1:9090/ui'
 check "LuCI Clients asset served"  "meow Clients" bash -c "docker exec $ROUTER cat /www/luci-static/resources/view/meow/clients.js"
 check "LuCI ACL grants arp exec"   "arp-hijack.sh clients" bash -c "docker exec $ROUTER cat /usr/share/rpcd/acl.d/luci-app-meow.json"
+check "LuCI ACL grants host hints" "getHostHints" bash -c "docker exec $ROUTER cat /usr/share/rpcd/acl.d/luci-app-meow.json"
 check "arp steering off by default" "0"         bash -c "docker exec $ROUTER uci -q get meow.arp.enabled"
 
 # Firewall / routing plumbing (firewall:false -> only gateway.sh's table)
@@ -363,6 +364,16 @@ rexec 'uci set meow.tproxy.ipv6=0; uci set meow.tproxy.tproxy_port="7893; flush 
 check "raw UCI port injection rejected" "REJECTED" rexec 'if /usr/share/meow/gateway.sh up; then exit 1; else echo REJECTED; fi'
 rexec 'uci set meow.tproxy.tproxy_port=7893; uci commit meow'
 check "invalid settings preserve active rules" "meow_gateway" rexec 'nft list table inet meow_gateway'
+# Per-client bypass (LuCI Clients tab): MAC set checked before DNS hijack.
+CLIENT_MAC_UC=$(echo "$CLIENT_MAC" | tr 'a-f' 'A-F')
+rexec "uci add_list meow.tproxy.bypass_mac=$CLIENT_MAC_UC; uci commit meow; /usr/share/meow/gateway.sh up"
+check "bypass MAC loaded into nft set" "$CLIENT_MAC" rexec 'nft list set inet meow_gateway bypass_src'
+check "bypass precedes DNS hijack" "BYPASS_FIRST" rexec 'nft list chain inet meow_gateway dstnat | awk "/bypass_src/{b=NR} /dport 53/{d=NR} END{if (b && d && b < d) print \"BYPASS_FIRST\"}"'
+check "bypass skips UDP tproxy" "bypass_src" rexec 'nft list chain inet meow_gateway mangle_tproxy'
+rexec 'uci del_list meow.tproxy.bypass_mac="'"$CLIENT_MAC_UC"'"; uci add_list meow.tproxy.bypass_mac="aa:bb:cc:dd:ee:ff; flush ruleset"; uci commit meow'
+check "raw UCI bypass MAC injection rejected" "REJECTED" rexec 'if /usr/share/meow/gateway.sh up; then exit 1; else echo REJECTED; fi'
+rexec 'uci delete meow.tproxy.bypass_mac; uci commit meow; /usr/share/meow/gateway.sh up'
+check "bypass set empty after clearing" "EMPTY" rexec 'nft list set inet meow_gateway bypass_src | grep -q elements || echo EMPTY'
 docker exec -i "$ROUTER" sh -c 'cat > /tmp/delegated-luci.sh' < "$SCRIPT_DIR/openwrt-docker/delegated-luci.sh"
 check "delegated LuCI transports and validation policy" "DELEGATED_OK" rexec 'sh /tmp/delegated-luci.sh'
 # Stop while the managed gateway instance is still waiting for a missing port.

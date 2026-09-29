@@ -9,8 +9,9 @@ Packaging sources for the official OpenWrt `.ipk` release artifacts
 - `meow/files/` — procd init scripts (`meow.init`, `meow-arp.init`),
   `/etc/config/meow` UCI settings, the default `/etc/meow/config.yaml`,
   `gateway.sh` (transparent-proxy nftables rules for gateway / side-router
-  mode: kernel TPROXY or REDIRECT), and `arp-hijack.sh` (opt-in, off-by-default
-  ARP-based client steering for the LuCI Clients tab — ARP spoofing, for
+  mode: kernel TPROXY or REDIRECT, plus the per-client MAC bypass set managed
+  from the LuCI Clients tab), and `arp-hijack.sh` (opt-in, off-by-default
+  ARP-based client steering, an advanced section of the Clients tab — ARP spoofing, for
   devices you administer only).
 - `luci-app-meow/` — LuCI app: `root/` overlays `/` on the device,
   `htdocs/` maps to `/www`. Overview, config editor, clients, settings and log

@@ -108,7 +108,7 @@ for s in gateway.sh arp-hijack.sh meow-arp.init; do
 done
 
 # --- 8. Configuration editor request and failure handling ---
-if node --test "$SCRIPT_DIR/luci_config_test.cjs" "$SCRIPT_DIR/luci_settings_test.cjs" "$SCRIPT_DIR/luci_runtime_test.cjs"; then
+if node --test "$SCRIPT_DIR/luci_config_test.cjs" "$SCRIPT_DIR/luci_settings_test.cjs" "$SCRIPT_DIR/luci_runtime_test.cjs" "$SCRIPT_DIR/luci_clients_test.cjs"; then
     pass "configuration editor regression tests"
 else
     fail "configuration editor regression tests"

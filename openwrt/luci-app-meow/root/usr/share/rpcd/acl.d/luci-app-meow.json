@@ -2,8 +2,9 @@
 	"luci-app-meow": {
 		"description": "Grant access to meow service configuration",
 		"read": {
-			"uci": [ "meow", "network" ],
+			"uci": [ "meow", "network", "dhcp" ],
 			"ubus": {
+				"luci-rpc": [ "getHostHints", "getDHCPLeases" ],
 				"service": [ "list" ],
 				"file": [ "exec" ],
 				"uci": [ "get", "changes" ]
