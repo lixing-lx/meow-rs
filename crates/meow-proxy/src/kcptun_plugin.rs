@@ -286,6 +286,14 @@ impl KcptunClient {
             let socket = match self.dialer.dial_udp_endpoint(remote).await {
                 Ok(s) => s,
                 Err(e) => {
+                    // A capability refusal from the front hop is per-front,
+                    // not per-candidate — propagate as NotSupported so it
+                    // stays exempt from dead-marking like the plain-SS arm.
+                    if e.kind() == std::io::ErrorKind::Unsupported {
+                        return Err(MeowError::NotSupported(format!(
+                            "kcptun: udp endpoint for {remote}: {e}"
+                        )));
+                    }
                     last_err = Some(format!("kcptun: udp endpoint for {remote}: {e}"));
                     continue;
                 }

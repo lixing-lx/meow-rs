@@ -18,6 +18,7 @@ use shadowsocks::config::{Mode, ServerAddr, ServerConfig, ServerType};
 use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::plugin::{Plugin, PluginConfig, PluginMode};
+use shadowsocks::relay::udprelay::crypto_io::{decrypt_server_payload, encrypt_client_payload};
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::proxy_socket::UdpSocketType;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend, DatagramSocket, ProxySocket};
@@ -317,6 +318,29 @@ impl ShadowsocksAdapter {
         });
         self.mux = Some(MuxClient::new(dial, options));
         self
+    }
+
+    /// Whether an external SIP003 plugin owns the UDP leg: `udp_external_addr`
+    /// is then the plugin's local listener, whose outbound belongs to the
+    /// subprocess — chaining it through `dialer-proxy` would make the *front*
+    /// dial `127.0.0.1:<plugin-port>` on its own loopback while our plugin
+    /// still listens locally. Same contract as the TCP path, which dials the
+    /// plugin listener directly under `dialer-proxy`.
+    fn plugin_owns_udp(&self) -> bool {
+        matches!(self.core.plugin, PluginKind::External(_))
+            && self
+                .core
+                .server_config
+                .plugin()
+                .is_some_and(|p| p.plugin_mode.enable_udp())
+    }
+
+    /// Whether the plain SS UDP association must ride the `dialer-proxy`
+    /// chain — false on a direct dialer, and false when an external plugin
+    /// owns the UDP leg (its endpoint is the local plugin listener, which
+    /// is never chain-routed).
+    fn udp_via_chain(&self) -> bool {
+        self.core.dialer.is_proxy() && !self.plugin_owns_udp()
     }
 }
 
@@ -947,53 +971,144 @@ impl SsUdpSession {
     }
 }
 
-// Wrapper for SS UDP ProxySocket
-struct SsPacketConn<S: DatagramSend + DatagramReceive + DatagramSocket + Send + Sync + 'static> {
-    socket: ProxySocket<S>,
+// Wrapper for SS UDP packet transport. The crypto layer is identical on
+// both arms — only how ciphertext datagrams reach the SS server's UDP
+// endpoint differs.
+enum SsUdpIo {
+    /// Raw connected UDP socket to the server (no `dialer-proxy`).
+    Raw(ProxySocket<TokioUdpDatagram>),
+    /// Front-proxied UDP association — mihomo's `proxyDialer.ListenPacket`
+    /// shape: `dialer-proxy` turns the SS server's UDP endpoint into the
+    /// front's association destination, and the SS crypto layer runs
+    /// directly over the returned `ProxyPacketConn` (no `ProxySocket`/poll
+    /// bridge — `ProxySocket`'s client path only ever uses connected
+    /// send/recv, which `ProxyPacketConn` already is).
+    ///
+    /// `remote` is the SS server's UDP endpoint: bound-at-dial conns
+    /// (VLESS, mux) ignore the per-packet addr; per-packet conns (SOCKS5)
+    /// encode it — either way it must be the server address, not the
+    /// inner SS target (that travels encrypted inside the payload).
+    Chained {
+        conn: Arc<dyn ProxyPacketConn>,
+        remote: SocketAddr,
+        context: SharedContext,
+        method: CipherKind,
+        key: Box<[u8]>,
+        identity_keys: Arc<Vec<bytes::Bytes>>,
+    },
+}
+
+struct SsPacketConn {
+    io: SsUdpIo,
     session: SsUdpSession,
 }
 
+impl SsPacketConn {
+    fn chained(
+        conn: Arc<dyn ProxyPacketConn>,
+        remote: SocketAddr,
+        core: &SsCore,
+        session: SsUdpSession,
+    ) -> Self {
+        Self {
+            io: SsUdpIo::Chained {
+                conn,
+                remote,
+                context: Arc::clone(&core.context),
+                method: core.server_config.method(),
+                key: core.server_config.key().into(),
+                identity_keys: core.server_config.clone_identity_keys(),
+            },
+            session,
+        }
+    }
+}
+
 #[async_trait]
-impl<S: DatagramSend + DatagramReceive + DatagramSocket + Send + Sync + 'static> ProxyPacketConn
-    for SsPacketConn<S>
-{
+impl ProxyPacketConn for SsPacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
-        loop {
-            let (n, addr, _raw_len, control) = match self.socket.recv_with_ctrl(buf).await {
-                Ok(v) => v,
-                // A single undecryptable / malformed datagram must not kill
-                // the association: the reply task exits on Err, forcing a
-                // redial per stray packet (an on-path attacker replaying
-                // captured ciphertexts could churn sessions). Protocol-level
-                // rejects are per-datagram — drop and keep reading, matching
-                // how sslocal survives recv errors.
-                Err(
-                    e @ (ProxySocketError::ProtocolError(_)
-                    | ProxySocketError::ProtocolErrorWithPeer(..)),
-                ) => {
-                    debug!("ss udp: dropped malformed reply datagram: {e}");
-                    continue;
-                }
-                Err(e) => return Err(MeowError::Proxy(format!("ss udp recv: {e}"))),
-            };
-            // §3.2.4: a reply stamped for another session, or a replayed /
-            // out-of-window server packet ID, is dropped — keep reading for
-            // a valid datagram instead of surfacing the junk one.
-            if let Some(c) = &control {
-                if !self.session.accept_reply(c) {
-                    continue;
+        match &self.io {
+            SsUdpIo::Raw(socket) => {
+                use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
+                loop {
+                    let (n, addr, _raw_len, control) = match socket.recv_with_ctrl(buf).await {
+                        Ok(v) => v,
+                        // A single undecryptable / malformed datagram must not kill
+                        // the association: the reply task exits on Err, forcing a
+                        // redial per stray packet (an on-path attacker replaying
+                        // captured ciphertexts could churn sessions). Protocol-level
+                        // rejects are per-datagram — drop and keep reading, matching
+                        // how sslocal survives recv errors.
+                        Err(
+                            e @ (ProxySocketError::ProtocolError(_)
+                            | ProxySocketError::ProtocolErrorWithPeer(..)),
+                        ) => {
+                            debug!("ss udp: dropped malformed reply datagram: {e}");
+                            continue;
+                        }
+                        Err(e) => return Err(MeowError::Proxy(format!("ss udp recv: {e}"))),
+                    };
+                    // §3.2.4: a reply stamped for another session, or a replayed /
+                    // out-of-window server packet ID, is dropped — keep reading for
+                    // a valid datagram instead of surfacing the junk one.
+                    if let Some(c) = &control {
+                        if !self.session.accept_reply(c) {
+                            continue;
+                        }
+                    }
+                    let sock_addr = match addr {
+                        Address::SocketAddress(sa) => sa,
+                        // A conforming server always replies with the responder's
+                        // SocketAddress; a domain-typed reply (non-compliant peer)
+                        // can never parse as SocketAddr — drop it rather than kill
+                        // the reply task.
+                        Address::DomainNameAddress(..) => continue,
+                    };
+                    return Ok((n, sock_addr));
                 }
             }
-            let sock_addr = match addr {
-                Address::SocketAddress(sa) => sa,
-                // A conforming server always replies with the responder's
-                // SocketAddress; a domain-typed reply (non-compliant peer)
-                // can never parse as SocketAddr — drop it rather than kill
-                // the reply task.
-                Address::DomainNameAddress(..) => continue,
-            };
-            return Ok((n, sock_addr));
+            SsUdpIo::Chained {
+                conn,
+                remote,
+                context,
+                method,
+                key,
+                ..
+            } => loop {
+                // Transport errors propagate (the association is dead);
+                // decrypt failures are per-datagram — same drop-and-continue
+                // as the Raw arm's ProtocolError handling above.
+                let (rn, outer_src) = conn.read_packet(buf).await?;
+                // Per-packet fronts (SOCKS5 UDP) report the real wire source
+                // and can deliver datagrams from arbitrary remotes — restore
+                // the connected-socket filter the Raw arm had. Bound conns
+                // report `remote` or an unspecified addr (no source info);
+                // unspecified skips the check rather than breaking them.
+                // `to_canonical` collapses IPv4-mapped IPv6 forms so a
+                // resolver/front representation difference can't wedge the
+                // association on a spurious mismatch.
+                let same_src = outer_src.ip().to_canonical() == remote.ip().to_canonical()
+                    && outer_src.port() == remote.port();
+                if !same_src && !outer_src.ip().is_unspecified() {
+                    debug!("ss udp: dropped chained reply from {outer_src} (expected {remote})");
+                    continue;
+                }
+                let Ok((n, addr, control)) =
+                    decrypt_server_payload(context, *method, key, &mut buf[..rn])
+                else {
+                    debug!("ss udp: dropped malformed reply datagram (chained)");
+                    continue;
+                };
+                if let Some(c) = &control {
+                    if !self.session.accept_reply(c) {
+                        continue;
+                    }
+                }
+                let Address::SocketAddress(sa) = addr else {
+                    continue;
+                };
+                return Ok((n, sa));
+            },
         }
     }
 
@@ -1008,21 +1123,78 @@ impl<S: DatagramSend + DatagramReceive + DatagramSocket + Send + Sync + 'static>
                 "ss udp: client packet-ID space exhausted".into(),
             ));
         };
-        // ProxySocket::send_with_ctrl returns the encrypted packet size (with
-        // protocol overhead), but callers expect the payload size.
-        self.socket
-            .send_with_ctrl(&target, &control, buf)
-            .await
-            .map_err(|e| MeowError::Proxy(format!("ss udp send: {e}")))?;
+        match &self.io {
+            SsUdpIo::Raw(socket) => {
+                // ProxySocket::send_with_ctrl returns the encrypted packet size
+                // (with protocol overhead), but callers expect the payload size.
+                socket
+                    .send_with_ctrl(&target, &control, buf)
+                    .await
+                    .map_err(|e| MeowError::Proxy(format!("ss udp send: {e}")))?;
+            }
+            SsUdpIo::Chained {
+                conn,
+                remote,
+                context,
+                method,
+                key,
+                identity_keys,
+            } => {
+                // Same bytes `ProxySocket::send_with_ctrl` emits — the SS
+                // header + target are inside the ciphertext; the wire
+                // datagram always goes to `remote` (the SS server's UDP
+                // endpoint bound by the front's association).
+                let mut send_buf = bytes::BytesMut::with_capacity(buf.len() + 256);
+                encrypt_client_payload(
+                    context,
+                    *method,
+                    key,
+                    &target,
+                    &control,
+                    identity_keys,
+                    buf,
+                    &mut send_buf,
+                );
+                // AEAD-2022 overhead (header + EIH + up to 900 B padding +
+                // addr + tag) can push ciphertext past u16::MAX for a legal
+                // max-size UDP payload. Every stream-framed front encodes
+                // datagrams with a u16 length — a wrap would desync the
+                // front's stream permanently, so error the association like
+                // EMSGSIZE does on the raw socket.
+                if send_buf.len() > u16::MAX as usize {
+                    return Err(MeowError::Proxy(format!(
+                        "ss udp: chained datagram {}B exceeds u16 frame limit",
+                        send_buf.len()
+                    )));
+                }
+                // A datagram conn must be atomic — a short write means the
+                // front truncated ciphertext, which no retry can repair.
+                let sent = conn.write_packet(&send_buf, remote).await?;
+                if sent != send_buf.len() {
+                    return Err(MeowError::Proxy(format!(
+                        "ss udp: front conn truncated datagram ({sent}/{} B)",
+                        send_buf.len()
+                    )));
+                }
+            }
+        }
         Ok(buf.len())
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().map_err(MeowError::Io)
+        match &self.io {
+            SsUdpIo::Raw(socket) => socket.local_addr().map_err(MeowError::Io),
+            // Stream-framed front conns (VLESS/Trojan) have no bound UDP
+            // socket — they report unspecified, which callers only log.
+            SsUdpIo::Chained { conn, .. } => conn.local_addr(),
+        }
     }
 
     fn close(&self) -> Result<()> {
-        Ok(())
+        match &self.io {
+            SsUdpIo::Raw(_) => Ok(()),
+            SsUdpIo::Chained { conn, .. } => conn.close(),
+        }
     }
 }
 
@@ -1051,25 +1223,33 @@ impl ProxyAdapter for ShadowsocksAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        // SS UDP relay uses a raw UDP socket that bypasses the TCP dialer.
-        // When a `ProxyDialer` is installed (dialer-proxy), raw UDP would
-        // leak traffic past the chain — advertise the plain UDP path as
-        // unsupported.  Mux UDP is safe because it rides the mux TCP session
-        // through `dialer.dial()`, so it is unaffected.
+        // The plain SS UDP association rides the front proxy's own
+        // `dial_udp` under `dialer-proxy` (mihomo `proxyDialer.ListenPacket`),
+        // so a proxy dialer is fine *when the front advertises UDP* — a
+        // point-in-time snapshot for group fronts; `dial_udp` re-checks at
+        // dial and fails closed on a front that cannot carry UDP. An
+        // external SIP003 plugin's UDP leg (its local listener) bypasses
+        // the chain by design, same as TCP — capability is unconditional
+        // there.
         //
-        // This is the *advertised* capability only (LoadBalance member
-        // filtering, the `udp` field in `GET /proxies`).  It is NOT the
-        // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
-        // directly without consulting `support_udp`, so the refusal is
-        // re-checked there.  Keep the two in sync.
+        // Two consumers read this advertisement: the rule probe treats a
+        // UDP flow matched to a `!support_udp` target as ineligible and
+        // skips to the next rule (tunnel.rs `RouteTargetProbe`), and
+        // LoadBalance filters members by it.  It is NOT the enforcement
+        // point — `dial_udp` re-checks the chain and refuses on its own,
+        // so a stale optimistic snapshot cannot open a raw socket.  Keep
+        // the two in sync.
         let plain_udp_ok = self.support_udp
-            && !self.core.dialer.is_proxy()
-            && self.core.plugin.udp_block_reason().is_none();
+            && self.core.plugin.udp_block_reason().is_none()
+            && (!self.udp_via_chain() || self.core.dialer.supports_udp());
         // kcptun's UDP path is UDP-over-TCP over a pooled smux stream — its
         // datagrams go through `dial_udp_endpoint`, which tunnels them under
-        // `dialer-proxy`, so the chain-safety check does not apply.
+        // `dialer-proxy` — so the chain is *safe*, but it still needs the
+        // front to carry UDP at all: advertise only when it reports so.
         #[cfg(feature = "kcptun")]
-        let kcptun_udp_ok = self.support_udp && matches!(self.core.plugin, PluginKind::Kcptun(_));
+        let kcptun_udp_ok = self.support_udp
+            && matches!(self.core.plugin, PluginKind::Kcptun(_))
+            && self.core.dialer.supports_udp();
         #[cfg(not(feature = "kcptun"))]
         let kcptun_udp_ok = false;
         plain_udp_ok || kcptun_udp_ok || {
@@ -1168,25 +1348,87 @@ impl ProxyAdapter for ShadowsocksAdapter {
             ))));
         }
 
-        // Enforcement point for the dialer-proxy UDP leak (not `support_udp`,
-        // which the tunnel's UDP dispatch never consults).  The plain SS UDP
-        // relay below binds a raw socket and connects straight to the SS
-        // server, so with a `ProxyDialer` installed it would egress from the
-        // real source path while TCP goes through the front proxy.  Refuse
-        // loudly (Class A, ADR-0002) instead of leaking.  Reached only after
-        // the mux branch above, which tunnels UDP over `dialer.dial()` and is
-        // therefore safe.
-        if self.core.dialer.is_proxy() {
+        // TCP-transport plugins (v2ray/gost/shadow-tls/…) refuse UDP
+        // regardless of chaining — checked before the `is_proxy` branch so
+        // the refusal names the plugin, not the chain.
+        if let Some(reason) = self.core.plugin.udp_block_reason() {
+            return Err(MeowError::NotSupported(reason.into()));
+        }
+
+        // Snapshot pre-flight BEFORE resolving: a front that advertises no
+        // UDP is a capability refusal (`NotSupported` is exempt from
+        // dead-marking — the node itself isn't broken), and skipping the
+        // resolve keeps a refused dial from emitting a pointless local DNS
+        // lookup whose failure would masquerade as `Proxy` (dead-markable).
+        // The authoritative check stays the real dial below: groups may
+        // rotate members between this query and it.
+        if self.udp_via_chain() && !self.core.dialer.supports_udp() {
             return Err(MeowError::NotSupported(
-                "ss: plain UDP relay bypasses `dialer-proxy` (raw socket); \
-                 refusing to leak the real source path — enable `smux`/`yamux` \
-                 mux for UDP over the chain"
+                "ss: `dialer-proxy` front reports no UDP support; \
+                 refusing rather than leaking the real source path"
                     .into(),
             ));
         }
 
-        if let Some(reason) = self.core.plugin.udp_block_reason() {
-            return Err(MeowError::NotSupported(reason.into()));
+        // The SS server's UDP endpoint — resolved here because both egress
+        // paths need it, and `ProxyPacketConn::write_packet` is
+        // `SocketAddr`-keyed: the chained path cannot hand the front a
+        // domain to resolve. `udp_external_addr` returns a literal
+        // `SocketAddr` for the standard path and the SIP003 plugin's local
+        // listener for external plugins (where the connect is loopback —
+        // protect is harmless).
+        let candidates = match self.core.server_config.udp_external_addr() {
+            ServerAddr::SocketAddr(sa) => vec![*sa],
+            ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
+                .await
+                .map_err(|e| MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}")))?,
+        };
+
+        // mihomo `proxyDialer.ListenPacket`: under `dialer-proxy` the SS UDP
+        // association rides the front proxy's own `dial_udp` — the
+        // association's wire destination is the SS server's UDP endpoint and
+        // the SS crypto layer wraps the per-packet targets inside. Reached
+        // after the mux branch above (which tunnels UDP over `dialer.dial()`)
+        // and skipped for external plugins (their UDP endpoint is the local
+        // plugin listener — never chained).
+        //
+        // Fail-closed (Class A, ADR-0002): a front that cannot carry UDP
+        // surfaces its error and the raw-socket path below stays unreachable
+        // on this branch — no silent real-source egress.
+        if self.udp_via_chain() {
+            let mut last_err = None;
+            for remote in &candidates {
+                match self
+                    .core
+                    .dialer
+                    .dial_udp_conn(*remote, metadata.is_internal())
+                    .await
+                {
+                    Ok(conn) => {
+                        debug!("SS UDP chained to {remote} via {}", self.addr_str);
+                        let session =
+                            SsUdpSession::new(&self.core.context, self.core.server_config.method());
+                        return Ok(Box::new(SsPacketConn::chained(
+                            conn, *remote, &self.core, session,
+                        )));
+                    }
+                    // The dialer maps front `NotSupported`/`UdpNotSupported`
+                    // to `ErrorKind::Unsupported` — a capability refusal, not
+                    // a transport failure: every candidate would fail the
+                    // same way, and `NotSupported` stays exempt from
+                    // dead-marking (a UDP-less front must not cost the node
+                    // its health).
+                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                        return Err(MeowError::NotSupported(format!(
+                            "ss udp via dialer-proxy {remote}: {e}"
+                        )));
+                    }
+                    Err(e) => last_err = Some(format!("ss udp via dialer-proxy {remote}: {e}")),
+                }
+            }
+            return Err(MeowError::Proxy(last_err.unwrap_or_else(|| {
+                "ss udp via dialer-proxy: no candidates".into()
+            })));
         }
 
         // Hand-roll the UDP bind+connect so the installed
@@ -1195,15 +1437,6 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // plain tokio and the Android `VpnService.protect(fd)` hook never
         // fires, looping outbound UDP back into our own VPN tunnel.
         //
-        // `udp_external_addr` returns a literal `SocketAddr` for the standard
-        // path and the SIP003 plugin's local listener for external plugins
-        // (where the connect is loopback — protect is harmless).
-        let candidates = match self.core.server_config.udp_external_addr() {
-            ServerAddr::SocketAddr(sa) => vec![*sa],
-            ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
-                .await
-                .map_err(|e| MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}")))?,
-        };
         // Try candidates in resolver order rather than committing to the
         // first one: on a single-stack network the resolver can still order
         // the unreachable family first (AAAA on an IPv4-only path), and a
@@ -1249,7 +1482,10 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // ID + packet counter, minted from the shared context's CSPRNG.
         let session = SsUdpSession::new(&self.core.context, self.core.server_config.method());
         debug!("SS UDP connected via {}", remote);
-        Ok(Box::new(SsPacketConn { socket, session }))
+        Ok(Box::new(SsPacketConn {
+            io: SsUdpIo::Raw(socket),
+            session,
+        }))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -1329,6 +1565,7 @@ impl DatagramSend for TokioUdpDatagram {
 mod tests {
     use super::*;
     use meow_common::atomic::Uint;
+    use std::sync::Mutex;
 
     #[test]
     fn sip003u_mode_extraction() {
@@ -1364,8 +1601,8 @@ mod tests {
         assert_eq!(o.as_deref(), Some("mode=quic;host=a.com"));
     }
 
-    /// A dialer that reports itself as proxied without needing a real front
-    /// proxy — stands in for `ProxyDialer` in the leak-refusal tests.
+    /// A dialer that reports itself as proxied but cannot carry UDP —
+    /// stands in for a `ProxyDialer` whose front hop lacks UDP support.
     struct FakeProxyDialer;
 
     #[async_trait]
@@ -1384,13 +1621,262 @@ mod tests {
         }
     }
 
+    /// Loopback `ProxyPacketConn` playing the *server* side of the SS UDP
+    /// protocol: `write_packet` decrypts the client datagram (real
+    /// `crypto_io`, real key) and queues a server-side encrypted echo
+    /// addressed from the client's target. Drives the whole `Chained` codec
+    /// — encryption, session control, bound-remote contract — without a
+    /// socket.
+    struct FakeSsUdpServer {
+        bound: SocketAddr,
+        context: SharedContext,
+        method: CipherKind,
+        key: Vec<u8>,
+        /// Server-side association ID (SIP0222 §3.2.3) — nonzero, or the
+        /// client's `accept_reply` filter would drop the echo.
+        server_session_id: u64,
+        reply_packet_id: Mutex<u64>,
+        /// Outer addrs `write_packet` was handed — must always be the SS
+        /// server endpoint the association is bound to.
+        outer: Mutex<Vec<SocketAddr>>,
+        /// Decrypted inner targets + payloads the "server" received.
+        inner: Mutex<Vec<(Address, Vec<u8>)>>,
+        reply_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        reply_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    }
+
+    impl FakeSsUdpServer {
+        fn new(bound: SocketAddr, core: &SsCore) -> Self {
+            let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                bound,
+                context: Arc::clone(&core.context),
+                method: core.server_config.method(),
+                key: core.server_config.key().to_vec(),
+                server_session_id: 0x5345_5256_4552_5349, // "SERVERSE"-ish
+                reply_packet_id: Mutex::new(0),
+                outer: Mutex::new(Vec::new()),
+                inner: Mutex::new(Vec::new()),
+                reply_tx,
+                reply_rx: tokio::sync::Mutex::new(reply_rx),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for FakeSsUdpServer {
+        async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+            let pkt = self
+                .reply_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| MeowError::Proxy("fake ss server closed".into()))?;
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
+            Ok((n, self.bound))
+        }
+
+        async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
+            use shadowsocks::relay::udprelay::crypto_io::{
+                decrypt_client_payload, encrypt_server_payload,
+            };
+            self.outer.lock().unwrap().push(*addr);
+            let mut pkt = buf.to_vec();
+            let (n, target, control) =
+                decrypt_client_payload(&self.context, self.method, &self.key, &mut pkt, None)
+                    .map_err(|e| MeowError::Proxy(format!("fake server decrypt: {e}")))?;
+            self.inner
+                .lock()
+                .unwrap()
+                .push((target.clone(), pkt[..n].to_vec()));
+            // Reply like ssserver: payload echoed, addressed from the
+            // target. AEAD-2022 replies carry the echoed client session ID
+            // (kept by `unwrap_or_default`) plus the server's own session
+            // ID + a fresh packet ID; non-2022 methods ignore `control`.
+            let mut ctrl = control.unwrap_or_default();
+            ctrl.server_session_id = self.server_session_id;
+            ctrl.packet_id = {
+                let mut n = self.reply_packet_id.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            let mut reply = bytes::BytesMut::new();
+            encrypt_server_payload(
+                &self.context,
+                self.method,
+                &self.key,
+                &target,
+                &ctrl,
+                &pkt[..n],
+                &mut reply,
+            );
+            let _ = self.reply_tx.send(reply.to_vec());
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(self.bound)
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A front conn that replays a scripted `(bytes, reported_src)` queue —
+    /// exercises the chained read path's drop-and-continue branches (junk
+    /// ciphertext, foreign wire source) without sockets.
+    struct ScriptedFront {
+        remote: SocketAddr,
+        script: Mutex<std::collections::VecDeque<(Vec<u8>, SocketAddr)>>,
+        written: Mutex<Vec<Vec<u8>>>,
+        short_write: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedFront {
+        fn new(remote: SocketAddr) -> Self {
+            Self {
+                remote,
+                script: Mutex::new(std::collections::VecDeque::new()),
+                written: Mutex::new(Vec::new()),
+                short_write: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for ScriptedFront {
+        async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+            let Some((pkt, src)) = self.script.lock().unwrap().pop_front() else {
+                // Script exhausted: park forever (a real conn would block on
+                // the wire); tests close via `close`/drop.
+                return std::future::pending().await;
+            };
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
+            Ok((n, src))
+        }
+
+        async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
+            assert_eq!(
+                *addr, self.remote,
+                "chained writes must go to the SS server endpoint"
+            );
+            self.written.lock().unwrap().push(buf.to_vec());
+            if self.short_write.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(buf.len() / 2);
+            }
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(self.remote)
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Dialer variant that returns a [`ScriptedFront`] conn.
+    struct ScriptedFrontDialer {
+        front: Mutex<Option<Arc<ScriptedFront>>>,
+    }
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for ScriptedFrontDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+            _internal: bool,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+
+        fn supports_udp(&self) -> bool {
+            true
+        }
+
+        async fn dial_udp_conn(
+            &self,
+            _remote: SocketAddr,
+            _internal: bool,
+        ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
+            self.front
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|f| f as Arc<dyn ProxyPacketConn>)
+                .ok_or_else(|| std::io::Error::other("no scripted front"))
+        }
+    }
+
+    /// A `dialer-proxy` dialer whose UDP endpoint is [`FakeSsUdpServer`] —
+    /// installed after adapter construction because the fake needs the
+    /// adapter's crypto context.
+    #[derive(Default)]
+    struct FakeChainedDialer {
+        server: Mutex<Option<Arc<FakeSsUdpServer>>>,
+        dialed: Mutex<Vec<SocketAddr>>,
+    }
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for FakeChainedDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+            _internal: bool,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+
+        fn supports_udp(&self) -> bool {
+            true
+        }
+
+        async fn dial_udp_conn(
+            &self,
+            remote: SocketAddr,
+            _internal: bool,
+        ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
+            self.dialed.lock().unwrap().push(remote);
+            self.server
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|s| s as Arc<dyn ProxyPacketConn>)
+                .ok_or_else(|| std::io::Error::other("fake front has no server"))
+        }
+    }
+
     fn ss_adapter(udp: bool, dialer: Arc<dyn crate::dialer::TcpDialer>) -> ShadowsocksAdapter {
+        ss_adapter_with(udp, "password", "aes-256-gcm", dialer)
+    }
+
+    fn ss_adapter_with(
+        udp: bool,
+        password: &str,
+        cipher: &str,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
+    ) -> ShadowsocksAdapter {
         ShadowsocksAdapter::new(
             "ss-test",
             "127.0.0.1",
             8388,
-            "password",
-            "aes-256-gcm",
+            password,
+            cipher,
             udp,
             None,
             None,
@@ -1400,32 +1886,205 @@ mod tests {
         .expect("adapter builds")
     }
 
-    /// Regression: the plain SS UDP relay binds a raw socket and connects
-    /// straight to the SS server, bypassing the TCP dialer. With a proxy dialer
-    /// installed it must refuse, not egress from the real source path.
+    /// Fail-closed: under a `dialer-proxy` chain the plain SS UDP relay must
+    /// never reach the raw-socket path — a front that cannot carry UDP
+    /// refuses the association instead of leaking the real source path.
     ///
-    /// `dial_udp` is the enforcement point on purpose: the tunnel's UDP
-    /// dispatch (`meow-tunnel/src/udp.rs`) calls it directly and never consults
-    /// `support_udp()`, so gating only the latter would leave the leak open for
-    /// any rule that references the outbound by name.
+    /// `dial_udp` is the enforcement point on purpose: routing probes do
+    /// consult `support_udp` for target eligibility (tunnel.rs
+    /// `RouteTargetProbe`), so the advertisement alone can steer a UDP
+    /// flow to a later rule — but the dispatch path (`meow-tunnel/src/
+    /// udp.rs`) calls `dial_udp` directly, so gating only the
+    /// advertisement would leave the leak open for any rule that
+    /// references the outbound by name.
     #[tokio::test]
-    async fn plain_udp_is_refused_under_proxy_dialer() {
+    async fn chained_udp_fails_closed_when_front_cannot_carry() {
         let adapter = ss_adapter(true, Arc::new(FakeProxyDialer));
 
         // `ProxyPacketConn` is not `Debug`, so match rather than `expect_err`.
+        // Assert the variant, not the text: `NotSupported` is the class that
+        // keeps the refusal exempt from group dead-marking — a reworded
+        // `Proxy` would silently break the exemption.
         match adapter.dial_udp(&Metadata::default()).await {
-            Err(MeowError::NotSupported(m)) => assert!(
-                m.contains("dialer-proxy"),
-                "refusal should name dialer-proxy, got: {m}"
+            Err(MeowError::NotSupported(msg)) => assert!(
+                msg.contains("dialer-proxy"),
+                "refusal should name dialer-proxy, got: {msg}"
             ),
-            Err(other) => panic!("expected NotSupported, got: {other:?}"),
-            Ok(_) => panic!("plain UDP must be refused under a proxy dialer"),
+            Err(e) => panic!("expected NotSupported refusal, got: {e:?}"),
+            Ok(_) => panic!("chained UDP must fail when the front cannot carry it"),
         }
 
         assert!(
             !adapter.support_udp(),
-            "advertised capability must agree with the refusal"
+            "advertised capability must agree: no UDP through a UDP-less front"
         );
+    }
+
+    /// The `dialer-proxy` UDP path: `dial_udp` must dial the SS server's UDP
+    /// endpoint through the injected dialer (`dial_udp_conn`, never a raw
+    /// socket) and run the SS crypto layer over the returned conn.
+    #[tokio::test]
+    async fn chained_udp_round_trips_ss_crypto_over_front_conn() {
+        // AEAD-2022 exercises the `SsUdpSession` control path end-to-end:
+        // the fake server echoes the client session ID and stamps its own
+        // server session ID / packet counter, which `accept_reply` must
+        // accept. (Password for 2022 is base64 of the 32-byte key.)
+        for (password, cipher) in [
+            ("password", "aes-256-gcm"),
+            (
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                "2022-blake3-aes-256-gcm",
+            ),
+        ] {
+            let dialer = Arc::new(FakeChainedDialer::default());
+            let adapter = ss_adapter_with(true, password, cipher, Arc::clone(&dialer) as _);
+            assert!(
+                adapter.support_udp(),
+                "a UDP-capable front makes chained UDP advertised ({cipher})"
+            );
+            let server = Arc::new(FakeSsUdpServer::new(
+                "127.0.0.1:8388".parse().unwrap(),
+                &adapter.core,
+            ));
+            *dialer.server.lock().unwrap() = Some(Arc::clone(&server));
+
+            let conn = adapter
+                .dial_udp(&Metadata::default())
+                .await
+                .expect("chained dial_udp");
+
+            // The dialer was handed the resolved SS server UDP endpoint.
+            assert_eq!(
+                dialer.dialed.lock().unwrap().as_slice(),
+                &["127.0.0.1:8388".parse().unwrap()],
+            );
+
+            let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+            // Two datagrams: the 2022 reply filter must accept increasing
+            // server packet IDs within one server session.
+            for payload in [b"hello chained udp".as_slice(), b"second".as_slice()] {
+                conn.write_packet(payload, &target).await.expect("write");
+                let mut buf = [0u8; 2048];
+                let (n, src) = conn.read_packet(&mut buf).await.expect("read");
+                assert_eq!(&buf[..n], payload, "{cipher}");
+                assert_eq!(src, target, "reply source is the inner SS target");
+            }
+
+            // Wire shape: the front conn saw only the SS-server endpoint —
+            // the real destination rode encrypted inside the SS payload.
+            assert_eq!(
+                server.outer.lock().unwrap().as_slice(),
+                &[
+                    "127.0.0.1:8388".parse().unwrap(),
+                    "127.0.0.1:8388".parse().unwrap()
+                ],
+            );
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.len(), 2);
+            assert_eq!(inner[0].0, Address::SocketAddress(target));
+            assert_eq!(inner[0].1, b"hello chained udp");
+        }
+    }
+
+    /// Chained read path: junk ciphertext and foreign wire sources drop
+    /// per-datagram without killing the association — the filter then
+    /// delivers the first valid reply.
+    #[tokio::test]
+    async fn chained_udp_drops_junk_and_foreign_sources() {
+        let remote: SocketAddr = "127.0.0.1:8388".parse().unwrap();
+        let front = Arc::new(ScriptedFront::new(remote));
+        let adapter = ss_adapter(
+            true,
+            Arc::new(ScriptedFrontDialer {
+                front: Mutex::new(Some(Arc::clone(&front))),
+            }),
+        );
+        let conn = adapter
+            .dial_udp(&Metadata::default())
+            .await
+            .expect("chained dial_udp");
+
+        // Mint a server reply with the same crypto/context the server would
+        // use, so the client arm's decrypt + session filter must accept it.
+        let server = FakeSsUdpServer::new(remote, &adapter.core);
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut reply = bytes::BytesMut::new();
+        shadowsocks::relay::udprelay::crypto_io::encrypt_server_payload(
+            &server.context,
+            server.method,
+            &server.key,
+            &Address::SocketAddress(target),
+            &Default::default(),
+            b"real-reply",
+            &mut reply,
+        );
+
+        let foreign: SocketAddr = "9.9.9.9:1234".parse().unwrap();
+        {
+            let mut q = front.script.lock().unwrap();
+            // 1. junk ciphertext from the right source → decrypt fails → drop
+            q.push_back((vec![0xde, 0xad, 0xbe, 0xef], remote));
+            // 2. valid ciphertext from a foreign source → source filter drops
+            q.push_back((reply.to_vec(), foreign));
+            // 3. the real reply from the bound remote → delivered
+            q.push_back((reply.to_vec(), remote));
+        }
+
+        let mut buf = [0u8; 2048];
+        let (n, src) = conn.read_packet(&mut buf).await.expect("read");
+        assert_eq!(&buf[..n], b"real-reply");
+        assert_eq!(src, target);
+    }
+
+    /// Chained write path: ciphertext beyond u16::MAX is refused before the
+    /// write (stream fronts frame with a u16 length — a wrap would desync),
+    /// and a front that returns a short write is an error, never a silent
+    /// truncation of ciphertext.
+    #[tokio::test]
+    async fn chained_udp_rejects_oversized_and_short_writes() {
+        let remote: SocketAddr = "127.0.0.1:8388".parse().unwrap();
+        let front = Arc::new(ScriptedFront::new(remote));
+        let adapter = ss_adapter(
+            true,
+            Arc::new(ScriptedFrontDialer {
+                front: Mutex::new(Some(Arc::clone(&front))),
+            }),
+        );
+        let conn = adapter
+            .dial_udp(&Metadata::default())
+            .await
+            .expect("chained dial_udp");
+
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        // Oversized: a u16::MAX payload encrypts to > u16::MAX under any
+        // cipher's overhead — but the write must never reach the front.
+        let big = vec![0u8; u16::MAX as usize];
+        let writes_before = front.written.lock().unwrap().len();
+        match conn.write_packet(&big, &target).await {
+            Err(e) if front.written.lock().unwrap().len() == writes_before => {
+                assert!(
+                    format!("{e:?}").contains("u16"),
+                    "expected u16 refusal: {e:?}"
+                );
+            }
+            Err(e) => panic!("oversized datagram touched the front conn: {e:?}"),
+            Ok(n) => panic!("oversized datagram reported success ({n})"),
+        }
+
+        // Short write: the front reports fewer bytes written.
+        front
+            .short_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        match conn.write_packet(b"payload", &target).await {
+            Err(e) => {
+                assert!(
+                    format!("{e:?}").contains("truncat"),
+                    "expected short-write error: {e:?}"
+                );
+            }
+            Ok(n) => panic!("short write reported success ({n})"),
+        }
     }
 
     /// Every built-in TCP-only plugin must refuse `dial_udp` and name

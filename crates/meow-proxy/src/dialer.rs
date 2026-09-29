@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 
 use async_trait::async_trait;
-use meow_common::{ConnType, Metadata, Network, Proxy, ProxyConn};
+use meow_common::{ConnType, MeowError, Metadata, Network, Proxy, ProxyConn, ProxyPacketConn};
 use meow_transport::Stream;
 use smol_str::SmolStr;
 
@@ -62,12 +62,46 @@ pub trait TcpDialer: Send + Sync {
     }
 
     /// Whether this dialer tunnels through another proxy (vs. direct).
-    ///
-    /// Adapters whose UDP path uses a raw socket that bypasses `dial()`
-    /// (e.g. Shadowsocks UDP relay) should check this and disable UDP when a
-    /// proxy dialer is installed, so UDP traffic does not leak past the
-    /// `dialer-proxy` chain.
     fn is_proxy(&self) -> bool {
+        false
+    }
+
+    /// UDP association to `remote` — mihomo's `dialer.ListenPacket`.
+    ///
+    /// A direct dialer binds a real socket; a proxy dialer asks its front
+    /// hop for a UDP relay association to `remote`, so the caller's
+    /// datagrams ride the `dialer-proxy` chain instead of leaking the real
+    /// source path. The returned conn is *bound* to `remote`:
+    /// `write_packet`'s addr is advisory (bound-at-dial conns such as VLESS
+    /// or mux ignore it; per-packet conns such as SOCKS5 must be handed
+    /// `remote`).
+    ///
+    /// `internal` mirrors `dial()` — housekeeping traffic marks it so a
+    /// lazy front-hop group does not count the chained dial as use.
+    ///
+    /// `Arc` (not `Box`) because the kcptun transport wraps the conn in a
+    /// `PacketConnSocket` whose pump tasks each hold a reference.
+    ///
+    /// The default errors — implementations without UDP cannot carry it.
+    async fn dial_udp_conn(
+        &self,
+        _remote: SocketAddr,
+        _internal: bool,
+    ) -> io::Result<Arc<dyn ProxyPacketConn>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "dialer cannot provide a UDP endpoint",
+        ))
+    }
+
+    /// Whether [`dial_udp_conn`](Self::dial_udp_conn) can succeed — the
+    /// dialer-layer counterpart of `ProxyAdapter::support_udp`.
+    ///
+    /// A by-name proxy dialer answers with the resolved front's snapshot.
+    /// That answer is provisional when the front is a group (the member
+    /// live at dial time decides), so callers must still fail closed on a
+    /// `dial_udp_conn` error rather than trusting this flag.
+    fn supports_udp(&self) -> bool {
         false
     }
 
@@ -115,11 +149,11 @@ impl TcpDialer for DirectDialer {
         Ok(Box::new(tcp))
     }
 
-    #[cfg(feature = "kcptun")]
-    async fn dial_udp_endpoint(
+    async fn dial_udp_conn(
         &self,
         remote: SocketAddr,
-    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        _internal: bool,
+    ) -> io::Result<Arc<dyn ProxyPacketConn>> {
         // Same bind-family + protect-hook dance as the SS UDP relay path:
         // `bind_udp` routes the fd through the installed SocketProtector
         // (Android VpnService.protect) before `connect`.
@@ -130,7 +164,64 @@ impl TcpDialer for DirectDialer {
         };
         let udp = meow_common::bind_udp(bind_addr).await?;
         udp.connect(remote).await?;
+        Ok(Arc::new(ConnectedUdpConn {
+            socket: udp,
+            remote,
+        }))
+    }
+
+    fn supports_udp(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "kcptun")]
+    async fn dial_udp_endpoint(
+        &self,
+        remote: SocketAddr,
+    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        // Not shared with `dial_udp_conn` above: kcptun needs the raw
+        // `UdpSocket` for `SocketIo::apply_socket_options` (sockbuf/DSCP),
+        // which `ProxyPacketConn` does not expose.
+        let bind_addr: SocketAddr = if remote.is_ipv4() {
+            "0.0.0.0:0".parse().expect("static")
+        } else {
+            "[::]:0".parse().expect("static")
+        };
+        let udp = meow_common::bind_udp(bind_addr).await?;
+        udp.connect(remote).await?;
         Ok(Box::new(udp))
+    }
+}
+
+/// `ProxyPacketConn` over a connected raw UDP socket — the direct arm of
+/// [`TcpDialer::dial_udp_conn`]. Datagrams always go to `remote`;
+/// `write_packet`'s addr is ignored, matching the bound-destination
+/// semantics a front proxy applies to a chained association.
+struct ConnectedUdpConn {
+    socket: tokio::net::UdpSocket,
+    remote: SocketAddr,
+}
+
+#[async_trait]
+impl ProxyPacketConn for ConnectedUdpConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        let n = self.socket.recv(buf).await.map_err(MeowError::Io)?;
+        Ok((n, self.remote))
+    }
+
+    async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+        self.socket.send(buf).await.map_err(MeowError::Io)
+    }
+
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.socket.local_addr().map_err(MeowError::Io)
+    }
+
+    /// Contract no-op like `Socks5UdpConn::close`: a connected socket has no
+    /// association state to release — it dies on the last `Arc` drop and a
+    /// parked `recv` is not interrupted.
+    fn close(&self) -> meow_common::Result<()> {
+        Ok(())
     }
 }
 
@@ -354,33 +445,62 @@ impl TcpDialer for ProxyDialer {
         true
     }
 
+    async fn dial_udp_conn(
+        &self,
+        remote: SocketAddr,
+        internal: bool,
+    ) -> io::Result<Arc<dyn ProxyPacketConn>> {
+        // `proxyDialer.ListenPacket` upstream: the datagram endpoint is the
+        // front proxy's UDP relay association to `remote`. `ConnType::Inner`
+        // like `dial()` — this is infrastructure traffic, not user inbound.
+        let meta = Metadata {
+            network: Network::Udp,
+            conn_type: ConnType::Inner,
+            dst_ip: Some(remote.ip()),
+            dst_port: remote.port(),
+            internal,
+            ..Default::default()
+        };
+        let conn = self.proxy.dial_udp(&meta).await.map_err(|e| match e {
+            // Capability errors keep their class across the `io::Error`
+            // boundary so the adapter can reconstitute `NotSupported` —
+            // `DialFailureTracker::on_failure` exempts capability errors
+            // from dead-marking, and a UDP-less front must not cost the
+            // node its health.
+            MeowError::NotSupported(_) | MeowError::UdpNotSupported => {
+                io::Error::new(io::ErrorKind::Unsupported, format!("dialer-proxy udp: {e}"))
+            }
+            e => io::Error::other(format!("dialer-proxy udp: {e}")),
+        })?;
+        Ok(Arc::from(conn))
+    }
+
+    fn supports_udp(&self) -> bool {
+        // Point-in-time snapshot: a group front reports its live
+        // selection's capability, so `dial_udp_conn` remains the
+        // authoritative gate. Guarded the same way `NamedProxyDialer` is —
+        // every in-tree `ProxyDialer` is ephemeral under a named frame, but
+        // `ProxyDialer::new` is `pub` and an embedder could inject one where
+        // the front group resolves back to the caller's own adapter.
+        let Some(_depth) = SupportsUdpDepth::enter() else {
+            return false;
+        };
+        self.proxy.support_udp()
+    }
+
     #[cfg(feature = "kcptun")]
     async fn dial_udp_endpoint(
         &self,
         remote: SocketAddr,
     ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
-        // `proxyDialer.ListenPacket` upstream: the datagram endpoint is the
-        // front proxy's UDP relay association to `remote`. `ConnType::Inner`
-        // like `dial()` — this is infrastructure traffic, not user inbound.
         // `internal` stays false by the same rule as mux session
         // establishment: the pooled kcptun session is the ONLY dial signal
         // a lazy front hop sees for this chain — per-stream `open_stream`
         // calls never re-dial while a session lives — so marking it
         // internal would leave the front hop permanently "unused" while
         // user traffic flows (issue #555 boundary).
-        let meta = Metadata {
-            network: Network::Udp,
-            conn_type: ConnType::Inner,
-            dst_ip: Some(remote.ip()),
-            dst_port: remote.port(),
-            ..Default::default()
-        };
-        let conn = self
-            .proxy
-            .dial_udp(&meta)
-            .await
-            .map_err(|e| io::Error::other(format!("dialer-proxy udp: {e}")))?;
-        Ok(Box::new(PacketConnSocket::new(Arc::from(conn), remote)))
+        let conn = self.dial_udp_conn(remote, false).await?;
+        Ok(Box::new(PacketConnSocket::new(conn, remote)))
     }
 }
 
@@ -543,6 +663,38 @@ tokio::task_local! {
 /// stack. 16 is far above any sane front-hop depth.
 pub(crate) const MAX_DIALER_CHAIN_DEPTH: usize = 16;
 
+std::thread_local! {
+    /// Depth of nested `supports_udp` resolution on the current thread —
+    /// the synchronous counterpart of `DIALER_CHAIN_DEPTH`. A dynamic
+    /// `node → group → node` cycle recurses through `front.support_udp()`
+    /// with no await point for [`scoped_chain_dial`] to bound, so the sync
+    /// capability query needs its own limit.
+    static SUPPORTS_UDP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII decrement for [`SUPPORTS_UDP_DEPTH`] — bounds `supports_udp`
+/// recursion the way [`scoped_chain_dial`] bounds dial recursion.
+struct SupportsUdpDepth;
+
+impl SupportsUdpDepth {
+    /// `None` once the chain exceeds [`MAX_DIALER_CHAIN_DEPTH`] (or during
+    /// thread-local teardown) — treat as "capability unknown", which is
+    /// fail-safe: a cyclic chain can't carry UDP anyway.
+    fn enter() -> Option<Self> {
+        SUPPORTS_UDP_DEPTH
+            .try_with(|d| (d.get() < MAX_DIALER_CHAIN_DEPTH).then(|| d.set(d.get() + 1)))
+            .ok()
+            .flatten()
+            .map(|()| Self)
+    }
+}
+
+impl Drop for SupportsUdpDepth {
+    fn drop(&mut self) {
+        let _ = SUPPORTS_UDP_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Run `f` as one nested `dialer-proxy` hop; `over_limit` produces the
 /// caller's error type when the chain exceeds [`MAX_DIALER_CHAIN_DEPTH`].
 /// Every by-name dial entry point — [`NamedProxyDialer`]'s TCP and UDP
@@ -600,6 +752,49 @@ impl TcpDialer for NamedProxyDialer {
 
     fn is_proxy(&self) -> bool {
         true
+    }
+
+    async fn dial_udp_conn(
+        &self,
+        remote: SocketAddr,
+        internal: bool,
+    ) -> io::Result<Arc<dyn ProxyPacketConn>> {
+        // Same guard as `dial_inner`: a UDP-capable node's association
+        // setup calls this through the injected dialer, so
+        // `node → group → node` cycles recurse here without ever touching
+        // `dial`/`dial_addr`.
+        scoped_chain_dial(
+            self.target.name(),
+            |name| {
+                io::Error::other(format!(
+                    "dialer-proxy '{name}': chain exceeds {MAX_DIALER_CHAIN_DEPTH} hops; \
+                     a provider member or group is routing the dial back into itself"
+                ))
+            },
+            async {
+                let front = self
+                    .target
+                    .resolve()
+                    .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+                ProxyDialer::new(front)
+                    .dial_udp_conn(remote, internal)
+                    .await
+            },
+        )
+        .await
+    }
+
+    fn supports_udp(&self) -> bool {
+        // Depth-bounded like the dial path: a provider-sourced dynamic
+        // cycle (`node → group → node`) would otherwise recurse through
+        // `front.support_udp()` until the native stack exhausts. The guard
+        // lives in `ProxyDialer::supports_udp` so exactly one depth slot is
+        // consumed per named hop — and direct `ProxyDialer` injection stays
+        // covered too. `false` on overflow is fail-safe: the dial would
+        // fail the same guard.
+        self.target
+            .resolve()
+            .is_some_and(|front| ProxyDialer::new(front).supports_udp())
     }
 
     #[cfg(feature = "kcptun")]
@@ -747,6 +942,255 @@ mod tests {
         seen.last()
             .expect("a dial must reach the front proxy")
             .clone()
+    }
+
+    /// Sink conn returned by [`CapturingUdpProxy`]'s `dial_udp` — dial tests
+    /// never pump it, so reads pend forever and writes are black-holed.
+    struct SinkPacketConn;
+
+    #[async_trait]
+    impl ProxyPacketConn for SinkPacketConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok("0.0.0.0:0".parse().unwrap())
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+    }
+
+    /// UDP-aware front mock: captures `dial_udp` metadata and honours the
+    /// `udp` flag — a false flag produces `UdpNotSupported` like a real
+    /// UDP-incapable front (HTTP, Reject).
+    struct CapturingUdpProxy {
+        udp: bool,
+        seen: Mutex<Vec<Metadata>>,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for CapturingUdpProxy {
+        fn name(&self) -> &str {
+            "udp-front"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Socks5
+        }
+        fn addr(&self) -> &str {
+            "127.0.0.1:1080"
+        }
+        fn support_udp(&self) -> bool {
+            self.udp
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "test mock refuses connections".to_string(),
+            ))
+        }
+        async fn dial_udp(&self, metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            self.seen.lock().unwrap().push(metadata.clone());
+            if !self.udp {
+                return Err(meow_common::MeowError::UdpNotSupported);
+            }
+            Ok(Box::new(SinkPacketConn))
+        }
+        fn health(&self) -> &ProxyHealth {
+            static H: std::sync::OnceLock<ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for CapturingUdpProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_dialer_udp_conn_is_inner_udp_to_remote() {
+        // mihomo `proxyDialer.ListenPacket`: a chained UDP endpoint must
+        // reach the front as `Inner` + `Udp` metadata addressed at the
+        // *inner proxy's server endpoint* (here `remote`), not at the
+        // user's target — the caller layers its own per-packet addressing
+        // inside.
+        let mock = Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dialer = ProxyDialer::new(Arc::clone(&mock) as Arc<dyn Proxy>);
+        let remote: SocketAddr = "203.0.113.7:8388".parse().unwrap();
+
+        let conn = dialer
+            .dial_udp_conn(remote, false)
+            .await
+            .expect("UDP-capable front yields a conn");
+        {
+            let meta = mock.seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(meta.network, Network::Udp);
+            assert_eq!(meta.conn_type, ConnType::Inner);
+            assert_eq!(meta.dst_ip, Some(remote.ip()));
+            assert_eq!(meta.dst_port, remote.port());
+            assert!(!meta.internal);
+        }
+
+        // The `internal` housekeeping marker rides the UDP path too.
+        let _ = dialer.dial_udp_conn(remote, true).await;
+        assert!(mock.seen.lock().unwrap().last().unwrap().internal);
+
+        // The bound-destination contract: writes target `remote`.
+        assert_eq!(conn.write_packet(b"x", &remote).await.unwrap(), 1);
+        assert!(dialer.supports_udp(), "capability delegates to the front");
+
+        // A UDP-incapable front advertises false and fails the dial loudly.
+        let incapable = ProxyDialer::new(Arc::new(CapturingUdpProxy {
+            udp: false,
+            seen: Mutex::new(Vec::new()),
+        }) as Arc<dyn Proxy>);
+        assert!(!incapable.supports_udp());
+        match incapable.dial_udp_conn(remote, false).await {
+            Err(e) => assert!(
+                e.to_string().contains("dialer-proxy udp"),
+                "front error must propagate with chain context, got: {e}"
+            ),
+            Ok(_) => panic!("UDP-incapable front must fail the chained dial"),
+        }
+    }
+
+    #[tokio::test]
+    async fn named_dialer_udp_conn_resolves_front_per_dial() {
+        let registry = ProxyRegistry::default();
+        let remote: SocketAddr = "203.0.113.9:8388".parse().unwrap();
+
+        let mock = Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("front"), Arc::clone(&mock) as Arc<dyn Proxy>);
+        registry.publish(Arc::new(proxies));
+
+        let dialer = NamedProxyDialer::new(DialerTarget::new("front", &registry));
+        assert!(dialer.supports_udp());
+        dialer
+            .dial_udp_conn(remote, true)
+            .await
+            .expect("by-name UDP dial resolves");
+        let meta = mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(meta.network, Network::Udp);
+        assert_eq!(meta.dst_ip, Some(remote.ip()));
+        assert!(meta.internal, "internal must survive NamedProxyDialer");
+
+        // A rebuilt generation swapping in a UDP-incapable front flips the
+        // advertisement and closes the dial — no stale capability survives.
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::from("front"),
+            Arc::new(CapturingUdpProxy {
+                udp: false,
+                seen: Mutex::new(Vec::new()),
+            }) as Arc<dyn Proxy>,
+        );
+        registry.publish(Arc::new(proxies));
+        assert!(!dialer.supports_udp());
+        assert!(dialer.dial_udp_conn(remote, false).await.is_err());
+
+        // A dropped registry fails closed (never a direct fallback).
+        drop(registry);
+        assert!(!dialer.supports_udp());
+        match dialer.dial_udp_conn(remote, false).await {
+            Err(e) => assert!(
+                e.to_string().contains("registry generation dropped"),
+                "got: {e}"
+            ),
+            Ok(_) => panic!("dropped registry must fail closed"),
+        }
+    }
+
+    /// A proxy whose `support_udp` consults a `dialer-proxy` dialer that
+    /// resolves back to itself — the `node → group → node` dynamic-cycle
+    /// shape, reproduced without a group. Without the
+    /// [`SUPPORTS_UDP_DEPTH`] guard this recurses until the stack blows.
+    struct LoopyProxy {
+        dialer: NamedProxyDialer,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for LoopyProxy {
+        fn name(&self) -> &str {
+            "loopy"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Socks5
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            self.dialer.supports_udp()
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("loopy".into()))
+        }
+        async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            Err(meow_common::MeowError::UdpNotSupported)
+        }
+        fn health(&self) -> &ProxyHealth {
+            static H: std::sync::OnceLock<ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for LoopyProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn supports_udp_bounds_dynamic_cycles() {
+        let registry = ProxyRegistry::default();
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::from("loopy"),
+            Arc::new(LoopyProxy {
+                dialer: NamedProxyDialer::new(DialerTarget::new("loopy", &registry)),
+            }) as Arc<dyn Proxy>,
+        );
+        registry.publish(Arc::new(proxies));
+
+        let dialer = NamedProxyDialer::new(DialerTarget::new("loopy", &registry));
+        assert!(
+            !dialer.supports_udp(),
+            "a cyclic capability query must bottom out at the depth guard"
+        );
     }
 
     #[tokio::test]
@@ -1255,5 +1699,102 @@ mod tests {
             err.to_string().contains("exceeds"),
             "depth bound must be the surfaced error: {err}"
         );
+    }
+
+    /// `PacketConnSocket` bridges an async `ProxyPacketConn` onto the
+    /// poll-based `SocketIo` surface kcptun consumes: poll_send queues into
+    /// the write pump (which `write_packet`s the bound remote), poll_recv
+    /// surfaces pumped inbound datagrams, and a dead read pump turns recv
+    /// into BrokenPipe.
+    #[cfg(feature = "kcptun")]
+    #[tokio::test]
+    async fn packet_conn_socket_bridges_poll_and_async() {
+        use futures::future::poll_fn;
+        use meow_transport::kcptun::SocketIo;
+        use tokio::io::ReadBuf;
+
+        /// A datagram conn fed by a channel: `read_packet` parks on the
+        /// receiver until the test pushes a datagram; dropping `tx` makes
+        /// the pump error out, mimicking a dead association.
+        struct MockConn {
+            remote: SocketAddr,
+            // tokio Mutex: the std MutexGuard is !Send and cannot be held
+            // across `recv().await` inside the spawned read pump.
+            read_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+            written: Mutex<Vec<Vec<u8>>>,
+            closed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl ProxyPacketConn for MockConn {
+            async fn read_packet(&self, buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                match self.read_rx.lock().await.recv().await {
+                    Some(pkt) => {
+                        let n = pkt.len().min(buf.len());
+                        buf[..n].copy_from_slice(&pkt[..n]);
+                        Ok((n, self.remote))
+                    }
+                    None => Err(MeowError::Proxy("mock conn closed".into())),
+                }
+            }
+            async fn write_packet(&self, data: &[u8], addr: &SocketAddr) -> MeowResult<usize> {
+                assert_eq!(*addr, self.remote);
+                self.written.lock().unwrap().push(data.to_vec());
+                Ok(data.len())
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok(self.remote)
+            }
+            fn close(&self) -> MeowResult<()> {
+                self.closed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let conn = Arc::new(MockConn {
+            remote,
+            read_rx: tokio::sync::Mutex::new(rx),
+            written: Mutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let conn_cloned = Arc::clone(&conn);
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn_cloned;
+        let mut sock = super::packet_conn_socket::PacketConnSocket::new(conn_dyn, remote);
+
+        // Outbound: poll_send → write pump → conn.write_packet(remote).
+        poll_fn(|cx| sock.poll_send(cx, b"ping"))
+            .await
+            .expect("poll_send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(conn.written.lock().unwrap().as_slice(), &[b"ping"]);
+
+        // Inbound: a pushed datagram surfaces through poll_recv.
+        tx.send(b"pong".to_vec()).unwrap();
+        let mut raw = [0u8; 64];
+        let mut rb = ReadBuf::new(&mut raw);
+        poll_fn(|cx| sock.poll_recv(cx, &mut rb))
+            .await
+            .expect("poll_recv");
+        assert_eq!(rb.filled(), b"pong");
+
+        // Oversized inbound datagram truncates like a datagram socket.
+        tx.send(vec![7u8; 60000]).unwrap();
+        let mut small = [0u8; 16];
+        let mut rb2 = ReadBuf::new(&mut small);
+        poll_fn(|cx| sock.poll_recv(cx, &mut rb2))
+            .await
+            .expect("truncated recv");
+        assert_eq!(rb2.filled().len(), 16);
+
+        // Dead read pump (channel closed) → recv errors BrokenPipe.
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut sink = [0u8; 64];
+        let mut rb3 = ReadBuf::new(&mut sink);
+        let r = poll_fn(|cx| sock.poll_recv(cx, &mut rb3)).await;
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

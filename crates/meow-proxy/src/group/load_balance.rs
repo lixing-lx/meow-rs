@@ -305,7 +305,12 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     fn support_udp(&self) -> bool {
-        self.any_member(|p| p.support_udp())
+        // Mirror the UDP pick's eligibility filter: a member ineligible at
+        // pick time cannot be picked, so it must not advertise capability
+        // either — otherwise an empty `select_udp` would surface as
+        // NoProxyAvailable (a real failure) instead of the capability
+        // refusal it is.
+        self.any_member(|p| self.eligible(p, true))
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -317,9 +322,19 @@ impl ProxyAdapter for LoadBalanceGroup {
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         self.usage.touch_user_traffic(metadata);
-        let proxy = self
-            .select_udp(metadata)
-            .ok_or(MeowError::NoProxyAvailable)?;
+        // An empty UDP pick with alive members is a capability refusal
+        // (nothing alive can carry UDP), not an availability failure —
+        // keep the class exempt from dead-marking like a leaf's refusal.
+        let proxy = self.select_udp(metadata).ok_or_else(|| {
+            if self.any_member(|p| self.eligible(p, false)) {
+                MeowError::NotSupported(format!(
+                    "load-balance {}: no alive member can carry UDP",
+                    self.name
+                ))
+            } else {
+                MeowError::NoProxyAvailable
+            }
+        })?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
         attempt.finish(proxy.dial_udp(metadata).await)
     }
@@ -916,12 +931,25 @@ mod tests {
 
     #[tokio::test]
     async fn dial_udp_all_udp_proxies_dead_returns_error() {
-        // All UDP-capable proxies dead → NoProxyAvailable. NOT a dial to non-UDP proxy.
+        // UDP member dead + TCP-only member alive → NotSupported: an
+        // availability-empty UDP pick is a *capability* refusal (upstream
+        // ErrNotSupport), exempt from dead-marking — a chained inner node
+        // must not eat the front's UDP-eligibility miss.
         let a = MockProxy::new_udp("A");
         let b = MockProxy::new("B"); // no UDP, alive
+        let b_ref = Arc::clone(&b);
         a.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b];
         let group = make_rr(proxies);
+        let result = group.dial_udp(&meta_no_src()).await;
+        assert!(
+            matches!(result, Err(MeowError::NotSupported(_))),
+            "expected NotSupported, got: {:?}",
+            result.err()
+        );
+
+        // Every member dead → NoProxyAvailable (real availability failure).
+        b_ref.set_alive(false);
         let result = group.dial_udp(&meta_no_src()).await;
         assert!(
             matches!(result, Err(MeowError::NoProxyAvailable)),

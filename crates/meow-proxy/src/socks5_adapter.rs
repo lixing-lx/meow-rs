@@ -689,8 +689,17 @@ struct Socks5UdpConn {
 #[async_trait]
 impl ProxyPacketConn for Socks5UdpConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let n = self.socket.recv(buf).await.map_err(MeowError::Io)?;
-        decode_udp_datagram(buf, n)
+        // A malformed relay datagram is per-datagram: it is already
+        // consumed from the socket, so skip it instead of letting one
+        // junk packet kill the whole association (upstream mihomo treats
+        // decode failures the same way).
+        loop {
+            let n = self.socket.recv(buf).await.map_err(MeowError::Io)?;
+            match decode_udp_datagram(buf, n) {
+                Ok(ok) => return Ok(ok),
+                Err(e) => debug!("socks5 udp: dropping malformed relay datagram: {e}"),
+            }
+        }
     }
 
     async fn write_packet(&self, data: &[u8], addr: &SocketAddr) -> Result<usize> {

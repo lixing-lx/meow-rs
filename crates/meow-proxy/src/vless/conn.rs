@@ -544,6 +544,15 @@ impl ProxyPacketConn for VlessPacketConn {
     /// Write a UDP packet as `u16_be(len) + data`.
     async fn write_packet(&self, buf: &[u8], _addr: &std::net::SocketAddr) -> Result<usize> {
         crate::check_not_desynced(&self.poisoned)?;
+        // A `buf.len() > u16::MAX` cast would wrap the length field and
+        // permanently desync the stream framing — reject like the trojan,
+        // mux, anytls and snell datagram writers already do.
+        if buf.len() > u16::MAX as usize {
+            return Err(MeowError::Proxy(format!(
+                "vless udp: datagram {}B exceeds u16 frame limit",
+                buf.len()
+            )));
+        }
         let mut writer = self.writer.lock().await;
         // Re-check after the lock: a write parked behind one cancelled
         // mid-frame must not append after the torn frame.

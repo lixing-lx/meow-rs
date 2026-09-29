@@ -271,7 +271,12 @@ impl ProxyAdapter for UrlTestGroup {
     }
 
     fn support_udp(&self) -> bool {
-        self.fastest_proxy().is_some_and(|p| p.support_udp())
+        // Answer for the member `dial_udp` would actually pick — not the
+        // stale `fastest` cache: `pick_for_dial` recomputes the selection
+        // (including tolerance hysteresis) so a UDP query neither under-
+        // advertises before the first TCP dial nor over-advertises when
+        // `fastest` names a member that has since gone dead.
+        self.pick_for_dial().is_some_and(|p| p.support_udp())
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {

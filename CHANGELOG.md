@@ -10,6 +10,31 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Shadowsocks UDP relay through `dialer-proxy` chains** — an SS node's
+  plain UDP association now rides the front proxy's own UDP relay
+  (`dial_udp`) instead of being refused, matching mihomo's
+  `proxyDialer.ListenPacket` and sing-box's `detour` semantics: the
+  front's association is bound to the SS server's UDP endpoint while the
+  per-packet destination stays encrypted inside the Shadowsocks payload.
+  `TcpDialer` grows `dial_udp_conn` + a `supports_udp` capability query
+  (depth-bounded against dynamic `node → group → node` cycles), which the
+  SS adapter consults for both its `support_udp` advertisement and a
+  fail-closed pre-flight — a UDP-less front errors at dial time rather
+  than leaking the real source path, and never falls back to a raw
+  socket. External SIP003 plugins keep owning their UDP leg (the local
+  listener is never chain-routed), TCP-only plugins still refuse UDP,
+  and mux / kcptun-UoT transports keep their precedence over native
+  chained UDP.  (Advisory-flag semantics are unchanged: the node-level
+  `udp:` toggle only gates `support_udp`, never `dial_udp` — same as the
+  direct path.)
+
+  Capability errors keep their class across the whole surface: a front's
+  UDP refusal surfaces as `NotSupported` (exempt from dead-marking) through
+  the chained arm, the kcptun endpoint arm, and an empty load-balance UDP
+  pick (which previously reported `NoProxyAvailable` even when alive
+  members existed).  SOCKS5 and Hysteria2 UDP fronts now drop malformed
+  relay datagrams per-datagram instead of tearing down the association.
+
 - **In-process `gost-plugin` for Shadowsocks** — `plugin: gost-plugin` now
   runs natively instead of spawning a SIP003 subprocess, matching mihomo's
   built-in: TCP → optional TLS (ALPN `http/1.1`, SNI from `host` or a `Host`

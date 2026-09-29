@@ -277,12 +277,19 @@ async fn run_udp_session(
             received = session.recv() => {
                 match received {
                     Ok((data, addr)) => {
-                        let parsed = addr.parse::<SocketAddr>().map_err(|e| {
-                            MeowError::Proxy(format!("hysteria2 udp: invalid source address '{addr}': {e}"))
-                        });
-                        let packet = parsed.map(|src| (Bytes::from(data), src));
-                        if packets.send(packet).await.is_err() {
-                            return;
+                        // A bad source address is per-datagram junk: the
+                        // datagram is already consumed from the session,
+                        // so drop it rather than poison the association
+                        // with a fatal read error.
+                        match addr.parse::<SocketAddr>() {
+                            Ok(src) => {
+                                if packets.send(Ok((Bytes::from(data), src))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => debug!(
+                                "hysteria2 udp: dropping datagram with invalid source '{addr}': {e}"
+                            ),
                         }
                     }
                     Err(e) => {
