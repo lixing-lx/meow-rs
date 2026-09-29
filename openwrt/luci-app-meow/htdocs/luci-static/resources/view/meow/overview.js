@@ -231,12 +231,19 @@ return view.extend({
 				])
 			]),
 			E('div', { 'class': 'cbi-page-actions' }, [
-				E('a', {
-					'class': 'cbi-button cbi-button-action',
-					'href': meow.panelURL(),
-					'target': '_blank',
-					'rel': 'noopener'
-				}, _('Open panel')),
+				// Without a secret the API is loopback-only; the Panel tab explains
+				// that and offers to set one.
+				meow.secret()
+					? E('a', {
+						'class': 'cbi-button cbi-button-action',
+						'href': meow.panelURL(),
+						'target': '_blank',
+						'rel': 'noopener'
+					}, _('Open panel'))
+					: E('a', {
+						'class': 'cbi-button cbi-button-action',
+						'href': L.url('admin/services/meow/panel')
+					}, _('Open panel')),
 				' ', nodes.actions.start, ' ', nodes.actions.stop, ' ', nodes.actions.restart
 			])
 		]);

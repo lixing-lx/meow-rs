@@ -90,20 +90,36 @@ test('Log polling has an explicitly imported DOM dependency; filters and highlig
 for (const protocol of ['http:', 'https:']) {
   test(protocol + ' Overview API uses authenticated RPC; panel uses HTTP', async () => {
     const calls = [];
+    const uci = { get: (c, s, o) => (o === 'secret' ? 'abc' : null) };
     const api = load('tools/meow.js', {
-      baseclass: extend, rpc: { declare: () => async () => ({}) }, uci: { get: () => null },
+      baseclass: extend, rpc: { declare: () => async () => ({}) }, uci,
       fs: { exec: async (...args) => { calls.push(args); return { code: 0, stdout: '{"version":"test"}' }; } }
     }, { window: { location: { protocol, hostname: 'router.test' } } });
     assert.equal((await api.api('GET', '/version')).version, 'test');
     assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['/usr/libexec/meow-api', ['GET', '/version']]]);
-    assert.equal(api.panelURL(), 'http://router.test:9090/ui');
-    const panel = load('view/meow/panel.js', { view: extend, 'tools.meow': api },
+    assert.equal(api.panelURL(), 'http://router.test:9090/ui#token=abc');
+    const panel = load('view/meow/panel.js', { view: extend, 'tools.meow': api, uci, ui: {} },
       { window: { location: { protocol } } });
     const tree = panel.render();
     assert.equal(tree.children.some(n => n.tag === 'iframe'), protocol === 'http:');
     assert.match(JSON.stringify(tree), /http:\/\/router.test:9090\/ui/);
   });
 }
+
+test('Panel without an API secret explains loopback-only access instead of a blank frame', async () => {
+  const writes = [];
+  const uci = {
+    get: () => null, set: (...a) => writes.push(a), save: async () => {}, apply: async () => {}
+  };
+  const api = load('tools/meow.js', { baseclass: extend, rpc: { declare: () => () => {} }, uci },
+    { window: { location: { protocol: 'http:', hostname: 'router.test' } } });
+  const panel = load('view/meow/panel.js', {
+    view: extend, 'tools.meow': api, uci, ui: { createHandlerFn: (ctx, name) => name }
+  }, { window: { location: { protocol: 'http:' } }, L: { url: p => p } });
+  const tree = panel.render();
+  assert.ok(!tree.children.some(n => n && n.tag === 'iframe'));
+  assert.match(JSON.stringify(tree), /only reachable from the router.*handleEnableLan/);
+});
 
 test('API bridge errors propagate instead of rendering success', async () => {
   const api = load('tools/meow.js', {
