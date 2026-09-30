@@ -48,6 +48,25 @@ fn build_request_frame(addr: &SocketAddr, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Domain form of [`build_request_frame`] — `host-length > 0` carries the
+/// hostname bytes so the server resolves the target itself. Used when this
+/// adapter fronts a chained `UdpTarget::Name` (issue #657). `host` must be
+/// ≤255 bytes (the length prefix is a u8).
+fn build_request_frame_domain(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+    let host_bytes = host.as_bytes();
+    debug_assert!(
+        !host_bytes.is_empty() && host_bytes.len() <= u8::MAX as usize,
+        "domain length checked by caller"
+    );
+    let mut buf = Vec::with_capacity(1 + 1 + host_bytes.len() + 2 + payload.len());
+    buf.push(COMMAND_UDP_FORWARD);
+    buf.push(host_bytes.len() as u8);
+    buf.extend_from_slice(host_bytes);
+    buf.extend_from_slice(&port.to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
 /// Parse a server-to-client snell UDP response frame, writing the payload
 /// into `out` and returning (bytes copied, source address).
 fn parse_response_frame(frame: &[u8], out: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -132,16 +151,25 @@ pub struct SnellPacketConn<S> {
     poisoned: AtomicBool,
     /// Largest frame one record carries (v6 allows more than v3/v4).
     max_frame: usize,
+    /// A chained `UdpTarget::Name` binds every request frame's address to
+    /// the domain so the server resolves it (issue #657). `None` keeps
+    /// per-packet `SocketAddr` stamping.
+    write_target: Option<(smol_str::SmolStr, u16)>,
 }
 
 impl<S> SnellPacketConn<S> {
     pub fn new(snell: Snell<S>) -> Self {
+        Self::with_target(snell, None)
+    }
+
+    pub fn with_target(snell: Snell<S>, write_target: Option<(smol_str::SmolStr, u16)>) -> Self {
         Self {
             max_frame: snell.max_packet_frame_len(),
             stream: Arc::new(parking_lot::Mutex::new(snell)),
             read_gate: Mutex::new(Vec::new()),
             write_gate: Mutex::new(()),
             poisoned: AtomicBool::new(false),
+            write_target,
         }
     }
 }
@@ -184,7 +212,10 @@ where
         // Re-check after the lock: a write parked behind one cancelled
         // mid-frame must not append after the torn frame.
         crate::check_not_desynced(&self.poisoned)?;
-        let frame = build_request_frame(addr, buf);
+        let frame = match &self.write_target {
+            Some((host, port)) => build_request_frame_domain(host, *port, buf),
+            None => build_request_frame(addr, buf),
+        };
         // Oversize is rejected before arming the guard — an unwritable
         // datagram must not brick an otherwise healthy conn (the codec's
         // own check inside `poll_write_packet_frame` stays as backstop).
@@ -283,6 +314,44 @@ mod tests {
             .expect("read_packet");
         assert_eq!(payload, b"pong");
         assert_eq!(addr, dst);
+    }
+
+    /// A domain-bound conn (a chained `UdpTarget::Name` front, issue #657)
+    /// stamps the request frame with `host_len + hostname` — the caller's
+    /// `SocketAddr` arg is ignored.
+    #[tokio::test]
+    async fn domain_bound_conn_stamps_hostname_frame() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let conn = SnellPacketConn::with_target(
+            Snell::new(a, Arc::clone(&psk)),
+            Some(("back.internal".into(), 8388)),
+        );
+        let mut peer = V4Conn::new(b, psk);
+
+        conn.write_packet(b"ping", &"0.0.0.0:8388".parse().unwrap())
+            .await
+            .expect("write");
+
+        let mut buf = [0u8; 2048];
+        let n = timeout(Duration::from_secs(5), peer.read(&mut buf))
+            .await
+            .expect("peer read timed out")
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            &build_request_frame_domain("back.internal", 8388, b"ping")[..],
+            "frame must carry the domain form, not the advisory SocketAddr"
+        );
+        let mut expected = vec![COMMAND_UDP_FORWARD, 13];
+        expected.extend_from_slice(b"back.internal");
+        expected.extend_from_slice(&8388u16.to_be_bytes());
+        expected.extend_from_slice(b"ping");
+        assert_eq!(
+            &buf[..n],
+            &expected[..],
+            "host-length + hostname + port layout"
+        );
     }
 
     /// Issue #625.3: a `write_packet` future dropped mid-frame leaves a torn

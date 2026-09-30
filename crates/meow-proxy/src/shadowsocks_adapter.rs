@@ -1,3 +1,4 @@
+use crate::dialer::UdpTarget;
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
 use crate::gost_plugin;
@@ -341,6 +342,74 @@ impl ShadowsocksAdapter {
     /// is never chain-routed).
     fn udp_via_chain(&self) -> bool {
         self.core.dialer.is_proxy() && !self.plugin_owns_udp()
+    }
+
+    /// Dial the SS server's UDP endpoint through the `dialer-proxy` front.
+    ///
+    /// A [`UdpTarget::Name`] asks the front to resolve the name itself —
+    /// matching the view it used for the TCP leg (issue #657). A front
+    /// that cannot carry a domain target answers `ErrorKind::Unsupported`
+    /// and we fall back to a locally-resolved literal per candidate — the
+    /// pre-#657 behavior, still fail-closed through the same chain.
+    ///
+    /// Returns the conn plus the *effective* target (the literal a
+    /// fallback dial bound to), which the conn uses for its source filter.
+    async fn dial_udp_via_front(
+        &self,
+        target: UdpTarget,
+        internal: bool,
+    ) -> Result<(Arc<dyn ProxyPacketConn>, UdpTarget)> {
+        match self
+            .core
+            .dialer
+            .dial_udp_conn(target.clone(), internal)
+            .await
+        {
+            Ok(conn) => Ok((conn, target)),
+            // The dialer maps front `NotSupported`/`UdpNotSupported` to
+            // `ErrorKind::Unsupported` — a capability refusal, not a
+            // transport failure: `NotSupported` stays exempt from
+            // dead-marking (a UDP-less front must not cost the node its
+            // health), and every candidate would fail the same way.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => match &target {
+                UdpTarget::Addr(_) => Err(MeowError::NotSupported(format!(
+                    "ss udp via dialer-proxy {target}: {e}"
+                ))),
+                UdpTarget::Name { host, port } => {
+                    let candidates =
+                        meow_common::resolve_host_all(host, *port)
+                            .await
+                            .map_err(|e| {
+                                MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}"))
+                            })?;
+                    let mut last_err = None;
+                    for remote in candidates {
+                        match self
+                            .core
+                            .dialer
+                            .dial_udp_conn(UdpTarget::Addr(remote), internal)
+                            .await
+                        {
+                            Ok(conn) => return Ok((conn, UdpTarget::Addr(remote))),
+                            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                                return Err(MeowError::NotSupported(format!(
+                                    "ss udp via dialer-proxy {remote}: {e}"
+                                )));
+                            }
+                            Err(e) => {
+                                last_err = Some(format!("ss udp via dialer-proxy {remote}: {e}"));
+                            }
+                        }
+                    }
+                    Err(MeowError::Proxy(last_err.unwrap_or_else(|| {
+                        "ss udp via dialer-proxy: no candidates".into()
+                    })))
+                }
+            },
+            Err(e) => Err(MeowError::Proxy(format!(
+                "ss udp via dialer-proxy {target}: {e}"
+            ))),
+        }
     }
 }
 
@@ -985,12 +1054,14 @@ enum SsUdpIo {
     /// send/recv, which `ProxyPacketConn` already is).
     ///
     /// `remote` is the SS server's UDP endpoint: bound-at-dial conns
-    /// (VLESS, mux) ignore the per-packet addr; per-packet conns (SOCKS5)
-    /// encode it — either way it must be the server address, not the
-    /// inner SS target (that travels encrypted inside the payload).
+    /// (VLESS, mux, name-bound fronts) ignore the per-packet addr;
+    /// per-packet conns (SOCKS5) encode it — either way it must be the
+    /// server endpoint, not the inner SS target (that travels encrypted
+    /// inside the payload). A [`UdpTarget::Name`] keeps the server domain
+    /// so the front resolves it with the same view as the TCP leg.
     Chained {
         conn: Arc<dyn ProxyPacketConn>,
-        remote: SocketAddr,
+        remote: UdpTarget,
         context: SharedContext,
         method: CipherKind,
         key: Box<[u8]>,
@@ -1001,14 +1072,19 @@ enum SsUdpIo {
 struct SsPacketConn {
     io: SsUdpIo,
     session: SsUdpSession,
+    /// This adapter as a *front* for a domain-carrying association request
+    /// (issue #657): the SS payload's target stamps the name so the server
+    /// resolves it — the caller's per-packet `SocketAddr` arg is advisory.
+    write_target: Option<Address>,
 }
 
 impl SsPacketConn {
     fn chained(
         conn: Arc<dyn ProxyPacketConn>,
-        remote: SocketAddr,
+        remote: UdpTarget,
         core: &SsCore,
         session: SsUdpSession,
+        write_target: Option<Address>,
     ) -> Self {
         Self {
             io: SsUdpIo::Chained {
@@ -1020,6 +1096,7 @@ impl SsPacketConn {
                 identity_keys: core.server_config.clone_identity_keys(),
             },
             session,
+            write_target,
         }
     }
 }
@@ -1084,12 +1161,14 @@ impl ProxyPacketConn for SsPacketConn {
                 // the connected-socket filter the Raw arm had. Bound conns
                 // report `remote` or an unspecified addr (no source info);
                 // unspecified skips the check rather than breaking them.
-                // `to_canonical` collapses IPv4-mapped IPv6 forms so a
-                // resolver/front representation difference can't wedge the
-                // association on a spurious mismatch.
-                let same_src = outer_src.ip().to_canonical() == remote.ip().to_canonical()
-                    && outer_src.port() == remote.port();
-                if !same_src && !outer_src.ip().is_unspecified() {
+                // `src_matches` compares canonically for literal targets and
+                // by port only for a `Name` — a name-bound front resolved it
+                // itself, so the wire source legitimately differs from any
+                // local resolution (issue #657). The unspecified exemption is
+                // canonical too: `::ffff:0.0.0.0` must not sneak past as a
+                // "real" remote.
+                if !remote.src_matches(outer_src) && !outer_src.ip().to_canonical().is_unspecified()
+                {
                     debug!("ss udp: dropped chained reply from {outer_src} (expected {remote})");
                     continue;
                 }
@@ -1113,7 +1192,16 @@ impl ProxyPacketConn for SsPacketConn {
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        let target = Address::SocketAddress(*addr);
+        // A front-side domain association stamps its bound name as the
+        // decrypted target; otherwise the caller's per-packet addr rules.
+        let arg_target;
+        let target = match &self.write_target {
+            Some(t) => t,
+            None => {
+                arg_target = Address::SocketAddress(*addr);
+                &arg_target
+            }
+        };
         // An exhausted packet-ID space kills the association: the tunnel
         // drops the session on this error and the next datagram re-dials
         // under a fresh `SsUdpSession` — sslocal's recovery on counter
@@ -1128,7 +1216,7 @@ impl ProxyPacketConn for SsPacketConn {
                 // ProxySocket::send_with_ctrl returns the encrypted packet size
                 // (with protocol overhead), but callers expect the payload size.
                 socket
-                    .send_with_ctrl(&target, &control, buf)
+                    .send_with_ctrl(target, &control, buf)
                     .await
                     .map_err(|e| MeowError::Proxy(format!("ss udp send: {e}")))?;
             }
@@ -1149,7 +1237,7 @@ impl ProxyPacketConn for SsPacketConn {
                     context,
                     *method,
                     key,
-                    &target,
+                    target,
                     &control,
                     identity_keys,
                     buf,
@@ -1169,7 +1257,10 @@ impl ProxyPacketConn for SsPacketConn {
                 }
                 // A datagram conn must be atomic — a short write means the
                 // front truncated ciphertext, which no retry can repair.
-                let sent = conn.write_packet(&send_buf, remote).await?;
+                // `write_dst` is the literal for `Addr` targets and an
+                // advisory placeholder for a name-bound front conn (it
+                // stamps its own resolved target).
+                let sent = conn.write_packet(&send_buf, &remote.write_dst()).await?;
                 if sent != send_buf.len() {
                     return Err(MeowError::Proxy(format!(
                         "ss udp: front conn truncated datagram ({sent}/{} B)",
@@ -1198,14 +1289,28 @@ impl ProxyPacketConn for SsPacketConn {
     }
 }
 
-fn parse_address(metadata: &Metadata) -> Address {
-    if !metadata.host.is_empty() {
-        Address::DomainNameAddress(metadata.host.to_string(), metadata.dst_port)
-    } else if let Some(ip) = metadata.dst_ip {
-        Address::SocketAddress(SocketAddr::new(ip, metadata.dst_port))
-    } else {
-        Address::DomainNameAddress(metadata.host.to_string(), metadata.dst_port)
+/// The shadowsocks crate asserts `domain.len() <= u8::MAX` when serializing
+/// a `DomainNameAddress`, so an oversized provider/config hostname panics
+/// instead of erroring — refuse first. `NotSupported` also lets a chained
+/// `dial_udp_conn` caller fall back to a locally-resolved `UdpTarget::Addr`
+/// (issue #657).
+fn parse_address(metadata: &Metadata) -> Result<Address> {
+    if !metadata.host.is_empty() || metadata.dst_ip.is_none() {
+        if metadata.host.len() > u8::MAX as usize {
+            return Err(MeowError::NotSupported(format!(
+                "ss: domain target exceeds 255 bytes ({}B)",
+                metadata.host.len()
+            )));
+        }
+        return Ok(Address::DomainNameAddress(
+            metadata.host.to_string(),
+            metadata.dst_port,
+        ));
     }
+    Ok(Address::SocketAddress(SocketAddr::new(
+        metadata.dst_ip.expect("checked above"),
+        metadata.dst_port,
+    )))
 }
 
 #[async_trait]
@@ -1265,7 +1370,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let addr = parse_address(metadata);
+        let addr = parse_address(metadata)?;
         debug!("SS connecting to {} via {}", addr, self.addr_str);
 
         #[cfg(feature = "mux")]
@@ -1291,7 +1396,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
         stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        let addr = parse_address(metadata);
+        let addr = parse_address(metadata)?;
         debug!("SS connecting to {} via relay stream", addr);
 
         #[cfg(feature = "mux")]
@@ -1327,6 +1432,15 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // socket.
         #[cfg(feature = "kcptun")]
         if let PluginKind::Kcptun(client) = &self.core.plugin {
+            // The UoT per-packet address is `SocketAddr`-keyed — a domain
+            // association target cannot ride it. Refuse so the dialer layer
+            // falls back to a locally-resolved `UdpTarget::Addr`, which the
+            // kcptun path stamps per packet as before.
+            if let Some((host, _)) = metadata.domain_udp_target() {
+                return Err(MeowError::NotSupported(format!(
+                    "ss kcptun: cannot carry domain UDP target {host}"
+                )));
+            }
             debug!(
                 "SS UDP over kcptun UoT connecting to {} via {}",
                 metadata.remote_address(),
@@ -1355,6 +1469,28 @@ impl ProxyAdapter for ShadowsocksAdapter {
             return Err(MeowError::NotSupported(reason.into()));
         }
 
+        // This adapter as a *front*: a host-only UDP destination — the
+        // dialer layer's encoding of a chained `UdpTarget::Name`
+        // (issue #657) — binds the association to the name: the SS
+        // payload's target stamps the domain and the server resolves it
+        // with its own view. The mux arm above carries it natively on
+        // bound flows; the kcptun arm cannot and refuses below. The same
+        // `DomainNameAddress` length contract as `parse_address` applies —
+        // refuse an oversized name so the caller falls back to a literal
+        // `UdpTarget::Addr` instead of tripping the crate's assert.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) if host.len() <= u8::MAX as usize => {
+                Some(Address::DomainNameAddress(host.to_string(), port))
+            }
+            Some((host, _)) => {
+                return Err(MeowError::NotSupported(format!(
+                    "ss: domain UDP target exceeds 255 bytes ({}B)",
+                    host.len()
+                )));
+            }
+            None => None,
+        };
+
         // Snapshot pre-flight BEFORE resolving: a front that advertises no
         // UDP is a capability refusal (`NotSupported` is exempt from
         // dead-marking — the node itself isn't broken), and skipping the
@@ -1370,20 +1506,6 @@ impl ProxyAdapter for ShadowsocksAdapter {
             ));
         }
 
-        // The SS server's UDP endpoint — resolved here because both egress
-        // paths need it, and `ProxyPacketConn::write_packet` is
-        // `SocketAddr`-keyed: the chained path cannot hand the front a
-        // domain to resolve. `udp_external_addr` returns a literal
-        // `SocketAddr` for the standard path and the SIP003 plugin's local
-        // listener for external plugins (where the connect is loopback —
-        // protect is harmless).
-        let candidates = match self.core.server_config.udp_external_addr() {
-            ServerAddr::SocketAddr(sa) => vec![*sa],
-            ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
-                .await
-                .map_err(|e| MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}")))?,
-        };
-
         // mihomo `proxyDialer.ListenPacket`: under `dialer-proxy` the SS UDP
         // association rides the front proxy's own `dial_udp` — the
         // association's wire destination is the SS server's UDP endpoint and
@@ -1392,44 +1514,43 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // and skipped for external plugins (their UDP endpoint is the local
         // plugin listener — never chained).
         //
+        // A domain-form server address dials as `UdpTarget::Name` — the
+        // front resolves it with the same view as the control/TCP leg
+        // (issue #657); a front that cannot carry a domain refuses and
+        // `dial_udp_via_front` falls back to a local resolution.
+        //
         // Fail-closed (Class A, ADR-0002): a front that cannot carry UDP
         // surfaces its error and the raw-socket path below stays unreachable
         // on this branch — no silent real-source egress.
         if self.udp_via_chain() {
-            let mut last_err = None;
-            for remote in &candidates {
-                match self
-                    .core
-                    .dialer
-                    .dial_udp_conn(*remote, metadata.is_internal())
-                    .await
-                {
-                    Ok(conn) => {
-                        debug!("SS UDP chained to {remote} via {}", self.addr_str);
-                        let session =
-                            SsUdpSession::new(&self.core.context, self.core.server_config.method());
-                        return Ok(Box::new(SsPacketConn::chained(
-                            conn, *remote, &self.core, session,
-                        )));
-                    }
-                    // The dialer maps front `NotSupported`/`UdpNotSupported`
-                    // to `ErrorKind::Unsupported` — a capability refusal, not
-                    // a transport failure: every candidate would fail the
-                    // same way, and `NotSupported` stays exempt from
-                    // dead-marking (a UDP-less front must not cost the node
-                    // its health).
-                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        return Err(MeowError::NotSupported(format!(
-                            "ss udp via dialer-proxy {remote}: {e}"
-                        )));
-                    }
-                    Err(e) => last_err = Some(format!("ss udp via dialer-proxy {remote}: {e}")),
-                }
-            }
-            return Err(MeowError::Proxy(last_err.unwrap_or_else(|| {
-                "ss udp via dialer-proxy: no candidates".into()
-            })));
+            let target = match self.core.server_config.udp_external_addr() {
+                ServerAddr::SocketAddr(sa) => UdpTarget::Addr(*sa),
+                ServerAddr::DomainName(host, port) => UdpTarget::named(host, *port),
+            };
+            let (conn, bound) = self
+                .dial_udp_via_front(target, metadata.is_internal())
+                .await?;
+            debug!("SS UDP chained to {bound} via {}", self.addr_str);
+            let session = SsUdpSession::new(&self.core.context, self.core.server_config.method());
+            return Ok(Box::new(SsPacketConn::chained(
+                conn,
+                bound,
+                &self.core,
+                session,
+                write_target,
+            )));
         }
+
+        // The SS server's UDP endpoint for the raw path. `udp_external_addr`
+        // returns a literal `SocketAddr` for the standard path and the SIP003
+        // plugin's local listener for external plugins (where the connect is
+        // loopback — protect is harmless).
+        let candidates = match self.core.server_config.udp_external_addr() {
+            ServerAddr::SocketAddr(sa) => vec![*sa],
+            ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
+                .await
+                .map_err(|e| MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}")))?,
+        };
 
         // Hand-roll the UDP bind+connect so the installed
         // `meow_common::SocketProtector` sees the fd before bind — otherwise
@@ -1485,6 +1606,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
         Ok(Box::new(SsPacketConn {
             io: SsUdpIo::Raw(socket),
             session,
+            write_target,
         }))
     }
 
@@ -1806,7 +1928,7 @@ mod tests {
 
         async fn dial_udp_conn(
             &self,
-            _remote: SocketAddr,
+            _remote: UdpTarget,
             _internal: bool,
         ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
             self.front
@@ -1824,7 +1946,11 @@ mod tests {
     #[derive(Default)]
     struct FakeChainedDialer {
         server: Mutex<Option<Arc<FakeSsUdpServer>>>,
-        dialed: Mutex<Vec<SocketAddr>>,
+        dialed: Mutex<Vec<UdpTarget>>,
+        /// Refuse `UdpTarget::Name` dials `Unsupported` (a front that cannot
+        /// carry a domain) — exercises the caller's local-resolution
+        /// fallback (issue #657).
+        refuse_name: bool,
     }
 
     #[async_trait]
@@ -1848,9 +1974,16 @@ mod tests {
 
         async fn dial_udp_conn(
             &self,
-            remote: SocketAddr,
+            remote: UdpTarget,
             _internal: bool,
         ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
+            if self.refuse_name && matches!(remote, UdpTarget::Name { .. }) {
+                self.dialed.lock().unwrap().push(remote);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "front cannot carry domain targets",
+                ));
+            }
             self.dialed.lock().unwrap().push(remote);
             self.server
                 .lock()
@@ -1877,6 +2010,28 @@ mod tests {
             8388,
             password,
             cipher,
+            udp,
+            None,
+            None,
+            None,
+            dialer,
+        )
+        .expect("adapter builds")
+    }
+
+    /// Variant whose server is named by domain — exercises the
+    /// `UdpTarget::Name` dial (issue #657).
+    fn ss_adapter_named(
+        udp: bool,
+        server: &str,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
+    ) -> ShadowsocksAdapter {
+        ShadowsocksAdapter::new(
+            "ss-test",
+            server,
+            8388,
+            "password",
+            "aes-256-gcm",
             udp,
             None,
             None,
@@ -1956,7 +2111,7 @@ mod tests {
             // The dialer was handed the resolved SS server UDP endpoint.
             assert_eq!(
                 dialer.dialed.lock().unwrap().as_slice(),
-                &["127.0.0.1:8388".parse().unwrap()],
+                &[UdpTarget::Addr("127.0.0.1:8388".parse().unwrap())],
             );
 
             let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -2085,6 +2240,129 @@ mod tests {
             }
             Ok(n) => panic!("short write reported success ({n})"),
         }
+    }
+
+    /// A domain-named SS server dials the front as `UdpTarget::Name` — the
+    /// front resolves the server with the same view that carried the TCP
+    /// leg, closing the split-horizon/GeoDNS divergence (issue #657).
+    #[tokio::test]
+    async fn chained_udp_domain_server_dials_name_target() {
+        let dialer = Arc::new(FakeChainedDialer::default());
+        let adapter = ss_adapter_named(true, "localhost", Arc::clone(&dialer) as _);
+        let server = Arc::new(FakeSsUdpServer::new(
+            "127.0.0.1:8388".parse().unwrap(),
+            &adapter.core,
+        ));
+        *dialer.server.lock().unwrap() = Some(server);
+
+        let conn = adapter
+            .dial_udp(&Metadata::default())
+            .await
+            .expect("chained dial_udp");
+
+        assert_eq!(
+            dialer.dialed.lock().unwrap().as_slice(),
+            &[UdpTarget::Name {
+                host: "localhost".into(),
+                port: 8388
+            }],
+            "domain server must reach the front as a name, not a local resolution"
+        );
+
+        // Writes take the advisory placeholder dst; replies filtered by
+        // port only (the front's resolution legitimately differs from ours).
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        conn.write_packet(b"ping", &target).await.expect("write");
+        let mut buf = [0u8; 2048];
+        let (n, src) = conn.read_packet(&mut buf).await.expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(src, target);
+    }
+
+    /// A front that cannot carry a domain target answers `Unsupported`;
+    /// the adapter resolves the name locally and redials the literal —
+    /// the pre-#657 behavior, still fail-closed through the chain.
+    #[tokio::test]
+    async fn chained_udp_name_unsupported_falls_back_to_literal() {
+        let dialer = Arc::new(FakeChainedDialer {
+            refuse_name: true,
+            ..Default::default()
+        });
+        let adapter = ss_adapter_named(true, "localhost", Arc::clone(&dialer) as _);
+        let server = Arc::new(FakeSsUdpServer::new(
+            "127.0.0.1:8388".parse().unwrap(),
+            &adapter.core,
+        ));
+        *dialer.server.lock().unwrap() = Some(server);
+
+        let _conn = adapter
+            .dial_udp(&Metadata::default())
+            .await
+            .expect("name refusal falls back to a local literal dial");
+
+        let dialed = dialer.dialed.lock().unwrap().clone();
+        assert_eq!(dialed.len(), 2, "name attempt, then literal retry");
+        assert_eq!(
+            dialed[0],
+            UdpTarget::Name {
+                host: "localhost".into(),
+                port: 8388
+            }
+        );
+        let UdpTarget::Addr(addr) = dialed[1] else {
+            panic!("fallback must dial a literal, got {:?}", dialed[1]);
+        };
+        assert!(addr.ip().is_loopback(), "localhost resolves loopback");
+        assert_eq!(addr.port(), 8388);
+    }
+
+    /// This adapter as a *front*: host-only metadata (the dialer layer's
+    /// encoding of `UdpTarget::Name`) stamps the *inner* SS payload target
+    /// with the domain so the SS server resolves it — while the front
+    /// conn's wire destination stays the SS server endpoint (issue #657).
+    #[tokio::test]
+    async fn front_udp_domain_target_encrypts_domain_inner() {
+        let remote: SocketAddr = "127.0.0.1:8388".parse().unwrap();
+        let front = Arc::new(ScriptedFront::new(remote));
+        let adapter = ss_adapter(
+            true,
+            Arc::new(ScriptedFrontDialer {
+                front: Mutex::new(Some(Arc::clone(&front))),
+            }),
+        );
+        // The dialer-layer encoding of `UdpTarget::Name`: host set, no dst_ip.
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "back.internal".into(),
+            dst_port: 8388,
+            ..Default::default()
+        };
+        let conn = adapter.dial_udp(&meta).await.expect("front dial_udp");
+        // The caller holds no literal — its write arg is the placeholder.
+        conn.write_packet(b"payload", &"0.0.0.0:8388".parse().unwrap())
+            .await
+            .expect("write");
+
+        // One ciphertext frame went to the SS server endpoint on the wire...
+        let written = front.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        // ...and decrypts to a *domain* target addressed to back.internal.
+        use shadowsocks::relay::udprelay::crypto_io::decrypt_client_payload;
+        let mut pkt = written[0].clone();
+        let (n, target, _ctrl) = decrypt_client_payload(
+            &adapter.core.context,
+            adapter.core.server_config.method(),
+            adapter.core.server_config.key(),
+            &mut pkt,
+            None,
+        )
+        .expect("frame decrypts");
+        assert_eq!(&pkt[..n], b"payload");
+        assert_eq!(
+            target,
+            Address::DomainNameAddress("back.internal".to_string(), 8388),
+            "inner SS target must carry the domain, not the advisory arg"
+        );
     }
 
     /// Every built-in TCP-only plugin must refuse `dial_udp` and name
@@ -2473,5 +2751,51 @@ mod tests {
         assert!(matches!(got, BuiltinObfs::Tls { .. }));
         let got = parse_obfs_opts(Some("obfs=tls;mode=http;host=foo"), "1.2.3.4").unwrap();
         assert!(matches!(got, BuiltinObfs::Http { .. }));
+    }
+
+    /// The shadowsocks crate `assert!`s `domain.len() <= u8::MAX` while
+    /// serializing — a >255-byte target must error, never panic (issue #657
+    /// review; the TCP `parse_address` hole predates the UDP path).
+    #[test]
+    fn parse_address_rejects_oversized_domain() {
+        let meta = Metadata {
+            host: "a".repeat(256).into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let Err(e) = parse_address(&meta) else {
+            panic!("256-byte domain must error");
+        };
+        assert!(matches!(e, MeowError::NotSupported(_)), "{e:?}");
+
+        // 255 stays encodable.
+        let meta = Metadata {
+            host: "a".repeat(255).into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(matches!(
+            parse_address(&meta),
+            Ok(Address::DomainNameAddress(..))
+        ));
+    }
+
+    /// Front role: a chained `UdpTarget::Name` arrives as host-only UDP
+    /// metadata — an oversized name must refuse `NotSupported` (so the
+    /// caller falls back to a literal `Addr`) rather than trip the crate's
+    /// assert during packet encode.
+    #[tokio::test]
+    async fn front_udp_refuses_oversized_domain_target() {
+        let adapter = ss_adapter_named(true, "127.0.0.1", Arc::new(FakeProxyDialer));
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "a".repeat(256).into(),
+            dst_port: 8388,
+            ..Default::default()
+        };
+        let Err(e) = adapter.dial_udp(&meta).await else {
+            panic!("oversized domain target must error");
+        };
+        assert!(matches!(e, MeowError::NotSupported(_)), "{e:?}");
     }
 }

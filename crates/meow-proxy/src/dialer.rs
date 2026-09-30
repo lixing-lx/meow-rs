@@ -21,6 +21,95 @@ use meow_common::{ConnType, MeowError, Metadata, Network, Proxy, ProxyConn, Prox
 use meow_transport::Stream;
 use smol_str::SmolStr;
 
+/// UDP association target for [`TcpDialer::dial_udp_conn`].
+///
+/// `Addr` is a literal endpoint, bound by whichever side dials. `Name`
+/// asks the *front* of a `dialer-proxy` chain to resolve `host` with its
+/// own resolver view — on the wire, where the front's protocol carries
+/// domains — so the UDP association lands on the same server the front
+/// picked for the chained TCP/control leg (issue #657: a local resolution
+/// can pick a different backend under split-horizon or GeoDNS, and the
+/// association then blackholes replies while failing closed).
+///
+/// A front that cannot carry a domain target refuses with
+/// `ErrorKind::Unsupported`; the caller then resolves `host` itself and
+/// redials with [`UdpTarget::Addr`] — today's behavior, preserved as the
+/// fallback. Conns returned for `Name` are *name-bound*: their
+/// `write_packet` ignores the addr arg and they may report read sources
+/// that differ from any local resolution of `host`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdpTarget {
+    /// A literal endpoint.
+    Addr(SocketAddr),
+    /// A domain endpoint the front should resolve.
+    Name { host: SmolStr, port: u16 },
+}
+
+impl UdpTarget {
+    /// Build a target from a host string: IP literals collapse to
+    /// [`UdpTarget::Addr`] (nothing to delegate — the stricter source
+    /// filter stays available), anything else becomes [`UdpTarget::Name`].
+    pub fn named(host: &str, port: u16) -> Self {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => UdpTarget::Addr(SocketAddr::new(ip, port)),
+            Err(_) => UdpTarget::Name {
+                host: SmolStr::new(host),
+                port,
+            },
+        }
+    }
+
+    /// The addr callers hand to `ProxyPacketConn::write_packet`.
+    ///
+    /// Bound conns (VLESS, mux, name-bound fronts) ignore the arg, so for
+    /// `Name` — where the caller holds no literal — this returns an
+    /// unspecified placeholder carrying only the port. Per-packet conns
+    /// are only ever returned for [`UdpTarget::Addr`] (or a caller-side
+    /// fallback to it), where the caller does hold the literal.
+    pub fn write_dst(&self) -> SocketAddr {
+        match self {
+            UdpTarget::Addr(addr) => *addr,
+            UdpTarget::Name { port, .. } => {
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), *port)
+            }
+        }
+    }
+
+    /// The association port — for `Name` targets the only locally-known
+    /// half of the wire identity.
+    pub fn port(&self) -> u16 {
+        match self {
+            UdpTarget::Addr(addr) => addr.port(),
+            UdpTarget::Name { port, .. } => *port,
+        }
+    }
+
+    /// Whether `src` is a plausible responder for this target.
+    ///
+    /// `Addr`: full canonical IP+port match (IPv4-mapped IPv6 forms
+    /// collapse). `Name`: the front resolved the name — the wire source
+    /// *should* differ from local resolution whenever views diverge (that
+    /// is the point of the fix), so only the port is checkable and a
+    /// foreign datagram must at least spoof the right port.
+    pub fn src_matches(&self, src: SocketAddr) -> bool {
+        match self {
+            UdpTarget::Addr(addr) => {
+                src.ip().to_canonical() == addr.ip().to_canonical() && src.port() == addr.port()
+            }
+            UdpTarget::Name { port, .. } => src.port() == *port,
+        }
+    }
+}
+
+impl std::fmt::Display for UdpTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UdpTarget::Addr(addr) => write!(f, "{addr}"),
+            UdpTarget::Name { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
 /// A pluggable dialer for the underlying connection to a proxy server.
 ///
 /// Mirrors mihomo's `C.Dialer` interface.  Adapters call `dial()` instead of
@@ -71,10 +160,14 @@ pub trait TcpDialer: Send + Sync {
     /// A direct dialer binds a real socket; a proxy dialer asks its front
     /// hop for a UDP relay association to `remote`, so the caller's
     /// datagrams ride the `dialer-proxy` chain instead of leaking the real
-    /// source path. The returned conn is *bound* to `remote`:
-    /// `write_packet`'s addr is advisory (bound-at-dial conns such as VLESS
-    /// or mux ignore it; per-packet conns such as SOCKS5 must be handed
-    /// `remote`).
+    /// source path. `remote` is a [`UdpTarget`]: `Addr` is literal,
+    /// `Name` asks the front to resolve the destination itself (issue
+    /// #657 — the front's view is the one its TCP/control leg used). The
+    /// returned conn is *bound* to `remote`: `write_packet`'s addr is
+    /// advisory — bound-at-dial conns (VLESS, mux, name-bound fronts)
+    /// ignore it; per-packet conns stamp it, so callers hand over
+    /// [`UdpTarget::write_dst`]. `read_packet`'s reported source follows
+    /// [`UdpTarget::src_matches`].
     ///
     /// `internal` mirrors `dial()` — housekeeping traffic marks it so a
     /// lazy front-hop group does not count the chained dial as use.
@@ -85,7 +178,7 @@ pub trait TcpDialer: Send + Sync {
     /// The default errors — implementations without UDP cannot carry it.
     async fn dial_udp_conn(
         &self,
-        _remote: SocketAddr,
+        _remote: UdpTarget,
         _internal: bool,
     ) -> io::Result<Arc<dyn ProxyPacketConn>> {
         Err(io::Error::new(
@@ -151,23 +244,49 @@ impl TcpDialer for DirectDialer {
 
     async fn dial_udp_conn(
         &self,
-        remote: SocketAddr,
+        remote: UdpTarget,
         _internal: bool,
     ) -> io::Result<Arc<dyn ProxyPacketConn>> {
-        // Same bind-family + protect-hook dance as the SS UDP relay path:
-        // `bind_udp` routes the fd through the installed SocketProtector
-        // (Android VpnService.protect) before `connect`.
-        let bind_addr: SocketAddr = if remote.is_ipv4() {
-            "0.0.0.0:0".parse().expect("static")
-        } else {
-            "[::]:0".parse().expect("static")
+        // A `Name` target has no remote to delegate resolution to — the
+        // local resolver is the only view a direct dial can take. Resolve
+        // here and fall into the literal path per candidate.
+        let candidates = match &remote {
+            UdpTarget::Addr(addr) => vec![*addr],
+            UdpTarget::Name { host, port } => meow_common::resolve_host_all(host, *port).await?,
         };
-        let udp = meow_common::bind_udp(bind_addr).await?;
-        udp.connect(remote).await?;
-        Ok(Arc::new(ConnectedUdpConn {
-            socket: udp,
-            remote,
-        }))
+        // Try candidates in resolver order: on a single-stack network the
+        // resolver can order an unreachable family first and a UDP
+        // connect() fails immediately with ENETUNREACH — falling through
+        // keeps the association alive like the SS raw-socket arm does.
+        let mut last_err = None;
+        for remote in candidates {
+            // Same bind-family + protect-hook dance as the SS UDP relay
+            // path: `bind_udp` routes the fd through the installed
+            // SocketProtector (Android VpnService.protect) before connect.
+            let bind_addr: SocketAddr = if remote.is_ipv4() {
+                "0.0.0.0:0".parse().expect("static")
+            } else {
+                "[::]:0".parse().expect("static")
+            };
+            let udp = match meow_common::bind_udp(bind_addr).await {
+                Ok(udp) => udp,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match udp.connect(remote).await {
+                Ok(()) => {
+                    return Ok(Arc::new(ConnectedUdpConn {
+                        socket: udp,
+                        remote,
+                    }));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no UDP dial candidates")))
     }
 
     fn supports_udp(&self) -> bool {
@@ -447,19 +566,37 @@ impl TcpDialer for ProxyDialer {
 
     async fn dial_udp_conn(
         &self,
-        remote: SocketAddr,
+        remote: UdpTarget,
         internal: bool,
     ) -> io::Result<Arc<dyn ProxyPacketConn>> {
         // `proxyDialer.ListenPacket` upstream: the datagram endpoint is the
         // front proxy's UDP relay association to `remote`. `ConnType::Inner`
         // like `dial()` — this is infrastructure traffic, not user inbound.
-        let meta = Metadata {
-            network: Network::Udp,
-            conn_type: ConnType::Inner,
-            dst_ip: Some(remote.ip()),
-            dst_port: remote.port(),
-            internal,
-            ..Default::default()
+        //
+        // A `Name` target populates `host` alone (`dst_ip` absent): the
+        // front binds an association to the *name*, resolving with its own
+        // resolver view — the front's server view, where the front's
+        // protocol can carry the domain — so the UDP leg lands on the same
+        // endpoint as the chained TCP/control leg (issue #657). Fronts
+        // that cannot express a domain target refuse with `NotSupported`,
+        // and the caller falls back to a local-resolution `Addr` dial.
+        let meta = match &remote {
+            UdpTarget::Addr(addr) => Metadata {
+                network: Network::Udp,
+                conn_type: ConnType::Inner,
+                dst_ip: Some(addr.ip()),
+                dst_port: addr.port(),
+                internal,
+                ..Default::default()
+            },
+            UdpTarget::Name { host, port } => Metadata {
+                network: Network::Udp,
+                conn_type: ConnType::Inner,
+                host: host.clone(),
+                dst_port: *port,
+                internal,
+                ..Default::default()
+            },
         };
         let conn = self.proxy.dial_udp(&meta).await.map_err(|e| match e {
             // Capability errors keep their class across the `io::Error`
@@ -499,7 +636,7 @@ impl TcpDialer for ProxyDialer {
         // calls never re-dial while a session lives — so marking it
         // internal would leave the front hop permanently "unused" while
         // user traffic flows (issue #555 boundary).
-        let conn = self.dial_udp_conn(remote, false).await?;
+        let conn = self.dial_udp_conn(UdpTarget::Addr(remote), false).await?;
         Ok(Box::new(PacketConnSocket::new(conn, remote)))
     }
 }
@@ -756,7 +893,7 @@ impl TcpDialer for NamedProxyDialer {
 
     async fn dial_udp_conn(
         &self,
-        remote: SocketAddr,
+        remote: UdpTarget,
         internal: bool,
     ) -> io::Result<Arc<dyn ProxyPacketConn>> {
         // Same guard as `dial_inner`: a UDP-capable node's association
@@ -1037,7 +1174,7 @@ mod tests {
         let remote: SocketAddr = "203.0.113.7:8388".parse().unwrap();
 
         let conn = dialer
-            .dial_udp_conn(remote, false)
+            .dial_udp_conn(UdpTarget::Addr(remote), false)
             .await
             .expect("UDP-capable front yields a conn");
         {
@@ -1050,7 +1187,7 @@ mod tests {
         }
 
         // The `internal` housekeeping marker rides the UDP path too.
-        let _ = dialer.dial_udp_conn(remote, true).await;
+        let _ = dialer.dial_udp_conn(UdpTarget::Addr(remote), true).await;
         assert!(mock.seen.lock().unwrap().last().unwrap().internal);
 
         // The bound-destination contract: writes target `remote`.
@@ -1063,7 +1200,10 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         }) as Arc<dyn Proxy>);
         assert!(!incapable.supports_udp());
-        match incapable.dial_udp_conn(remote, false).await {
+        match incapable
+            .dial_udp_conn(UdpTarget::Addr(remote), false)
+            .await
+        {
             Err(e) => assert!(
                 e.to_string().contains("dialer-proxy udp"),
                 "front error must propagate with chain context, got: {e}"
@@ -1088,7 +1228,7 @@ mod tests {
         let dialer = NamedProxyDialer::new(DialerTarget::new("front", &registry));
         assert!(dialer.supports_udp());
         dialer
-            .dial_udp_conn(remote, true)
+            .dial_udp_conn(UdpTarget::Addr(remote), true)
             .await
             .expect("by-name UDP dial resolves");
         let meta = mock.seen.lock().unwrap().last().unwrap().clone();
@@ -1108,18 +1248,165 @@ mod tests {
         );
         registry.publish(Arc::new(proxies));
         assert!(!dialer.supports_udp());
-        assert!(dialer.dial_udp_conn(remote, false).await.is_err());
+        assert!(dialer
+            .dial_udp_conn(UdpTarget::Addr(remote), false)
+            .await
+            .is_err());
 
         // A dropped registry fails closed (never a direct fallback).
         drop(registry);
         assert!(!dialer.supports_udp());
-        match dialer.dial_udp_conn(remote, false).await {
+        match dialer.dial_udp_conn(UdpTarget::Addr(remote), false).await {
             Err(e) => assert!(
                 e.to_string().contains("registry generation dropped"),
                 "got: {e}"
             ),
             Ok(_) => panic!("dropped registry must fail closed"),
         }
+    }
+
+    /// `named()` collapses IP literals to `Addr` (nothing to delegate) and
+    /// keeps real domains as `Name`.
+    #[test]
+    fn udp_target_named_collapses_ip_literals() {
+        assert_eq!(
+            UdpTarget::named("127.0.0.1", 8388),
+            UdpTarget::Addr("127.0.0.1:8388".parse().unwrap())
+        );
+        assert_eq!(
+            UdpTarget::named("::1", 53),
+            UdpTarget::Addr("[::1]:53".parse().unwrap())
+        );
+        assert_eq!(
+            UdpTarget::named("ss.example.com", 8388),
+            UdpTarget::Name {
+                host: "ss.example.com".into(),
+                port: 8388
+            }
+        );
+    }
+
+    /// `src_matches`: literal targets compare canonically (IPv4-mapped
+    /// aliases collapse); name targets compare port only — the front's
+    /// resolution legitimately differs from any local view (issue #657).
+    #[test]
+    fn udp_target_src_matches() {
+        let addr: SocketAddr = "203.0.113.7:8388".parse().unwrap();
+        let t = UdpTarget::Addr(addr);
+        assert!(t.src_matches(addr));
+        // IPv4-mapped IPv6 alias of the same peer.
+        assert!(t.src_matches("[::ffff:203.0.113.7]:8388".parse().unwrap()));
+        assert!(!t.src_matches("203.0.113.7:9999".parse().unwrap()));
+        assert!(!t.src_matches("203.0.113.8:8388".parse().unwrap()));
+
+        let t = UdpTarget::named("ss.example.com", 8388);
+        assert!(t.src_matches("198.51.100.1:8388".parse().unwrap()));
+        assert!(t.src_matches("[2001:db8::1]:8388".parse().unwrap()));
+        assert!(!t.src_matches("198.51.100.1:5300".parse().unwrap()));
+    }
+
+    /// `write_dst`/`port`: literals return the real endpoint; names return
+    /// an unspecified placeholder carrying the port (bound conns ignore it).
+    #[test]
+    fn udp_target_write_dst() {
+        let addr: SocketAddr = "203.0.113.7:8388".parse().unwrap();
+        assert_eq!(UdpTarget::Addr(addr).write_dst(), addr);
+        assert_eq!(UdpTarget::Addr(addr).port(), 8388);
+        let name = UdpTarget::named("ss.example.com", 8388);
+        assert_eq!(name.write_dst(), "0.0.0.0:8388".parse().unwrap());
+        assert_eq!(name.port(), 8388);
+    }
+
+    /// A `Name` target arrives at the front as host-only metadata — `host`
+    /// populated, `dst_ip` absent — the contract `Metadata::domain_udp_target`
+    /// detects downstream (issue #657).
+    #[tokio::test]
+    async fn proxy_dialer_udp_conn_name_sends_host_only_metadata() {
+        let mock = Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dialer = ProxyDialer::new(Arc::clone(&mock) as Arc<dyn Proxy>);
+
+        dialer
+            .dial_udp_conn(UdpTarget::named("ss.example.com", 8388), true)
+            .await
+            .expect("UDP-capable front yields a conn");
+
+        let meta = mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(meta.network, Network::Udp);
+        assert_eq!(meta.conn_type, ConnType::Inner);
+        assert_eq!(meta.host, "ss.example.com");
+        assert_eq!(meta.dst_ip, None, "Name targets carry no local resolution");
+        assert_eq!(meta.dst_port, 8388);
+        assert!(meta.internal);
+        let (host, port) = meta
+            .domain_udp_target()
+            .expect("the front adapter detects the domain request via this signal");
+        assert_eq!(host.as_str(), "ss.example.com");
+        assert_eq!(port, 8388);
+    }
+
+    /// `NamedProxyDialer` forwards a `Name` target unchanged — the front
+    /// resolves it, not an intermediate hop.
+    #[tokio::test]
+    async fn named_dialer_udp_conn_forwards_name_target() {
+        let registry = ProxyRegistry::default();
+        let mock = Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("front"), Arc::clone(&mock) as Arc<dyn Proxy>);
+        registry.publish(Arc::new(proxies));
+
+        let dialer = NamedProxyDialer::new(DialerTarget::new("front", &registry));
+        dialer
+            .dial_udp_conn(UdpTarget::named("relay.example.com", 5300), false)
+            .await
+            .expect("by-name UDP dial resolves");
+        let meta = mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(meta.host, "relay.example.com");
+        assert_eq!(meta.dst_ip, None);
+        assert_eq!(meta.dst_port, 5300);
+    }
+
+    /// `DirectDialer` on a `Name` target resolves locally — there is no
+    /// further resolver view to delegate to — and connects the socket.
+    /// Loopback echo proves the bound conn actually lands datagrams.
+    #[tokio::test]
+    async fn direct_dialer_udp_conn_name_resolves_and_exchanges() {
+        // `localhost` resolves to ::1 + 127.0.0.1 and the dialer picks the
+        // resolver's first candidate — echo on both families so whichever
+        // wins is served.
+        let echo4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo6 = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let port = echo4.local_addr().unwrap().port();
+        let echo6 = {
+            // Rebind v6 onto the same port — the dial target is one port.
+            drop(echo6);
+            tokio::net::UdpSocket::bind(("::1", port)).await.unwrap()
+        };
+        for sock in [echo4, echo6] {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+                    let _ = sock.send_to(&buf[..n], src).await;
+                }
+            });
+        }
+
+        let conn = DirectDialer
+            .dial_udp_conn(UdpTarget::named("localhost", port), false)
+            .await
+            .expect("localhost resolves");
+        conn.write_packet(b"ping", &conn.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (n, src) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        assert!(src.ip().is_loopback(), "loopback echo source, got {src}");
     }
 
     /// A proxy whose `support_udp` consults a `dialer-proxy` dialer that

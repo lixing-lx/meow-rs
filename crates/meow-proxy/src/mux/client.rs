@@ -374,6 +374,26 @@ impl MuxClient {
         if !self.supports_udp() {
             return Ok(None);
         }
+        // A chained `UdpTarget::Name` arrives as host-only metadata
+        // (issue #657). Bound-flow protocols (sing-mux/smux/h2mux) carry
+        // the name in the stream-open destination natively; mux.cool
+        // stamps a per-datagram `SocketAddr` destination the caller cannot
+        // supply for a name target — decline so the adapter's own UDP
+        // path picks up the domain request instead.
+        if let Some((host, _)) = metadata.domain_udp_target() {
+            if matches!(self.options.protocol, Protocol::MuxCool) {
+                return Ok(None);
+            }
+            // Bound flows carry the name in the stream-open Socksaddr —
+            // `encode_address` refuses >255 bytes with an io error, which
+            // would lose the capability class. Refuse as `NotSupported` so
+            // the chained caller falls back to `UdpTarget::Addr`.
+            if host.len() > u8::MAX as usize {
+                return Err(MeowError::NotSupported(format!(
+                    "{adapter} mux: domain UDP target exceeds 255 bytes"
+                )));
+            }
+        }
         let host = Self::metadata_host(metadata, adapter)?;
         self.open_packet_stream(&host, metadata.dst_port)
             .await
@@ -939,5 +959,72 @@ mod tests {
             error.to_string().contains("session setup timed out"),
             "unexpected error: {error}"
         );
+    }
+
+    /// The dialer-layer encoding of a chained `UdpTarget::Name` (issue
+    /// #657): host-only UDP metadata. Both checks must resolve before any
+    /// dial — a counting dial that pends proves it.
+    fn host_only_udp_meta(host: &str) -> Metadata {
+        Metadata {
+            network: meow_common::Network::Udp,
+            host: host.into(),
+            dst_port: 443,
+            ..Default::default()
+        }
+    }
+
+    /// mux.cool stamps a per-datagram `SocketAddr` destination it cannot
+    /// derive from a name — `open_packet_stream_for` declines (`Ok(None)`)
+    /// so the adapter's own UDP path handles the domain request.
+    #[tokio::test]
+    async fn packet_stream_muxcool_declines_domain_target() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let dial: DialFn = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending::<Result<Box<dyn ProxyConn>>>())
+        });
+        let client = MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::MuxCool,
+                ..MuxOptions::default()
+            },
+        );
+        let meta = host_only_udp_meta("relay.internal");
+        let got = client
+            .open_packet_stream_for(&meta, "test")
+            .await
+            .expect("decline is not an error");
+        assert!(got.is_none(), "mux.cool must decline a domain target");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Bound-flow protocols carry the name in the stream-open Socksaddr,
+    /// whose FQDN length is a u8 — an oversized name must surface as
+    /// `NotSupported` (capability class, so the chained caller falls back
+    /// to a literal `Addr`), not the io error `encode_address` would raise.
+    #[tokio::test]
+    async fn packet_stream_refuses_oversized_domain_target() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let dial: DialFn = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending::<Result<Box<dyn ProxyConn>>>())
+        });
+        let client = MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::Smux,
+                ..MuxOptions::default()
+            },
+        );
+        let meta = host_only_udp_meta(&"a".repeat(256));
+        match client.open_packet_stream_for(&meta, "test").await {
+            Err(MeowError::NotSupported(_)) => {}
+            Err(other) => panic!("expected NotSupported, got {other:?}"),
+            Ok(_) => panic!("oversized domain target must error"),
+        }
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

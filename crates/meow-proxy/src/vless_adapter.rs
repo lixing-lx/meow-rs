@@ -255,7 +255,7 @@ impl VlessAdapter {
         stream: Box<dyn meow_transport::Stream>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        let addr = addr_from_metadata(metadata);
+        let addr = addr_from_metadata(metadata).map_err(MeowError::NotSupported)?;
 
         // Choose flow string for the request header addon.
         let flow_str = match self.flow {
@@ -399,8 +399,13 @@ impl ProxyAdapter for VlessAdapter {
             self.addr_str
         );
 
+        // A >255-byte host cannot ride the one-byte domain length — refuse
+        // as `NotSupported` so a chained `dial_udp_conn` caller falls back to
+        // a locally-resolved `UdpTarget::Addr` instead of a truncated wire
+        // frame (issue #657).  Checked before dialing so the refusal costs
+        // no handshake.
+        let addr = addr_from_metadata(metadata).map_err(MeowError::NotSupported)?;
         let stream = self.dial_stream(metadata.is_internal()).await?;
-        let addr = addr_from_metadata(metadata);
 
         let conn = VlessPacketConn::new(stream, &self.uuid_bytes, metadata.dst_port, &addr).await?;
 

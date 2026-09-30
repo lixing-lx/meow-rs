@@ -201,20 +201,31 @@ impl Unpin for DirectConn {}
 impl ProxyConn for DirectConn {}
 
 // UDP wrapper
-struct DirectPacketConn(UdpSocket);
+struct DirectPacketConn {
+    socket: UdpSocket,
+    /// `Some` when the socket is `connect()`ed to a name-resolved target
+    /// (a chained `UdpTarget::Name`, issue #657): writes ignore the
+    /// advisory arg and reads report the connected peer.
+    bound: Option<SocketAddr>,
+}
 
 #[async_trait]
 impl ProxyPacketConn for DirectPacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        self.0.recv_from(buf).await.map_err(MeowError::Io)
+        self.socket.recv_from(buf).await.map_err(MeowError::Io)
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        self.0.send_to(buf, addr).await.map_err(MeowError::Io)
+        match self.bound {
+            // send_to() with the caller's placeholder arg would fail with
+            // EISCONN on a connected socket.
+            Some(_) => self.socket.send(buf).await.map_err(MeowError::Io),
+            None => self.socket.send_to(buf, addr).await.map_err(MeowError::Io),
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        self.0.local_addr().map_err(MeowError::Io)
+        self.socket.local_addr().map_err(MeowError::Io)
     }
 
     fn close(&self) -> Result<()> {
@@ -343,9 +354,52 @@ impl ProxyAdapter for DirectAdapter {
         // NAT session was never inserted, so no reply reader could ever form —
         // server→app QUIC replies had no socket to arrive on.
         //
+        // A chained `UdpTarget::Name` reaching a `direct` front arrives as
+        // host-only metadata (issue #657): direct is the terminal hop —
+        // there is no further resolver view to delegate to, so resolve
+        // through this adapter's configured resolver (the front's own view)
+        // and *connect* the socket. The conn is bound: the caller holds no
+        // literal for a name target and its write arg is only an advisory
+        // placeholder.
+        if metadata.domain_udp_target().is_some() {
+            let mut last_err = None;
+            for addr in self.resolve_targets(metadata).await? {
+                let bind: SocketAddr = if addr.is_ipv4() {
+                    "0.0.0.0:0".parse().expect("static")
+                } else {
+                    "[::]:0".parse().expect("static")
+                };
+                let socket = match meow_common::bind_udp(bind).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                match socket.connect(addr).await {
+                    Ok(()) => {
+                        return Ok(Box::new(DirectPacketConn {
+                            socket,
+                            bound: Some(addr),
+                        }));
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            return Err(MeowError::Io(last_err.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "direct udp: no candidates for {}",
+                        metadata.remote_address()
+                    ),
+                )
+            })));
+        }
+
         // The NAT key in `handle_udp` is `(src, dst)`, so a single direct UDP
         // session only ever targets one destination → one address family; we
-        // can bind the matching family up front. Falls back to IPv4 when the
+        // bind the matching family up front. Falls back to IPv4 when the
         // destination family is unknown (preserves the legacy behaviour).
         let dst_is_v6 = match metadata.dst_ip {
             Some(ip) => ip.is_ipv6(),
@@ -355,7 +409,10 @@ impl ProxyAdapter for DirectAdapter {
         let socket = meow_common::bind_udp(bind_addr)
             .await
             .map_err(MeowError::Io)?;
-        Ok(Box::new(DirectPacketConn(socket)))
+        Ok(Box::new(DirectPacketConn {
+            socket,
+            bound: None,
+        }))
     }
 
     /// Pass the stream through unchanged.
@@ -640,5 +697,51 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             "real IO error must not be relabeled as TimedOut: {io}"
         );
+    }
+
+    /// Front role: a chained `UdpTarget::Name` arrives as host-only UDP
+    /// metadata (issue #657). Direct is the terminal hop — it resolves via
+    /// the adapter's configured resolver and returns a *connected* socket
+    /// whose write arg is advisory.
+    #[tokio::test]
+    async fn dial_udp_host_only_resolves_and_connects() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, src) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], src).await.unwrap();
+        });
+
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("bound.test", vec![IpAddr::V4(Ipv4Addr::LOCALHOST)].into());
+        let resolver = Arc::new(Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        ));
+        let adapter = DirectAdapter::new().with_resolver(resolver);
+
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "bound.test".into(),
+            dst_port: port,
+            ..Default::default()
+        };
+        assert!(meta.domain_udp_target().is_some());
+        let conn = adapter.dial_udp(&meta).await.expect("host-only dial_udp");
+
+        // The caller's placeholder arg is ignored — the socket is bound.
+        conn.write_packet(b"ping", &"0.0.0.0:0".parse().unwrap())
+            .await
+            .expect("write");
+        let mut buf = [0u8; 16];
+        let (n, src) = conn.read_packet(&mut buf).await.expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(src, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        echo_task.await.unwrap();
     }
 }

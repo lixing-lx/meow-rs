@@ -717,8 +717,13 @@ The following are unsupported or intentionally rejected:
     relay, SOCKS5 UDP ASSOCIATE): the front proxy opens its own UDP
     association to the inner node's advertised datagram endpoint and the
     protocol framing rides it, failing closed when the front cannot carry
-    UDP rather than leaking the real source path. UDP carried inside a mux
-    session (`smux`/`yamux`/`h2mux`) traverses the chain as before.
+    UDP rather than leaking the real source path. Domain endpoints (a
+    domain-named inner server, a wildcard/domain SOCKS5 `BND.ADDR`) are
+    handed to the front unresolved so its resolver view decides the
+    backend (issue #657); fronts that cannot carry a name refuse
+    `NotSupported` and the inner node falls back to a locally-resolved
+    literal. UDP carried inside a mux session (`smux`/`yamux`/`h2mux`)
+    traverses the chain as before.
 
   `dialer-proxy` on **provider-sourced nodes** is honoured too (issue #489):
   the name resolves against the live route map at dial time — static proxies

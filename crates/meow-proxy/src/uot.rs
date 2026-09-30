@@ -46,6 +46,26 @@ pub(crate) fn encode_uot_addr(buf: &mut Vec<u8>, addr: &SocketAddr) {
     buf.extend_from_slice(&addr.port().to_be_bytes());
 }
 
+/// Append a per-packet uot domain address header — the form a chained
+/// `UdpTarget::Name` stamps so the server resolves the name (issue #657).
+/// `host` must be ≤255 bytes (the length prefix is a u8).
+///
+/// Only the opt-in `anytls` adapter writes the domain form — kcptun's UoT
+/// target is always the `SocketAddr` magic — so without the feature this
+/// serializer has no production caller and would trip `-D warnings`.
+#[cfg(any(feature = "anytls", test))]
+pub(crate) fn encode_uot_addr_domain(buf: &mut Vec<u8>, host: &str, port: u16) {
+    let host_bytes = host.as_bytes();
+    debug_assert!(
+        host_bytes.len() <= u8::MAX as usize,
+        "domain length checked by caller"
+    );
+    buf.push(UOT_ATYP_DOMAIN);
+    buf.push(u8::try_from(host_bytes.len()).expect("domain length checked by caller"));
+    buf.extend_from_slice(host_bytes);
+    buf.extend_from_slice(&port.to_be_bytes());
+}
+
 /// Read a per-packet uot address header.
 ///
 /// Domain-form replies are best-effort, matching `trojan.rs`: an IP literal is
@@ -125,6 +145,38 @@ mod tests {
             let mut reader: &[u8] = &buf;
             assert_eq!(read_uot_addr(&mut reader).await.unwrap(), addr);
         }
+    }
+
+    /// The domain write form (`UdpTarget::Name`, issue #657) round-trips
+    /// through the parser's FQDN branch — which degrades a non-literal to
+    /// `0.0.0.0:<port>` — and an IP-literal host survives as an address.
+    #[tokio::test]
+    async fn encode_uot_addr_domain_wire_layout() {
+        let mut buf = Vec::new();
+        encode_uot_addr_domain(&mut buf, "back.internal", 8388);
+        assert_eq!(
+            buf[..2],
+            [UOT_ATYP_DOMAIN, 13],
+            "atyp + one-byte host length"
+        );
+        assert_eq!(&buf[2..15], b"back.internal");
+        assert_eq!(&buf[15..], &8388u16.to_be_bytes());
+
+        // Parser accepts the form (degrades non-literal to unspecified+port).
+        let mut reader: &[u8] = &buf;
+        assert_eq!(
+            read_uot_addr(&mut reader).await.unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8388)
+        );
+
+        let mut buf = Vec::new();
+        encode_uot_addr_domain(&mut buf, "203.0.113.9", 5300);
+        let mut reader: &[u8] = &buf;
+        assert_eq!(
+            read_uot_addr(&mut reader).await.unwrap(),
+            "203.0.113.9:5300".parse().unwrap(),
+            "IP-literal domain form round-trips to the literal"
+        );
     }
 
     /// Domain-form replies degrade to `0.0.0.0:<port>` unless the "domain" is

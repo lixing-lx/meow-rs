@@ -240,16 +240,21 @@ enum UdpCommand {
 pub struct Hy2PacketConn {
     commands: mpsc::Sender<UdpCommand>,
     packets: Mutex<mpsc::Receiver<Result<(Bytes, SocketAddr)>>>,
+    /// A chained `UdpTarget::Name` binds the session to the domain: every
+    /// datagram's address field carries `host:port` verbatim and the
+    /// server resolves it (issue #657). `None` keeps per-packet stamping.
+    write_target: Option<String>,
 }
 
 impl Hy2PacketConn {
-    fn new(session: crate::hysteria2::UdpSession) -> Self {
+    fn new(session: crate::hysteria2::UdpSession, write_target: Option<String>) -> Self {
         let (command_tx, command_rx) = mpsc::channel(UDP_COMMAND_QUEUE);
         let (packet_tx, packet_rx) = mpsc::channel(UDP_PACKET_QUEUE);
         tokio::spawn(run_udp_session(session, command_rx, packet_tx));
         Self {
             commands: command_tx,
             packets: Mutex::new(packet_rx),
+            write_target,
         }
     }
 }
@@ -319,10 +324,14 @@ impl ProxyPacketConn for Hy2PacketConn {
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
         let (done_tx, done_rx) = oneshot::channel();
+        let addr = match &self.write_target {
+            Some(t) => t.clone(),
+            None => addr.to_string(),
+        };
         self.commands
             .send(UdpCommand::Send {
                 data: Bytes::copy_from_slice(buf),
-                addr: addr.to_string(),
+                addr,
                 done: done_tx,
             })
             .await
@@ -382,12 +391,32 @@ impl ProxyAdapter for Hy2Adapter {
             metadata.remote_address(),
             self.addr
         );
+        // A chained `UdpTarget::Name` arrives as host-only metadata — the
+        // QUIC datagram address field carries `host:port` verbatim and the
+        // server resolves it with its own view (issue #657). The driver
+        // silently drops datagrams whose address exceeds `MAX_ADDRESS_LENGTH`
+        // while reporting success — refuse first so the chained caller can
+        // fall back to a locally-resolved `UdpTarget::Addr`. Checked before
+        // `udp()` so the refusal costs no session.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) => {
+                let target = format!("{host}:{port}");
+                if target.len() > crate::hysteria2::MAX_ADDRESS_LENGTH {
+                    return Err(MeowError::NotSupported(format!(
+                        "hy2: domain UDP target exceeds MAX_ADDRESS_LENGTH ({}B)",
+                        target.len()
+                    )));
+                }
+                Some(target)
+            }
+            None => None,
+        };
         let session = self
             .client
             .udp()
             .await
             .map_err(|e| hy2_error("udp associate", e))?;
-        Ok(Box::new(Hy2PacketConn::new(session)))
+        Ok(Box::new(Hy2PacketConn::new(session, write_target)))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -500,6 +529,28 @@ mod tests {
             Err(MeowError::NotSupported(_)) => {}
             Err(other) => panic!("expected NotSupported, got {other:?}"),
             Ok(_) => panic!("hysteria2 must not support connect_over"),
+        }
+    }
+
+    /// A chained `UdpTarget::Name` whose `host:port` exceeds
+    /// `MAX_ADDRESS_LENGTH` would be silently dropped by the datagram
+    /// driver while reporting success — the adapter refuses `NotSupported`
+    /// instead so the caller falls back to a literal target (issue #657
+    /// review). The guard runs before `udp()`, so no session is needed.
+    #[tokio::test]
+    async fn dial_udp_refuses_oversized_domain_target() {
+        let adapter = Hy2Adapter::new(base_options()).unwrap();
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            // 2048-byte bound on "host:port": this host alone exceeds it.
+            host: "a".repeat(2048).into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        match adapter.dial_udp(&meta).await {
+            Err(MeowError::NotSupported(_)) => {}
+            Err(other) => panic!("expected NotSupported, got {other:?}"),
+            Ok(_) => panic!("oversized domain target must not associate"),
         }
     }
 }

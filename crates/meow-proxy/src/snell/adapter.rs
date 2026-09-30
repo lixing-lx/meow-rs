@@ -348,12 +348,25 @@ impl ProxyAdapter for SnellAdapter {
         Ok(Box::new(PooledConn::new(snell, None, 1)))
     }
 
-    async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.support_udp {
             return Err(MeowError::NotSupported(
                 "snell UDP is disabled for this proxy (set `udp: true`)".into(),
             ));
         }
+        // This adapter as a *front*: a host-only UDP destination — the
+        // dialer layer's encoding of a chained `UdpTarget::Name`
+        // (issue #657) — stamps each request frame's address with the
+        // domain so the server resolves it with its own view.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) if host.len() <= u8::MAX as usize => Some((host.clone(), port)),
+            Some(_) => {
+                return Err(MeowError::NotSupported(
+                    "snell: domain UDP target exceeds the length prefix".into(),
+                ));
+            }
+            None => None,
+        };
         let mut snell = self.dial_fresh().await?;
         if self.v6.is_some() {
             // Datagrams are one record each, so the request goes alone.
@@ -367,7 +380,7 @@ impl ProxyAdapter for SnellAdapter {
         if self.version.supports_reuse() {
             snell.read_reply().await.map_err(MeowError::Io)?;
         }
-        Ok(Box::new(SnellPacketConn::new(snell)))
+        Ok(Box::new(SnellPacketConn::with_target(snell, write_target)))
     }
 
     fn health(&self) -> &ProxyHealth {

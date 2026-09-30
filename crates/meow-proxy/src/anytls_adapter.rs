@@ -33,7 +33,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 
-use crate::uot::{encode_uot_addr, read_uot_addr};
+use crate::uot::{encode_uot_addr, encode_uot_addr_domain, read_uot_addr};
 
 /// AnyTLS outbound adapter.
 pub struct AnytlsAdapter {
@@ -183,6 +183,19 @@ impl ProxyAdapter for AnytlsAdapter {
                 "anytls: UDP is disabled for this proxy (set `udp: true`)".to_string(),
             ));
         }
+        // This adapter as a *front*: a host-only UDP destination — the
+        // dialer layer's encoding of a chained `UdpTarget::Name`
+        // (issue #657) — stamps each datagram's uot address with the domain
+        // so the server resolves it with its own view.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) if host.len() <= u8::MAX as usize => Some((host.clone(), port)),
+            Some(_) => {
+                return Err(MeowError::NotSupported(
+                    "anytls: domain UDP target exceeds uot length prefix".into(),
+                ));
+            }
+            None => None,
+        };
         let (stream, session) = self
             .client
             .create_proxy_stream_with_payload(
@@ -191,7 +204,11 @@ impl ProxyAdapter for AnytlsAdapter {
             )
             .await
             .map_err(|e| MeowError::Proxy(format!("anytls udp dial: {e}")))?;
-        Ok(Box::new(AnytlsPacketConn::new(stream, session)))
+        Ok(Box::new(AnytlsPacketConn::new(
+            stream,
+            session,
+            write_target,
+        )))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -460,14 +477,23 @@ struct AnytlsPacketConn {
     /// stream's framing is then unrecoverable, so every later packet op must fail
     /// fast rather than misdeliver (issue #514).
     poisoned: std::sync::atomic::AtomicBool,
+    /// A chained `UdpTarget::Name` binds every datagram's uot address to the
+    /// domain (`UOT_ATYP_DOMAIN`) so the server resolves it (issue #657).
+    /// `None` keeps per-packet `SocketAddr` stamping.
+    write_target: Option<(smol_str::SmolStr, u16)>,
 }
 
 impl AnytlsPacketConn {
-    fn new(stream: Arc<AnytlsStream>, session: Arc<Session>) -> Self {
+    fn new(
+        stream: Arc<AnytlsStream>,
+        session: Arc<Session>,
+        write_target: Option<(smol_str::SmolStr, u16)>,
+    ) -> Self {
         Self {
             stream,
             _session: session,
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            write_target,
         }
     }
 
@@ -537,7 +563,10 @@ impl ProxyPacketConn for AnytlsPacketConn {
         // dead regardless; fail fast rather than feed it.
         crate::check_not_desynced(&self.poisoned)?;
         let mut frame = Vec::with_capacity(21 + buf.len());
-        encode_uot_addr(&mut frame, addr);
+        match &self.write_target {
+            Some((host, port)) => encode_uot_addr_domain(&mut frame, host, *port),
+            None => encode_uot_addr(&mut frame, addr),
+        }
         let Ok(length) = u16::try_from(buf.len()) else {
             return Err(MeowError::Proxy(format!(
                 "anytls udp: packet too large ({} > {})",
@@ -805,7 +834,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let destination: SocketAddr = "192.0.2.2:53".parse().unwrap();
 
         assert_eq!(conn.write_packet(b"udp", &destination).await.unwrap(), 3);
@@ -845,7 +874,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let mut buf = [0u8; 2048];
 
         // A lone ATYP byte: the address read stalls mid-frame.
@@ -884,7 +913,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session)));
+        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session), None));
 
         // read1 stalls mid-addr while holding the reader lock.
         push_frame(&mut peer, id, &[UOT_ATYP_IPV4]).await;
@@ -933,7 +962,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session)));
+        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session), None));
 
         // read1 stalls mid-addr holding the lock; read2 parks behind it.
         push_frame(&mut peer, id, &[UOT_ATYP_IPV4]).await;
@@ -982,7 +1011,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let mut buf = [0u8; 2048];
 
         push_frame(&mut peer, id, &[0x7f]).await;
@@ -1020,7 +1049,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
 
         // 4-byte payload into a 2-byte buffer — 2 bytes must drain.
@@ -1064,7 +1093,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
 
         // 20 KiB payload into a 1-byte buffer → 19999 bytes drained over
@@ -1105,7 +1134,7 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let mut buf = [0u8; 2048];
         let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
 
@@ -1138,7 +1167,7 @@ mod tests {
         for _ in 0..64 {
             stream.send_data(Bytes::from(vec![42; 512])).await.unwrap();
         }
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), None);
         let destination: SocketAddr = "192.0.2.2:53".parse().unwrap();
         let mut write = Box::pin(conn.write_packet(b"cancelled", &destination));
         assert!(futures::poll!(&mut write).is_pending());

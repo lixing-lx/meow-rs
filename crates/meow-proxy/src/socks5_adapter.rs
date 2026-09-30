@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tracing::debug;
 
+use crate::dialer::UdpTarget;
 use crate::stream_conn::StreamConn;
 
 // ─── SOCKS5 constants ─────────────────────────────────────────────────────────
@@ -46,6 +47,9 @@ const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 const AUTH_VERSION: u8 = 0x01;
 const AUTH_SUCCESS: u8 = 0x00;
 const REPLY_SUCCESS: u8 = 0x00;
+/// ATYP_DOMAIN carries a one-byte length — a longer name cannot ride the
+/// wire and the requester falls back to a literal resolution.
+const MAX_DOMAIN_LEN: usize = u8::MAX as usize;
 
 // ─── Adapter ─────────────────────────────────────────────────────────────────
 
@@ -342,9 +346,11 @@ impl Socks5Adapter {
     /// to restrict the association to a specific source.
     ///
     /// A `BND.ADDR` of `0.0.0.0` / `::` (some servers return the wildcard
-    /// meaning "same host as this control connection") is rewritten to the
-    /// proxy server's own address.
-    async fn run_udp_associate<S>(&self, stream: &mut S) -> Result<SocketAddr>
+    /// meaning "same host as this control connection") comes back as
+    /// [`RelayAddr::Server`]; a domain BND stays a name. The caller picks
+    /// the resolution side — local for the raw path, the front's resolver
+    /// view via [`UdpTarget::Name`] under `dialer-proxy`.
+    async fn run_udp_associate<S>(&self, stream: &mut S) -> Result<RelayAddr>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -375,37 +381,55 @@ impl Socks5Adapter {
             return Err(MeowError::Socks5ConnectFailed(resp_hdr[1]));
         }
 
-        let relay = read_socks5_addr(stream, resp_hdr[3]).await?;
+        let relay = read_relay_addr(stream, resp_hdr[3]).await?;
         // A zero BND port is not a usable relay endpoint (mihomo rejects it
         // as a malformed server address) — refuse rather than blackhole.
-        if relay.port() == 0 {
+        let port = match &relay {
+            RelayAddr::Addr(a) => a.port(),
+            RelayAddr::Server { port, .. } | RelayAddr::Domain { port, .. } => *port,
+        };
+        if port == 0 {
             return Err(MeowError::Proxy(format!(
-                "socks5: server advertised unusable relay {relay}"
+                "socks5: server advertised unusable relay {relay:?}"
             )));
         }
-        // Rewrite a wildcard bound address to the proxy server's own address.
-        // Prefer a candidate in the wildcard's own family — `0.0.0.0` BND
-        // means "same host, on this v4 socket": a dual-stack hostname must
-        // not substitute a v6 address the relay never bound (mihomo resolves
-        // with the node's IPv4-prefer for the same reason). Note the resolve
-        // is *local* while the control conn's endpoint was resolved by the
-        // front: split-horizon/GeoDNS can in principle bind the relay to a
-        // different backend — a domain-carrying `dial_udp_conn` is the real
-        // fix; until then this matches mihomo's exposure.
-        if relay.ip().is_unspecified() {
-            let candidates = meow_common::resolve_host_all(&self.server, relay.port())
-                .await
-                .map_err(MeowError::Io)?;
-            return candidates
-                .iter()
-                .find(|c| c.is_ipv4() == relay.is_ipv4())
-                .or_else(|| candidates.first())
-                .copied()
-                .ok_or_else(|| {
-                    MeowError::Proxy(format!("socks5: cannot resolve relay host {}", self.server))
-                });
-        }
         Ok(relay)
+    }
+
+    /// Resolve a [`RelayAddr`] to a concrete `SocketAddr` locally — the raw
+    /// (unchained) path, and the chained fallback when the front cannot
+    /// carry a domain target.
+    ///
+    /// A wildcard BND prefers a candidate in the wildcard's own family:
+    /// `0.0.0.0` means "same host, on this v4 socket" — a dual-stack
+    /// hostname must not substitute a v6 address the relay never bound
+    /// (mihomo resolves with the node's IPv4-prefer for the same reason).
+    async fn resolve_relay(&self, relay: &RelayAddr) -> Result<SocketAddr> {
+        match relay {
+            RelayAddr::Addr(addr) => Ok(*addr),
+            RelayAddr::Server { port, v6 } => {
+                let candidates = meow_common::resolve_host_all(&self.server, *port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                candidates
+                    .iter()
+                    .find(|c| c.is_ipv6() == *v6)
+                    .or_else(|| candidates.first())
+                    .copied()
+                    .ok_or_else(|| {
+                        MeowError::Proxy(format!(
+                            "socks5: cannot resolve relay host {}",
+                            self.server
+                        ))
+                    })
+            }
+            RelayAddr::Domain { host, port } => meow_common::resolve_host_all(host, *port)
+                .await
+                .map_err(MeowError::Io)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| MeowError::Proxy(format!("socks5: cannot resolve bound {host}"))),
+        }
     }
 }
 
@@ -439,45 +463,88 @@ async fn drain_socks5_addr<S: tokio::io::AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Read a SOCKS5 address (`atyp` already consumed) into a concrete
-/// `SocketAddr`. A domain `atyp` is resolved via the protected resolver; this
-/// is only used for the UDP-ASSOCIATE bound address, which servers normally
-/// return as an IP literal.
-async fn read_socks5_addr<S: tokio::io::AsyncRead + Unpin>(
+/// Where the SOCKS5 server said its UDP relay lives — the `BND` of a
+/// UDP-ASSOCIATE reply, kept in its wire form so a `dialer-proxy` front can
+/// resolve a name with its own view instead of ours (issue #657).
+#[derive(Debug)]
+enum RelayAddr {
+    /// Literal IP endpoint.
+    Addr(SocketAddr),
+    /// Domain endpoint — the server named its relay by domain.
+    Domain { host: smol_str::SmolStr, port: u16 },
+    /// Wildcard BND (`0.0.0.0`/`::`): "same host as this control
+    /// connection". `v6` remembers the wildcard's address family so a
+    /// local resolution can prefer it; when the endpoint is delegated to a
+    /// front as `UdpTarget::Name` the hint is lost and the front's resolver
+    /// picks the family — a narrow divergence accepted for issue #657.
+    Server { port: u16, v6: bool },
+}
+
+impl RelayAddr {
+    /// The [`UdpTarget`] this endpoint dials under `dialer-proxy`:
+    /// literals pass through, while wildcard/domain forms hand the name to
+    /// the front so *its* resolver picks the backend the control leg used.
+    /// A "name" that is actually an IP literal collapses to [`UdpTarget::Addr`]
+    /// — the stricter source filter stays available and no resolution is
+    /// needed anywhere.
+    fn to_udp_target(&self, server: &str) -> UdpTarget {
+        match self {
+            RelayAddr::Addr(addr) => UdpTarget::Addr(*addr),
+            RelayAddr::Server { port, .. } => UdpTarget::named(server, *port),
+            RelayAddr::Domain { host, port } => UdpTarget::named(host, *port),
+        }
+    }
+}
+
+/// Read a SOCKS5 address (`atyp` already consumed) into its wire form —
+/// domain `atyp` is *kept as a name*; resolution is the caller's choice
+/// (local for the raw path, delegated to the front under `dialer-proxy`).
+async fn read_relay_addr<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     atyp: u8,
-) -> Result<SocketAddr> {
+) -> Result<RelayAddr> {
     match atyp {
         ATYP_IPV4 => {
             let mut b = [0u8; 6];
             stream.read_exact(&mut b).await.map_err(MeowError::Io)?;
             let ip = IpAddr::from([b[0], b[1], b[2], b[3]]);
-            Ok(SocketAddr::new(ip, u16::from_be_bytes([b[4], b[5]])))
+            let port = u16::from_be_bytes([b[4], b[5]]);
+            if ip.is_unspecified() {
+                return Ok(RelayAddr::Server { port, v6: false });
+            }
+            Ok(RelayAddr::Addr(SocketAddr::new(ip, port)))
         }
         ATYP_IPV6 => {
             let mut b = [0u8; 18];
             stream.read_exact(&mut b).await.map_err(MeowError::Io)?;
             let mut o = [0u8; 16];
             o.copy_from_slice(&b[..16]);
-            Ok(SocketAddr::new(
-                IpAddr::from(o),
-                u16::from_be_bytes([b[16], b[17]]),
-            ))
+            let ip = IpAddr::from(o);
+            let port = u16::from_be_bytes([b[16], b[17]]);
+            if ip.is_unspecified() {
+                return Ok(RelayAddr::Server { port, v6: true });
+            }
+            Ok(RelayAddr::Addr(SocketAddr::new(ip, port)))
         }
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await.map_err(MeowError::Io)?;
+            // A zero-length name cannot name a relay — treat it as a
+            // malformed reply rather than binding a degenerate association.
+            if len[0] == 0 {
+                return Err(MeowError::Proxy(
+                    "socks5: empty domain in UDP associate reply".into(),
+                ));
+            }
             let mut dbuf = vec![0u8; len[0] as usize + 2];
             stream.read_exact(&mut dbuf).await.map_err(MeowError::Io)?;
             let host = std::str::from_utf8(&dbuf[..len[0] as usize])
                 .map_err(|_| MeowError::Proxy("socks5: non-utf8 bound domain".into()))?;
             let port = u16::from_be_bytes([dbuf[len[0] as usize], dbuf[len[0] as usize + 1]]);
-            meow_common::resolve_host_all(host, port)
-                .await
-                .map_err(MeowError::Io)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| MeowError::Proxy(format!("socks5: cannot resolve bound {host}")))
+            Ok(RelayAddr::Domain {
+                host: smol_str::SmolStr::new(host),
+                port,
+            })
         }
         other => Err(MeowError::Proxy(format!(
             "socks5: unknown atyp {other:#04x} in response"
@@ -501,6 +568,18 @@ fn encode_udp_header(out: &mut SmallVec<[u8; 1500]>, addr: &SocketAddr) {
         }
     }
     out.extend_from_slice(&addr.port().to_be_bytes());
+}
+
+/// Same header for a domain destination — the association's bound name
+/// when this adapter fronts a chained UDP request (issue #657). The
+/// server resolves `host` with its own view; `host.len()` was validated
+/// against `MAX_DOMAIN_LEN` at dial time.
+fn encode_udp_header_domain(out: &mut SmallVec<[u8; 1500]>, host: &str, port: u16) {
+    out.extend_from_slice(&[0, 0, 0]); // RSV(2) + FRAG(1)
+    out.push(ATYP_DOMAIN);
+    out.push(u8::try_from(host.len()).expect("domain length validated at dial"));
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
 }
 
 /// Parse a received SOCKS5 UDP datagram in place: validate the header, return
@@ -621,13 +700,28 @@ impl ProxyAdapter for Socks5Adapter {
             )));
         }
 
+        // This adapter as a *front*: a host-only UDP destination (set by
+        // the dialer layer for a chained `UdpTarget::Name`, issue #657)
+        // binds the association to the name — every datagram's SOCKS5 DST
+        // field carries the domain, and the server resolves it with its
+        // own view. The write arg becomes advisory.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) if host.len() <= MAX_DOMAIN_LEN => Some((host.clone(), port)),
+            Some(_) => {
+                return Err(MeowError::NotSupported(
+                    "socks5: domain UDP target exceeds ATYP_DOMAIN length".into(),
+                ))
+            }
+            None => None,
+        };
+
         // The UDP association is bound to the lifetime of this TCP control
         // connection (RFC 1928 §7): the server tears the association down when
         // the control conn closes. We keep it open via `ControlGuard`.
         let mut control = self.dial_stream(metadata.is_internal()).await?;
         let relay = self.run_udp_associate(&mut control).await?;
         debug!(
-            "socks5: UDP ASSOCIATE via {}:{} → relay {}",
+            "socks5: UDP ASSOCIATE via {}:{} → relay {:?}",
             self.server, self.port, relay
         );
 
@@ -635,41 +729,67 @@ impl ProxyAdapter for Socks5Adapter {
         // datagrams ride the front proxy's own `dial_udp` association bound
         // to the advertised relay endpoint — the SOCKS5 UDP header still
         // wraps the per-packet destinations, the front only sees `relay`.
+        // Wildcard/domain BND forms dial as `UdpTarget::Name` so the front
+        // resolves them itself; a front that cannot carry a domain refuses
+        // with `Unsupported` and we fall back to a local resolution —
+        // the pre-#657 behavior, still fail-closed.
         if self.dialer.is_proxy() {
-            let conn = self
-                .dialer
-                .dial_udp_conn(relay, metadata.is_internal())
-                .await
-                .map_err(|e| {
-                    // The dialer maps front `NotSupported`/`UdpNotSupported`
-                    // to `ErrorKind::Unsupported` — a capability refusal, not
-                    // a transport failure: keep the class so the node is not
-                    // dead-marked over a UDP-less front.
-                    if e.kind() == std::io::ErrorKind::Unsupported {
-                        MeowError::NotSupported(format!("socks5 udp via dialer-proxy {relay}: {e}"))
-                    } else {
-                        MeowError::Io(e)
+            let target = relay.to_udp_target(&self.server);
+            let internal = metadata.is_internal();
+            // The dialer maps front `NotSupported`/`UdpNotSupported` to
+            // `ErrorKind::Unsupported` — a capability refusal, not a
+            // transport failure: keep the class so the node is not
+            // dead-marked over a UDP-less front.
+            let map_err = |target: &UdpTarget, e: std::io::Error| {
+                if e.kind() == std::io::ErrorKind::Unsupported {
+                    MeowError::NotSupported(format!("socks5 udp via dialer-proxy {target}: {e}"))
+                } else {
+                    MeowError::Io(e)
+                }
+            };
+            let (conn, bound) = match self.dialer.dial_udp_conn(target.clone(), internal).await {
+                Ok(conn) => (conn, target),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Unsupported
+                        && matches!(target, UdpTarget::Name { .. }) =>
+                {
+                    // The front cannot carry a domain target — resolve
+                    // locally and redial the literal (pre-#657 behavior,
+                    // still fail-closed through the same chain).
+                    let addr = self.resolve_relay(&relay).await?;
+                    match self
+                        .dialer
+                        .dial_udp_conn(UdpTarget::Addr(addr), internal)
+                        .await
+                    {
+                        Ok(conn) => (conn, UdpTarget::Addr(addr)),
+                        Err(e) => return Err(map_err(&UdpTarget::Addr(addr), e)),
                     }
-                })?;
-            debug!("socks5: UDP chained to relay {relay} via {}", self.addr_str);
+                }
+                Err(e) => return Err(map_err(&target, e)),
+            };
+            debug!("socks5: UDP chained to relay {bound} via {}", self.addr_str);
             return Ok(Box::new(Socks5UdpConn {
                 transport: Socks5UdpTransport::Chained(conn),
-                relay,
+                relay: bound,
+                write_target,
                 _control: ControlGuard::spawn(control),
             }));
         }
 
-        let bind: SocketAddr = if relay.is_ipv4() {
+        let relay_addr = self.resolve_relay(&relay).await?;
+        let bind: SocketAddr = if relay_addr.is_ipv4() {
             "0.0.0.0:0".parse().expect("static")
         } else {
             "[::]:0".parse().expect("static")
         };
         let socket = meow_common::bind_udp(bind).await.map_err(MeowError::Io)?;
-        socket.connect(relay).await.map_err(MeowError::Io)?;
+        socket.connect(relay_addr).await.map_err(MeowError::Io)?;
 
         Ok(Box::new(Socks5UdpConn {
             transport: Socks5UdpTransport::Raw(socket),
-            relay,
+            relay: UdpTarget::Addr(relay_addr),
+            write_target,
             _control: ControlGuard::spawn(control),
         }))
     }
@@ -751,7 +871,14 @@ struct Socks5UdpConn {
     transport: Socks5UdpTransport,
     /// The advertised relay endpoint: chained datagrams are written to it
     /// and chained reads are filtered against it (connected-socket parity).
-    relay: SocketAddr,
+    /// A [`UdpTarget::Name`] is bound by the front — reads then match on
+    /// port only, since the wire source legitimately differs from any
+    /// local resolution of the name (issue #657).
+    relay: UdpTarget,
+    /// Set when this adapter fronts a domain-carrying association request:
+    /// every datagram's SOCKS5 DST field stamps the name instead of the
+    /// caller's addr arg.
+    write_target: Option<(SmolStr, u16)>,
     _control: ControlGuard,
 }
 
@@ -773,11 +900,12 @@ impl ProxyPacketConn for Socks5UdpConn {
                     // connected-socket filter the Raw arm has.  Bound conns
                     // report `relay` or an unspecified addr (no source info);
                     // unspecified skips the check rather than breaking them.
-                    // `to_canonical` collapses IPv4-mapped IPv6 forms so a
-                    // representation difference can't wedge the association.
-                    let same_src = outer_src.ip().to_canonical() == self.relay.ip().to_canonical()
-                        && outer_src.port() == self.relay.port();
-                    if !same_src && !outer_src.ip().to_canonical().is_unspecified() {
+                    // A `Name` relay was resolved by the front: only the port
+                    // is comparable, since the wire source legitimately
+                    // differs from any local resolution.
+                    if !self.relay.src_matches(outer_src)
+                        && !outer_src.ip().to_canonical().is_unspecified()
+                    {
                         debug!(
                             "socks5 udp: dropped chained datagram from {outer_src} (expected {})",
                             self.relay
@@ -796,7 +924,11 @@ impl ProxyPacketConn for Socks5UdpConn {
 
     async fn write_packet(&self, data: &[u8], addr: &SocketAddr) -> Result<usize> {
         let mut pkt: SmallVec<[u8; 1500]> = SmallVec::new();
-        encode_udp_header(&mut pkt, addr);
+        if let Some((host, port)) = &self.write_target {
+            encode_udp_header_domain(&mut pkt, host, *port);
+        } else {
+            encode_udp_header(&mut pkt, addr);
+        }
         pkt.extend_from_slice(data);
         match &self.transport {
             Socks5UdpTransport::Raw(socket) => {
@@ -805,6 +937,8 @@ impl ProxyPacketConn for Socks5UdpConn {
             Socks5UdpTransport::Chained(conn) => {
                 // The wire destination is always the relay endpoint — the
                 // caller's `addr` already went inside the SOCKS5 header.
+                // For a `Name` relay the write dst is an advisory
+                // placeholder; the name-bound conn stamps its own target.
                 // Reject frames a stream-framed front could not carry
                 // (u16 length prefix) and verify datagram atomicity.
                 if pkt.len() > u16::MAX as usize {
@@ -813,7 +947,7 @@ impl ProxyPacketConn for Socks5UdpConn {
                         pkt.len()
                     )));
                 }
-                let n = conn.write_packet(&pkt, &self.relay).await?;
+                let n = conn.write_packet(&pkt, &self.relay.write_dst()).await?;
                 if n != pkt.len() {
                     return Err(MeowError::Proxy(format!(
                         "socks5 udp: short write on chained conn ({n} < {})",
@@ -1194,6 +1328,38 @@ mod tests {
         (addr, handle)
     }
 
+    /// Variant answering `BND.ADDR` as a domain — servers that relay on a
+    /// named interface. Exercises the `RelayAddr::Domain` → `UdpTarget::Name`
+    /// path (issue #657).
+    async fn spawn_associate_server_domain(
+        bnd_host: &str,
+        bnd_port: u16,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = bnd_host.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 2];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut methods = vec![0u8; hdr[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VERSION, METHOD_NO_AUTH]).await.unwrap();
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).await.unwrap();
+            assert_eq!(req[1], CMD_UDP_ASSOCIATE);
+            drain_socks5_addr(&mut s, req[3]).await.unwrap();
+            let mut resp = vec![VERSION, REPLY_SUCCESS, RESERVED, ATYP_DOMAIN];
+            resp.push(u8::try_from(host.len()).unwrap());
+            resp.extend_from_slice(host.as_bytes());
+            resp.extend_from_slice(&bnd_port.to_be_bytes());
+            s.write_all(&resp).await.unwrap();
+            let mut sink = [0u8; 64];
+            while s.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+        (addr, handle)
+    }
+
     /// Scripted front `ProxyPacketConn`: reads yield injected
     /// `(datagram, wire-src)` pairs, writes record `(frame, wire-dst)`.
     struct ScriptedFront {
@@ -1247,12 +1413,16 @@ mod tests {
     struct ChainedDialer {
         server_addr: std::net::SocketAddr,
         front: std::sync::Mutex<Option<Arc<ScriptedFront>>>,
-        udp_dialed: std::sync::Mutex<Vec<SocketAddr>>,
+        udp_dialed: std::sync::Mutex<Vec<crate::dialer::UdpTarget>>,
         udp_ok: bool,
         /// When set, `dial_udp_conn` fails with this `ErrorKind` — models a
         /// group front that rotated to a UDP-less member between the
         /// `supports_udp()` snapshot and the dial.
         dial_udp_err: Option<std::io::ErrorKind>,
+        /// When set, `UdpTarget::Name` dials fail `Unsupported` (a front
+        /// that cannot carry a domain) while literal `Addr` dials succeed —
+        /// exercises the caller's local-resolution fallback (issue #657).
+        refuse_name_targets: bool,
         /// `internal` flags seen on `dial_udp_conn` — proves metadata
         /// propagation through the chained leg.
         seen_internal: std::sync::Mutex<Vec<bool>>,
@@ -1279,12 +1449,19 @@ mod tests {
 
         async fn dial_udp_conn(
             &self,
-            remote: SocketAddr,
+            remote: crate::dialer::UdpTarget,
             internal: bool,
         ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
             self.seen_internal.lock().unwrap().push(internal);
             if let Some(kind) = self.dial_udp_err {
                 return Err(std::io::Error::new(kind, "scripted dial_udp_conn failure"));
+            }
+            if self.refuse_name_targets && matches!(remote, crate::dialer::UdpTarget::Name { .. }) {
+                self.udp_dialed.lock().unwrap().push(remote);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "front cannot carry domain targets",
+                ));
             }
             self.udp_dialed.lock().unwrap().push(remote);
             self.front
@@ -1323,6 +1500,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: None,
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1343,7 +1521,7 @@ mod tests {
             .expect("dial_udp");
         assert_eq!(
             dialer.udp_dialed.lock().unwrap().as_slice(),
-            &[relay],
+            &[crate::dialer::UdpTarget::Addr(relay)],
             "the front association must be bound to the advertised relay"
         );
         assert_eq!(
@@ -1407,6 +1585,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: None,
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1456,6 +1635,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: None,
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1504,10 +1684,12 @@ mod tests {
         assert_eq!(&buf[..n], b"ok");
     }
 
-    /// A `0.0.0.0` BND address ("same host as the control connection") must
-    /// be rewritten to the resolved server address before the front is
-    /// dialed — the `SocketAddr`-keyed `dial_udp_conn` cannot carry a
-    /// wildcard. Matches mihomo's unspecified-BND substitution.
+    /// A `0.0.0.0` BND address ("same host as the control connection") is
+    /// rewritten to the server endpoint before the front is dialed — as
+    /// `UdpTarget::Name` of the server name (which collapses to `Addr`
+    /// here because this test's server is an IP literal). Matches mihomo's
+    /// unspecified-BND substitution, extended by issue #657 to keep the
+    /// domain form for domain-named servers.
     #[tokio::test]
     async fn chained_udp_wildcard_bnd_rewritten_to_server_ip() {
         let relay: SocketAddr = "0.0.0.0:5301".parse().unwrap();
@@ -1526,6 +1708,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: None,
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1544,8 +1727,10 @@ mod tests {
             .expect("dial_udp");
         let dialed = dialer.udp_dialed.lock().unwrap().clone();
         assert_eq!(dialed.len(), 1);
-        assert_eq!(dialed[0].ip().to_string(), "127.0.0.1");
-        assert_eq!(dialed[0].port(), 5301);
+        assert_eq!(
+            dialed[0],
+            crate::dialer::UdpTarget::Addr("127.0.0.1:5301".parse().unwrap()),
+        );
     }
 
     /// Stale capability snapshot: `supports_udp()` passed, but the front
@@ -1571,6 +1756,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: Some(std::io::ErrorKind::Unsupported),
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1612,6 +1798,7 @@ mod tests {
             udp_dialed: std::sync::Mutex::new(Vec::new()),
             udp_ok: true,
             dial_udp_err: None,
+            refuse_name_targets: false,
             seen_internal: std::sync::Mutex::new(Vec::new()),
         });
         let adapter = Socks5Adapter::new(
@@ -1644,6 +1831,332 @@ mod tests {
             conn.write_packet(b"payload", &target).await.is_err(),
             "short write on the front conn must error"
         );
+    }
+
+    /// A domain-form BND (`RelayAddr::Domain`) dials the front as
+    /// `UdpTarget::Name` — the front resolves the relay with the same view
+    /// that answered the control leg (issue #657).
+    #[tokio::test]
+    async fn chained_udp_domain_bnd_dials_name_target() {
+        let (srv, _server) = spawn_associate_server_domain("relay.internal", 5300).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: "127.0.0.1:5300".parse().unwrap(),
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: false,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let _conn = adapter
+            .dial_udp(&meta_with_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53))
+            .await
+            .expect("dial_udp");
+        assert_eq!(
+            dialer.udp_dialed.lock().unwrap().as_slice(),
+            &[crate::dialer::UdpTarget::Name {
+                host: "relay.internal".into(),
+                port: 5300
+            }],
+            "domain BND must reach the front as a name, not a local resolution"
+        );
+    }
+
+    /// A wildcard BND on a *domain-named* server dials `UdpTarget::Name` of
+    /// the server name — "same host as the control connection" must mean
+    /// the front's resolution of that name, not ours (issue #657).
+    #[tokio::test]
+    async fn chained_udp_wildcard_bnd_domain_server_dials_name() {
+        let relay: SocketAddr = "0.0.0.0:5301".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: "127.0.0.1:5301".parse().unwrap(),
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: false,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "localhost",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let _conn = adapter
+            .dial_udp(&meta_with_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53))
+            .await
+            .expect("dial_udp");
+        assert_eq!(
+            dialer.udp_dialed.lock().unwrap().as_slice(),
+            &[crate::dialer::UdpTarget::Name {
+                host: "localhost".into(),
+                port: 5301
+            }],
+        );
+    }
+
+    /// A front that cannot carry a domain target answers `Unsupported`;
+    /// the adapter resolves the name locally and redials the literal —
+    /// the pre-#657 behavior, still fail-closed through the chain.
+    #[tokio::test]
+    async fn chained_udp_name_unsupported_falls_back_to_local_literal() {
+        let relay: SocketAddr = "0.0.0.0:5301".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: "127.0.0.1:5301".parse().unwrap(),
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: true,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "localhost",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let _conn = adapter
+            .dial_udp(&meta_with_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53))
+            .await
+            .expect("name refusal falls back to a local literal dial");
+        let dialed = dialer.udp_dialed.lock().unwrap().clone();
+        assert_eq!(dialed.len(), 2, "name attempt, then literal retry");
+        assert_eq!(
+            dialed[0],
+            crate::dialer::UdpTarget::Name {
+                host: "localhost".into(),
+                port: 5301
+            }
+        );
+        let crate::dialer::UdpTarget::Addr(addr) = dialed[1] else {
+            panic!("fallback must dial a literal, got {:?}", dialed[1]);
+        };
+        assert!(addr.ip().is_loopback(), "localhost resolves loopback");
+        assert_eq!(addr.port(), 5301);
+    }
+
+    /// For a name-bound association the wire source filter is port-only —
+    /// the front resolved the name with its own view, so the relay source
+    /// IP legitimately differs from any local resolution (issue #657).
+    #[tokio::test]
+    async fn chained_udp_name_relay_src_filter_is_port_only() {
+        let (srv, _server) = spawn_associate_server_domain("relay.internal", 5300).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: "127.0.0.1:5300".parse().unwrap(),
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: false,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let conn = adapter
+            .dial_udp(&meta_with_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53))
+            .await
+            .expect("dial_udp");
+
+        // A datagram arriving from the *front's* resolution of
+        // relay.internal — a different IP than any local answer, same port.
+        let inner: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut frame: SmallVec<[u8; 1500]> = SmallVec::new();
+        encode_udp_header(&mut frame, &inner);
+        frame.extend_from_slice(b"reply");
+        tx.send((frame.to_vec(), "198.51.100.99:5300".parse().unwrap()))
+            .await
+            .unwrap();
+        // A foreign source on the wrong port must be dropped.
+        let mut junk: SmallVec<[u8; 1500]> = SmallVec::new();
+        encode_udp_header(&mut junk, &inner);
+        junk.extend_from_slice(b"junk");
+        tx.send((junk.to_vec(), "198.51.100.99:9999".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 128];
+        // The wrong-port datagram may arrive first; the reader must skip it.
+        let (n, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("no read timeout")
+        .unwrap();
+        assert_eq!(&buf[..n], b"reply");
+        assert_eq!(src, inner);
+    }
+
+    /// This adapter as a *front*: host-only metadata (the dialer layer's
+    /// encoding of `UdpTarget::Name`) stamps every datagram's SOCKS5 DST
+    /// field with ATYP_DOMAIN — the server resolves the name (issue #657).
+    #[tokio::test]
+    async fn front_udp_domain_target_stamps_domain_header() {
+        let relay: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(Arc::clone(&front))),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: false,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        // The dialer-layer encoding of `UdpTarget::Name`: host set, no dst_ip.
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "back.internal".into(),
+            dst_port: 8388,
+            ..Default::default()
+        };
+        let conn = adapter.dial_udp(&meta).await.expect("dial_udp");
+        conn.write_packet(b"payload", &"0.0.0.0:8388".parse().unwrap())
+            .await
+            .unwrap();
+
+        let written = front.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        let (frame, dst) = &written[0];
+        // RSV(2) FRAG(1) ATYP_DOMAIN LEN host PORT — then payload.
+        assert_eq!(&frame[..4], &[0, 0, 0, ATYP_DOMAIN]);
+        assert_eq!(frame[4] as usize, "back.internal".len());
+        assert_eq!(&frame[5..5 + 13], b"back.internal");
+        assert_eq!(
+            u16::from_be_bytes([frame[18], frame[19]]),
+            8388,
+            "domain header port"
+        );
+        assert_eq!(&frame[20..], b"payload");
+        // The wire destination is the relay, not the domain placeholder.
+        assert_eq!(*dst, relay);
+    }
+
+    /// A host-only destination longer than 255 bytes cannot be encoded as
+    /// ATYP_DOMAIN — refuse with `NotSupported` so the dialer layer falls
+    /// back to a locally-resolved literal (issue #657).
+    #[tokio::test]
+    async fn front_udp_overlong_domain_refused() {
+        let relay: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+        let (srv, _server) = spawn_associate_server(relay, REPLY_SUCCESS).await;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let front = Arc::new(ScriptedFront {
+            inbound: tokio::sync::Mutex::new(rx),
+            written: std::sync::Mutex::new(Vec::new()),
+            bound: relay,
+            short_write: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dialer = Arc::new(ChainedDialer {
+            server_addr: srv,
+            front: std::sync::Mutex::new(Some(front)),
+            udp_dialed: std::sync::Mutex::new(Vec::new()),
+            udp_ok: true,
+            dial_udp_err: None,
+            refuse_name_targets: false,
+            seen_internal: std::sync::Mutex::new(Vec::new()),
+        });
+        let adapter = Socks5Adapter::new(
+            "s",
+            "127.0.0.1",
+            srv.port(),
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        )
+        .with_udp(true);
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "x".repeat(256).into(),
+            dst_port: 8388,
+            ..Default::default()
+        };
+        match adapter.dial_udp(&meta).await {
+            Err(MeowError::NotSupported(_)) => {}
+            Err(e) => panic!("overlong domain must refuse NotSupported, got {e}"),
+            Ok(_) => panic!("overlong domain must refuse NotSupported"),
+        }
     }
 
     fn meta_with_host(host: &str, port: u16) -> Metadata {
@@ -2034,5 +2547,19 @@ mod tests {
         let mut buf = [0u8; 2];
         conn.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hi");
+    }
+
+    /// A zero-length `ATYP_DOMAIN` BND cannot name a relay — it is a
+    /// malformed reply, not a degenerate name-bound association (issue
+    /// #657 review).
+    #[tokio::test]
+    async fn relay_addr_rejects_empty_domain() {
+        // atyp=DOMAIN, len=0, port=0x1F90 — the port bytes are present but
+        // must never be read into a valid RelayAddr.
+        let mut wire: &[u8] = &[0x00, 0x1f, 0x90];
+        let Err(e) = read_relay_addr(&mut wire, ATYP_DOMAIN).await else {
+            panic!("empty domain BND must error");
+        };
+        assert!(e.to_string().contains("empty domain"), "{e}");
     }
 }

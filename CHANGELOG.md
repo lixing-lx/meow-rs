@@ -10,6 +10,28 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Domain-carrying UDP dial targets through `dialer-proxy` chains** —
+  `TcpDialer::dial_udp_conn` now takes a `UdpTarget` (`Addr` literal or
+  `Name { host, port }`), letting a front proxy resolve the association
+  destination with the same resolver view its TCP/control leg used. This
+  closes a divergence where a chained UDP association could blackhole:
+  the inner node resolved a domain (domain-named Shadowsocks server,
+  wildcard or domain SOCKS5 `BND.ADDR`) locally while the front's
+  TCP/control path resolved it independently — split-horizon DNS, GeoDNS,
+  or multi-A/AAAA backends could land the two legs on different backends
+  (issue #657, matching mihomo's `ListenPacket(ctx, network, metadata)`).
+
+  Fronts that can carry a domain association bind it natively — VLESS,
+  Trojan, mux bound flows (sing-mux/smux/h2mux), Hysteria2, AnyTLS UoT,
+  Snell, and Shadowsocks/SOCKS5 chained arms stamp the domain on the wire
+  (SOCKS5 `ATYP_DOMAIN` / snell host-length / uot domain family); a
+  `direct` front resolves locally and connects. Fronts that cannot
+  express a domain target (mux.cool per-datagram destinations, kcptun
+  UoT) refuse `NotSupported`, and the caller falls back to a
+  locally-resolved literal — the pre-#657 behavior, still fail-closed.
+  For name-bound associations the wire-source filter relaxes to port-only
+  since the front's resolution legitimately differs from the local one.
+
 - **Snell v6 outbound** — `type: snell` accepts `version: 6` (or `v6`)
   with a `mode` matching the server's: `default` (traffic-shaped records),
   `unshaped`, or `unsafe-raw`. TCP, UDP-over-TCP and connection reuse are
@@ -26,8 +48,10 @@ the canonical, in-repo source a release is cut from.
   `proxyDialer.ListenPacket`), reusing the `dial_udp_conn`/`supports_udp`
   dialer plumbing from the Shadowsocks chain. The TCP control connection
   chains as before and keeps governing the association's lifetime; a
-  `0.0.0.0` bound address is rewritten to the resolved server IP before
-  the front is dialed. Chained reads restore the connected-socket filter
+  `0.0.0.0` bound address is resolved before the front is dialed — to a
+  literal when the server address is an IP, or delegated to the front as a
+  domain target when it is a name (issue #657). Chained reads restore the
+  connected-socket filter
   (foreign wire sources and malformed datagrams drop per-packet), writes
   verify frame size and atomicity, and a UDP-less front refuses at dial
   time with `NotSupported` — no raw-socket fallback.

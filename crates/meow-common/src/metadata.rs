@@ -95,6 +95,22 @@ impl Metadata {
         std::mem::swap(&mut self.src_port, &mut self.dst_port);
         std::mem::swap(&mut self.src_geo_ip, &mut self.dst_geo_ip);
     }
+
+    /// A *domain-carrying* UDP association request (`dialer-proxy` inner
+    /// hops, issue #657): `host` set, `dst_ip` absent.
+    ///
+    /// Listener-facing UDP dispatch always resolves `dst_ip` before calling
+    /// `dial_udp`, so a host-only destination only ever arrives via the
+    /// dialer layer asking the front to bind an association to the *name* —
+    /// the front resolves it with its own (remote-server) view, matching
+    /// where the chained TCP leg landed. An adapter that cannot express a
+    /// domain target on the wire must answer `NotSupported` — never bind a
+    /// conn whose `write_packet` stamps the caller's `SocketAddr` arg,
+    /// since the caller holds no literal for a `Name` target.
+    pub fn domain_udp_target(&self) -> Option<(&SmolStr, u16)> {
+        (self.network == Network::Udp && self.dst_ip.is_none() && !self.host.is_empty())
+            .then_some((&self.host, self.dst_port))
+    }
 }
 
 impl Default for Metadata {

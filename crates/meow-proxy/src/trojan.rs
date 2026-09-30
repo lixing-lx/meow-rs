@@ -301,6 +301,21 @@ fn encode_socks5_addr_from_metadata(buf: &mut Vec<u8>, metadata: &Metadata) {
     buf.extend_from_slice(&metadata.dst_port.to_be_bytes());
 }
 
+/// Encode a `(domain, port)` as a SOCKS5 ATYP_DOMAIN address — the
+/// per-packet form a domain-bound UDP association stamps (issue #657).
+/// Callers must have validated `host.len() <= MAX_DOMAIN_LEN`.
+fn encode_socks5_addr_domain(buf: &mut Vec<u8>, host: &str, port: u16) {
+    let host_bytes = host.as_bytes();
+    debug_assert!(
+        host_bytes.len() <= MAX_DOMAIN_LEN,
+        "domain length checked by caller"
+    );
+    buf.push(ATYP_DOMAIN);
+    buf.push(u8::try_from(host_bytes.len()).expect("domain length checked by caller"));
+    buf.extend_from_slice(host_bytes);
+    buf.extend_from_slice(&port.to_be_bytes());
+}
+
 /// Encode an explicit `SocketAddr` as a SOCKS5 address (used for per-packet
 /// UDP frames where each datagram targets an arbitrary peer).
 fn encode_socks5_addr_socket(buf: &mut Vec<u8>, addr: &SocketAddr) {
@@ -390,15 +405,23 @@ pub struct TrojanPacketConn {
     reader: Mutex<ReadHalf<Box<dyn TransportStream>>>,
     writer: Mutex<WriteHalf<Box<dyn TransportStream>>>,
     poisoned: std::sync::atomic::AtomicBool,
+    /// A chained `UdpTarget::Name` binds every datagram's DST field to the
+    /// domain (ATYP_DOMAIN) so the server resolves it (issue #657). `None`
+    /// keeps per-packet `SocketAddr` stamping.
+    write_target: Option<(smol_str::SmolStr, u16)>,
 }
 
 impl TrojanPacketConn {
-    fn new(stream: Box<dyn TransportStream>) -> Self {
+    fn new(
+        stream: Box<dyn TransportStream>,
+        write_target: Option<(smol_str::SmolStr, u16)>,
+    ) -> Self {
         let (r, w) = tokio::io::split(stream);
         Self {
             reader: Mutex::new(r),
             writer: Mutex::new(w),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            write_target,
         }
     }
 }
@@ -458,9 +481,12 @@ impl ProxyPacketConn for TrojanPacketConn {
             )));
         }
 
-        // Pre-size: ATYP(1) + addr(≤16) + port(2) + len(2) + CRLF(2) + payload.
-        let mut frame = Vec::with_capacity(buf.len() + 23);
-        encode_socks5_addr_socket(&mut frame, addr);
+        // Pre-size: ATYP(1) + addr(≤16 or ≤255 domain) + port(2) + len(2) + CRLF(2) + payload.
+        let mut frame = Vec::with_capacity(buf.len() + 280);
+        match &self.write_target {
+            Some((host, port)) => encode_socks5_addr_domain(&mut frame, host, *port),
+            None => encode_socks5_addr_socket(&mut frame, addr),
+        }
         frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         frame.extend_from_slice(b"\r\n");
         frame.extend_from_slice(buf);
@@ -578,10 +604,23 @@ impl ProxyAdapter for TrojanAdapter {
             metadata.remote_address(),
             self.addr_str
         );
+        // This adapter as a *front*: a host-only UDP destination — the
+        // dialer layer's encoding of a chained `UdpTarget::Name`
+        // (issue #657) — binds the association to the domain; each
+        // datagram's DST stamps ATYP_DOMAIN and the server resolves it.
+        let write_target = match metadata.domain_udp_target() {
+            Some((host, port)) if host.len() <= MAX_DOMAIN_LEN => Some((host.clone(), port)),
+            Some(_) => {
+                return Err(MeowError::NotSupported(
+                    "trojan: domain UDP target exceeds ATYP_DOMAIN length".into(),
+                ));
+            }
+            None => None,
+        };
         let stream = self
             .open_tls_with_header(metadata, CMD_UDP_ASSOCIATE)
             .await?;
-        Ok(Box::new(TrojanPacketConn::new(stream)))
+        Ok(Box::new(TrojanPacketConn::new(stream, write_target)))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -599,7 +638,7 @@ mod tests {
         // QUIC first flight: server sends ~3 datagrams that coalesce into one
         // TLS record → meow must yield all three, not just the first.
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let conn = TrojanPacketConn::new(Box::new(client));
+        let conn = TrojanPacketConn::new(Box::new(client), None);
 
         let src: SocketAddr = "9.9.9.9:443".parse().unwrap();
         let payloads: [&[u8]; 3] = [b"\xc0one", b"\xc0two", b"\xc0three!"];
@@ -628,7 +667,7 @@ mod tests {
     async fn cancelled_read_poisons_packet_conn() {
         use tokio::io::AsyncWriteExt;
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let conn = TrojanPacketConn::new(Box::new(client));
+        let conn = TrojanPacketConn::new(Box::new(client), None);
         let mut buf = [0u8; 2048];
 
         // Peer sends a partial header then stalls: ATYP + one address byte.
@@ -659,7 +698,7 @@ mod tests {
     async fn errored_read_poisons_packet_conn() {
         use tokio::io::AsyncWriteExt;
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let conn = TrojanPacketConn::new(Box::new(client));
+        let conn = TrojanPacketConn::new(Box::new(client), None);
         let mut buf = [0u8; 2048];
 
         // Valid addr + length, then a wrong CRLF marker.
@@ -685,7 +724,7 @@ mod tests {
     async fn completed_read_leaves_conn_usable() {
         use tokio::io::AsyncWriteExt;
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let conn = TrojanPacketConn::new(Box::new(client));
+        let conn = TrojanPacketConn::new(Box::new(client), None);
         let mut buf = [0u8; 2048];
         let src: SocketAddr = "9.9.9.9:443".parse().unwrap();
 
@@ -713,7 +752,7 @@ mod tests {
         // Tiny pipe: a 4 KiB datagram exceeds the buffer, so `write_all`
         // pends mid-frame with a prefix already on the wire.
         let (client, server) = tokio::io::duplex(1024);
-        let conn = TrojanPacketConn::new(Box::new(client));
+        let conn = TrojanPacketConn::new(Box::new(client), None);
         let dst: SocketAddr = "9.9.9.9:53".parse().unwrap();
 
         let cancelled = tokio::time::timeout(
@@ -742,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn queued_write_after_cancelled_write_fails_fast() {
         let (client, server) = tokio::io::duplex(1024);
-        let conn = std::sync::Arc::new(TrojanPacketConn::new(Box::new(client)));
+        let conn = std::sync::Arc::new(TrojanPacketConn::new(Box::new(client), None));
         let dst: SocketAddr = "9.9.9.9:53".parse().unwrap();
 
         // Occupy the writer mid-frame.
@@ -846,5 +885,18 @@ mod tests {
             matches!(err, MeowError::Proxy(ref msg) if msg.contains("domain name too long")),
             "expected domain length proxy error, got {err:?}"
         );
+    }
+
+    /// The per-packet domain stamp a bound UDP association writes when the
+    /// chained target is a `UdpTarget::Name` (issue #657): ATYP_DOMAIN +
+    /// u8 length + host + port — the server resolves the name itself.
+    #[test]
+    fn encode_socks5_addr_domain_wire_layout() {
+        let mut buf = Vec::new();
+        encode_socks5_addr_domain(&mut buf, "back.internal", 8388);
+        assert_eq!(buf[0], ATYP_DOMAIN);
+        assert_eq!(buf[1] as usize, "back.internal".len());
+        assert_eq!(&buf[2..15], b"back.internal");
+        assert_eq!(&buf[15..], &8388u16.to_be_bytes());
     }
 }
