@@ -456,6 +456,36 @@ the canonical, in-repo source a release is cut from.
   dropped. Docker e2e now runs bulk echo, a post-half-close reply and UDP
   against official v3.0.1, v4.1.1 and v5.0.1 servers, not only v6.
 
+- **Local resource-exhaustion and wrapped capability dial errors no longer
+  dead-mark proxy-group members** — `DialFailureTracker` now walks
+  `RelayHopFailed` chains and io-boundary reconstitution instead of only
+  matching the top-level error variant: a `NotSupported`/`UdpNotSupported`
+  refused at hop N of a chained front, and an `EMFILE`/`ENFILE`/`ENOBUFS`/
+  `ENOMEM` raised by a local `socket()` call anywhere in the chain, are
+  both recognized as non-health signals and never count toward the
+  5-failures-in-5s dead-mark threshold. The `dialer-proxy` io boundary
+  (`ProxyDialer::dial_metadata`/`dial_udp_conn`) now preserves the front's
+  classification — capability refusals map to `ErrorKind::Unsupported` and
+  innermost io errors pass through with their `raw_os_error` intact —
+  instead of collapsing everything into an untyped `Other` string, and the
+  same preservation was applied at adapter transport boundaries
+  (`Shadowsocks` TCP connect/lookup, `TransportChain`/
+  `transport_to_proxy_err`, `AnyTls` session setup and TLS-handshake
+  hook, `kcptun` session/resolve, SOCKS5 TLS wrap, and Hysteria2
+  initial-and-mid-session send/resolve) so a plain un-chained member
+  keeps its errno too. Multi-candidate retry loops (direct TCP
+  multi-address connect and UDP connect including the chained
+  domain-target path, Shadowsocks chained and un-chained UDP
+  bind/connect, kcptun endpoint/session, mux stream-open, socket-protect
+  TCP host connect, Hysteria2 multi-address dial) now prefer an earlier
+  errno-bearing failure over a later context-only one instead of
+  last-wins, and errno-less `ErrorKind::OutOfMemory`/`Unsupported` io
+  errors classify through the same arms as raw-errno ones. Previously, a local
+  fd-exhaustion burst (e.g. a client connection storm under the launchd
+  256-fd soft limit) dead-marked every member of a url-test/fallback
+  group and collapsed load-balance groups into `NoProxyAvailable` until
+  the next probe sweep revived them (issues #663, #668).
+
 - **Snell UDP replies from IPv4-mapped sources are unmapped** — a server
   answering from `::ffff:a.b.c.d` (the v6 server does, for IPv4 targets)
   is now reported as `a.b.c.d`, so the reply source matches the target
