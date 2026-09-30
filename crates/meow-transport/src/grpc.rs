@@ -108,15 +108,23 @@ impl Transport for GrpcLayer {
 
         // Drive the connection in a background task.  The connection future
         // must be polled continuously to process h2 control frames (SETTINGS,
-        // WINDOW_UPDATE, PING, etc.).
-        tokio::spawn(async move {
+        // WINDOW_UPDATE, PING, etc.).  Keep the JoinHandle on the stream so
+        // drop can bound the driver's shutdown flush — a wedged send buffer
+        // would otherwise pin the inner fd indefinitely (issue #669).
+        let conn_driver = tokio::spawn(async move {
             let _ = conn.await;
         });
 
         // Open the h2 stream.  `end_of_stream = false` — we will stream data.
-        let (response_future, send_stream) = h2
-            .send_request(request, false)
-            .map_err(|e| TransportError::Grpc(e.to_string()))?;
+        let (response_future, send_stream) = match h2.send_request(request, false) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Dropping the JoinHandle would detach the driver with an
+                // unbounded shutdown flush; abort it explicitly (issue #669).
+                conn_driver.abort();
+                return Err(TransportError::Grpc(e.to_string()));
+            }
+        };
 
         // Do NOT await the response here: upstream's `Tun` handler reads the
         // client's first hunk before it writes anything, and grpc-go only
@@ -126,6 +134,7 @@ impl Transport for GrpcLayer {
         Ok(Box::new(GunStream::new(
             send_stream,
             RecvState::new(response_future),
+            conn_driver,
         )))
     }
 }
@@ -294,17 +303,50 @@ struct GunStream {
     /// still stashed at `poll_shutdown` (i.e. the parked write was cancelled)
     /// is flushed together with the closing EOS frame, never discarded.
     pending_write: Option<Bytes>,
+    /// h2 conn driver task. The conn owns the inner stream's fd: dropping
+    /// this stream's send/recv refs makes the driver self-terminate, but
+    /// only if its closing flush can make progress — the handle lets Drop
+    /// bound that wait (issue #669).
+    conn_driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GunStream {
-    fn new(send: h2::SendStream<Bytes>, recv: RecvState) -> Self {
+    fn new(
+        send: h2::SendStream<Bytes>,
+        recv: RecvState,
+        conn_driver: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
             send,
             recv,
             read_buf: Bytes::new(),
             pending_frame: Vec::new(),
             pending_write: None,
+            conn_driver: Some(conn_driver),
         }
+    }
+}
+
+impl Drop for GunStream {
+    fn drop(&mut self) {
+        let Some(mut driver) = self.conn_driver.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            driver.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            // Once this stream's refs are gone the conn closes on its own;
+            // bound that wait so a wedged shutdown flush cannot pin the fd.
+            if tokio::time::timeout(crate::h2_common::DRIVER_DRAIN_TIMEOUT, &mut driver)
+                .await
+                .is_err()
+            {
+                driver.abort();
+                let _ = driver.await;
+            }
+        });
     }
 }
 

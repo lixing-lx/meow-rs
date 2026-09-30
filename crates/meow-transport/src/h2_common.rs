@@ -9,7 +9,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-const DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Grace window for an h2 conn driver to finish after its last stream
+/// drops; the driver is aborted past it (wedged-flush peers could
+/// otherwise pin the socket indefinitely, issue #669).
+pub(crate) const DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Per-stream receive window advertised in the client SETTINGS
 /// (`SETTINGS_INITIAL_WINDOW_SIZE`).  h2's default is the RFC 9113 initial

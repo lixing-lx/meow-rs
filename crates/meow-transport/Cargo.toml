@@ -196,7 +196,9 @@ foreign-types      = { workspace = true, optional = true }
 webpki-root-certs  = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio        = { workspace = true }
+# `test-util` enables paused-time tests (start_paused / time::advance) —
+# not part of tokio's `full` set.
+tokio        = { workspace = true, features = ["test-util"] }
 # Test-only: the loopback TLS *servers* in tests/ (SNI/ALPN/mTLS capture) are
 # rustls-based. Not linked into any binary.
 tokio-rustls = { workspace = true }

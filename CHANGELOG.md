@@ -462,6 +462,18 @@ the canonical, in-repo source a release is cut from.
   skipped, as for any outbound without UDP. Use `dialer-proxy` on the exit
   node for chained UDP (#495 item 6).
 
+- **A dropped deferred WebSocket upgrade no longer pins its fd**
+  (issue #669). With `ws-opts.max-early-data > 0` the upgrade handshake
+  ran in a spawned task that owned the inner TCP stream, and dropping the
+  caller's stream only dropped a oneshot receiver — the task kept
+  waiting on the peer's upgrade reply, so a peer that accepted TCP but
+  never answered held the fd open indefinitely. The task now carries a
+  10-second handshake timeout and is aborted the moment the stream is
+  dropped, releasing the fd in both cases; the eager
+  `max-early-data = 0` path gets the same 10-second bound. The gRPC
+  transport's conn driver gains the same drop-bounded shutdown so a
+  wedged closing flush cannot pin its fd either.
+
 - **AnyTLS no longer logs one `info` line per proxied stream** (#495
   item 13). The client session logged `Stream N SYNACK received
   (success)` at `info` for every stream it opened, so a busy AnyTLS proxy

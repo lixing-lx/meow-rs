@@ -18,6 +18,7 @@
 //! | I  | `grpc_shutdown_after_rejected_buffer_does_not_resurrect_frame` — shutdown never resends a frame cleared by the changed-buffer rejection (PR #440 follow-up) |
 //! | J  | `grpc_empty_write_is_noop_even_with_stashed_frame` — `write(&[])` returns `Ok(0)` without tripping the changed-buffer guard (PR #440 follow-up) |
 //! | K  | `grpc_receive_window_absorbs_1mib_before_first_read` — the client advertises proxy-sized receive windows, so a server can push 1 MiB before the first read (issue #495) |
+//! | L  | `grpc_drop_releases_connection` — dropping the stream ends the conn driver and closes the fd (issue #669) |
 
 mod support;
 
@@ -667,4 +668,50 @@ async fn grpc_receive_window_absorbs_1mib_before_first_read() {
         .await
         .expect("read_to_end 1 MiB");
     assert_eq!(recv_buf, payload, "pushed bytes must decode intact");
+}
+
+// ─── L: grpc_drop_releases_connection ────────────────────────────────────────
+
+/// The h2 conn driver owns the inner socket; dropping `GunStream` must end
+/// the driver and close the fd — the pre-fix code discarded the driver
+/// JoinHandle, so a wedged shutdown flush could pin it (issue #669). The
+/// server observes its own connection ending once the client fd closes.
+#[tokio::test]
+async fn grpc_drop_releases_connection() {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut conn) = h2::server::handshake(tcp).await else {
+            return;
+        };
+        // Accept the client's single request stream, then keep polling:
+        // `accept` returns None once the connection ends — i.e. once the
+        // client's conn driver (and its fd) is gone. `Some(Err)` is a
+        // terminal conn error — consume it and finish too.
+        let _first = conn.accept().await;
+        while let Some(Ok(_)) = conn.accept().await {}
+        let _ = done_tx.send(());
+    });
+
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP connect");
+    let stream = GrpcLayer::new(GrpcConfig::default())
+        .connect(Box::new(tcp))
+        .await
+        .expect("grpc connect");
+
+    drop(stream);
+
+    tokio::time::timeout(Duration::from_secs(3), done_rx)
+        .await
+        .expect("conn driver must end — and close the fd — after stream drop")
+        .expect("server done channel");
 }

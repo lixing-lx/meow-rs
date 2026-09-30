@@ -20,6 +20,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -198,13 +199,20 @@ impl Transport for WsLayer {
             .unwrap_or_else(|| "Sec-WebSocket-Protocol".into());
 
         if max_early_data == 0 {
-            // Eager path — no early data.
+            // Eager path — no early data. Same bound as the deferred
+            // task: a peer that never answers the upgrade must not wait
+            // here forever either (issue #669).
             let request = build_request(&uri, &host, &extra, "", "")
                 .map_err(|e| TransportError::Config(e.to_string()))?;
-            let (ws, _) =
-                tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config()))
-                    .await
-                    .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            let (ws, _) = tokio::time::timeout(
+                UPGRADE_TIMEOUT,
+                tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config())),
+            )
+            .await
+            .map_err(|_| {
+                TransportError::WebSocket(format!("ws upgrade timed out after {UPGRADE_TIMEOUT:?}"))
+            })?
+            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
             Ok(Box::new(WsStream::connected(ws)))
         } else {
             // Deferred path — accumulate early data on first writes.
@@ -260,12 +268,50 @@ fn build_request(
 
 type BoxStream = Box<dyn Stream>;
 
-// The upgrade future runs in a spawned task and sends the result back.
-// Using a oneshot channel avoids boxing a non-Sync future while still making
-// WsStream: Sync (oneshot::Receiver<T>: Sync when T: Send).
-type UpgradeRx = tokio::sync::oneshot::Receiver<
-    std::result::Result<WebSocketStream<BoxStream>, tokio_tungstenite::tungstenite::Error>,
->;
+/// Bounds the deferred-upgrade handshake task. A peer that accepts the
+/// TCP connection but never answers the HTTP upgrade would otherwise
+/// hold the inner stream's fd forever; the timeout also covers the
+/// upgraded-side wait while the caller is still alive (issue #669).
+/// Matches `reality_tls::REALITY_HANDSHAKE_TIMEOUT`.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Guard around the spawned upgrade task. Aborting on drop releases the
+/// inner stream (and its fd) as soon as the caller abandons the upgrade —
+/// a oneshot `Receiver` drop did not cancel the task, so a hung peer
+/// could pin the fd indefinitely (issue #669). A `JoinHandle` keeps
+/// `WsStream: Sync` without boxing the non-Sync handshake future.
+struct UpgradeTask {
+    handle: tokio::task::JoinHandle<io::Result<WebSocketStream<BoxStream>>>,
+    /// Set once the handle resolves — a `JoinHandle` panics when polled
+    /// after completion, but a caller that retries after a failed
+    /// upgrade polls us again; return a stable terminal error instead.
+    done: bool,
+}
+
+impl Future for UpgradeTask {
+    type Output = io::Result<WebSocketStream<BoxStream>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.done {
+            return Poll::Ready(Err(io::Error::other("ws upgrade task already resolved")));
+        }
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Ready(result) => {
+                self.done = true;
+                // JoinError is only reachable if the task panicked
+                // (aborts happen on drop, when nothing polls the guard).
+                Poll::Ready(result.unwrap_or_else(|e| Err(io::Error::other(e))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for UpgradeTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 struct PendingState {
     inner: Option<BoxStream>,
@@ -287,8 +333,8 @@ struct ConnectedState {
 
 enum WsInner {
     Pending(Box<PendingState>),
-    /// Upgrade in progress; result delivered via the channel.
-    Upgrading(UpgradeRx),
+    /// Upgrade in progress; aborting the guard on drop releases the fd.
+    Upgrading(UpgradeTask),
     Connected(Box<ConnectedState>),
 }
 
@@ -330,7 +376,7 @@ impl WsStream {
 }
 
 /// Transition `state` → `WsInner::Upgrading` by spawning the handshake task.
-fn begin_upgrade(state: &mut PendingState) -> UpgradeRx {
+fn begin_upgrade(state: &mut PendingState) -> UpgradeTask {
     let inner = state.inner.take().expect("inner stream taken only once");
     let early_value = if state.early_buf.is_empty() {
         String::new()
@@ -346,13 +392,25 @@ fn begin_upgrade(state: &mut PendingState) -> UpgradeRx {
     )
     .expect("WsConfig produces a valid HTTP upgrade request");
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let result =
-            tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config())).await;
-        let _ = tx.send(result.map(|(ws, _)| ws));
+    let handle = tokio::spawn(async move {
+        match tokio::time::timeout(
+            UPGRADE_TIMEOUT,
+            tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config())),
+        )
+        .await
+        {
+            Ok(Ok((ws, _))) => Ok(ws),
+            Ok(Err(e)) => Err(io::Error::other(e)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ws upgrade timed out after {UPGRADE_TIMEOUT:?}"),
+            )),
+        }
     });
-    rx
+    UpgradeTask {
+        handle,
+        done: false,
+    }
 }
 
 // ─── Poll helpers ─────────────────────────────────────────────────────────────
@@ -364,12 +422,12 @@ fn begin_upgrade(state: &mut PendingState) -> UpgradeRx {
 /// Returns `Poll::Ready(Ok(()))` when `inner` has been replaced with
 /// `WsInner::Connected`.
 fn poll_upgrade(inner: &mut WsInner, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-    let WsInner::Upgrading(rx) = inner else {
+    let WsInner::Upgrading(task) = inner else {
         unreachable!("poll_upgrade called outside Upgrading state")
     };
-    match Pin::new(rx).poll(cx) {
+    match Pin::new(task).poll(cx) {
         Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(Ok(ws))) => {
+        Poll::Ready(Ok(ws)) => {
             *inner = WsInner::Connected(Box::new(ConnectedState {
                 ws,
                 read_buf: Bytes::new(),
@@ -377,8 +435,7 @@ fn poll_upgrade(inner: &mut WsInner, cx: &mut Context<'_>) -> Poll<io::Result<()
             }));
             Poll::Ready(Ok(()))
         }
-        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other("ws upgrade task dropped"))),
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
     }
 }
 
@@ -395,8 +452,8 @@ impl AsyncRead for WsStream {
                 WsInner::Pending(state) => {
                     // A read forces the upgrade to start (with whatever
                     // early data has been buffered so far).
-                    let rx = begin_upgrade(state);
-                    self.inner = WsInner::Upgrading(rx);
+                    let task = begin_upgrade(state);
+                    self.inner = WsInner::Upgrading(task);
                 }
                 WsInner::Upgrading(_) => {
                     match poll_upgrade(&mut self.inner, cx) {
@@ -480,8 +537,8 @@ impl AsyncWrite for WsStream {
 
                     if state.early_buf.len() >= state.max_early_data {
                         // Buffer full — start the upgrade.
-                        let rx = begin_upgrade(state);
-                        self.inner = WsInner::Upgrading(rx);
+                        let task = begin_upgrade(state);
+                        self.inner = WsInner::Upgrading(task);
                         // Return the bytes consumed so far; any overflow
                         // will be written in the next poll_write call.
                         return Poll::Ready(Ok(take));
@@ -535,8 +592,8 @@ impl AsyncWrite for WsStream {
             match &mut self.inner {
                 WsInner::Pending(state) => {
                     // Flush forces the upgrade (with buffered early data).
-                    let rx = begin_upgrade(state);
-                    self.inner = WsInner::Upgrading(rx);
+                    let task = begin_upgrade(state);
+                    self.inner = WsInner::Upgrading(task);
                 }
                 WsInner::Upgrading(_) => {
                     match poll_upgrade(&mut self.inner, cx) {
@@ -558,8 +615,8 @@ impl AsyncWrite for WsStream {
         loop {
             match &mut self.inner {
                 WsInner::Pending(state) => {
-                    let rx = begin_upgrade(state);
-                    self.inner = WsInner::Upgrading(rx);
+                    let task = begin_upgrade(state);
+                    self.inner = WsInner::Upgrading(task);
                 }
                 WsInner::Upgrading(_) => match poll_upgrade(&mut self.inner, cx) {
                     Poll::Pending => return Poll::Pending,
