@@ -10,6 +10,20 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
+  file-descriptor soft limit toward the hard limit (≤ 65536) before any
+  listener or outbound socket is created, matching the precedent the
+  systemd unit (`LimitNOFILE`), the OpenWrt procd script, and `meow-bench`
+  already follow for their launch vectors. The macOS/launchd default of
+  256 EMFILEs a proxy at ~120 concurrent proxied connections (two fds per conn:
+  inbound + outbound) while the default `max-connections: 256` listener
+  cap can never bind first; a denied, kernel-clamped, or hard-limited
+  raise never aborts startup — it warns only when the effective limit
+  stays below a comfortable floor.
+  The generated launchd plist also gains
+  `SoftResourceLimits.NumberOfFiles = 65536` for installs that (re)run
+  `meow install` (issue #670).
+
 - **Domain-carrying UDP dial targets through `dialer-proxy` chains** —
   `TcpDialer::dial_udp_conn` now takes a `UdpTarget` (`Addr` literal or
   `Name { host, port }`), letting a front proxy resolve the association

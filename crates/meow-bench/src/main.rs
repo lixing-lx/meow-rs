@@ -230,6 +230,10 @@ async fn wait_for_port_guarded(
 /// before any real limit — BOTH sides pay per conn: the harness holds
 /// the client socket and the spawned proxy holds inbound + outbound
 /// (rlimits are inherited across exec, so children get it free).
+/// Twin of the `meow` binary's `raise_nofile_limit`
+/// (crates/meow-app/src/main.rs) — kept as a copy: this bin is
+/// standalone (no meow-common dep) and reports via eprintln rather
+/// than tracing.
 #[cfg(unix)]
 fn raise_nofile_limit() {
     unsafe {

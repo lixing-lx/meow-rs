@@ -348,6 +348,93 @@ fn run_application(
     result
 }
 
+// The "remedy" tail shared by the failure warnings below.
+#[cfg(unix)]
+const NOFILE_REMEDY: &str =
+    "raise via ulimit -n / launchd SoftResourceLimits / systemd LimitNOFILE";
+
+/// Raise this process's `RLIMIT_NOFILE` soft limit toward the hard
+/// limit. Deployment vectors that already ship a large limit (systemd
+/// `LimitNOFILE`, OpenWrt procd, meow-bench's own raise) make the bare
+/// launchd/shell default of 256 the odd one out — do it in-process so
+/// every launch path benefits. Never fatal: a denied or clamped raise
+/// only warns.
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    // Deliberately conservative vs. the 1M shipped in the systemd/procd
+    // vectors: 64K covers ~32K proxied conns (128× the default listener
+    // cap) while keeping fd-leak runway bounded in bare shell/launchd
+    // runs — and matches the plist + meow-bench values.
+    const TARGET: libc::rlim_t = 65_536;
+    /// Final limits below this warn no matter which branch produced
+    /// them — a low *hard* ceiling is as real as a kernel clamp.
+    const COMFORTABLE: libc::rlim_t = 4096;
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            warn!(
+                "getrlimit(RLIMIT_NOFILE) failed ({}) — conn-heavy traffic may hit the inherited cap; {NOFILE_REMEDY}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let target = lim.rlim_max.min(TARGET);
+        if lim.rlim_cur >= target {
+            if lim.rlim_cur < COMFORTABLE {
+                warn!(
+                    "RLIMIT_NOFILE capped at {} by the hard limit — conn-heavy traffic may hit the cap; {NOFILE_REMEDY}",
+                    lim.rlim_cur
+                );
+            } else {
+                tracing::debug!(
+                    soft = lim.rlim_cur,
+                    "RLIMIT_NOFILE soft limit already sufficient"
+                );
+            }
+            return;
+        }
+        let previous = lim.rlim_cur;
+        lim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            warn!(
+                "setrlimit(RLIMIT_NOFILE, {target}) failed ({}) — conn-heavy traffic may hit the low cap; {NOFILE_REMEDY}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // XNU can *silently clamp* rlim_cur to kern.maxfilesperproc and
+        // still return success — re-read to confirm the raise landed.
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) != 0 {
+            tracing::debug!(
+                "getrlimit(RLIMIT_NOFILE) re-check failed ({})",
+                std::io::Error::last_os_error()
+            );
+        } else if after.rlim_cur < COMFORTABLE {
+            warn!(
+                "RLIMIT_NOFILE only reached {} (wanted {target}, hard {}) — conn-heavy traffic may hit the low cap; {NOFILE_REMEDY}",
+                after.rlim_cur, lim.rlim_max
+            );
+        } else if after.rlim_cur < target {
+            info!(
+                "RLIMIT_NOFILE clamped to {} by the OS ceiling (wanted {target}) — still comfortably above the default 256",
+                after.rlim_cur
+            );
+        } else {
+            info!(
+                "raised RLIMIT_NOFILE soft limit {previous} → {}",
+                after.rlim_cur
+            );
+        }
+    }
+}
+
 fn run_application_inner(
     args: Args,
     log_tx: tokio::sync::broadcast::Sender<meow_api::log_stream::LogMessage>,
@@ -355,6 +442,13 @@ fn run_application_inner(
     on_ready: Option<ReadyCallback>,
 ) -> Result<()> {
     info!("meow-rs starting...");
+
+    // Raise RLIMIT_NOFILE before the runtime and any listener come up —
+    // every proxied conn costs two fds (inbound + outbound), and the
+    // macOS/launchd default of 256 EMFILEs at ~120 live conns while the
+    // default 256-conn listener cap never binds (issue #670).
+    #[cfg(unix)]
+    raise_nofile_limit();
 
     // Propagate -d to the process-wide home directory so all resource-path
     // helpers (default_geoip_path, default_asn_path, default_geosite_path, …)
@@ -619,6 +713,11 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{log_dir}/meow.log</string>
     <key>StandardErrorPath</key>
