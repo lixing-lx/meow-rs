@@ -31,7 +31,9 @@ filtered client-side via `?level=`.
 ## Run as a service
 
 Subcommands install meow-rs as a managed service (systemd on Linux, launchd on macOS,
-Windows Service on Windows). These need root/sudo (or an elevated shell on Windows).
+Windows Service on Windows). Linux needs root/sudo and Windows an elevated shell;
+on macOS `install` must run **as your own user, without sudo** — it targets the
+per-user `gui/<uid>` launchd domain and your `~/Library` directories.
 
 | Command | Action |
 | --- | --- |
@@ -52,8 +54,14 @@ with the config path baked into the unit.
 ### macOS (launchd)
 
 ```bash
-sudo ./meow install -f /path/to/config.yaml
+./meow install -f /path/to/config.yaml
 ```
+
+Do **not** use `sudo`: the agent is installed into the calling user's `gui/<uid>`
+domain. macOS `sudo` preserves `HOME` by default, so files would land root-owned
+in your own `~/Library` (or `/var/root` under `sudo -i`/`-H`) while the `gui/0`
+bootstrap fails either way. The same goes for `meow uninstall` and `meow status`,
+which refuse a sudo that would touch the wrong user's files or domain.
 
 Copies the config under `~/Library/Application Support/meow/`, writes
 `~/Library/LaunchAgents/com.meow.proxy.plist`, and bootstraps it. Runs as your user (the

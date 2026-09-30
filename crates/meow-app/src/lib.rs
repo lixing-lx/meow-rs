@@ -13,6 +13,19 @@ pub mod subscription_refresh;
 /// launchd label for the macOS user agent plist.
 pub const LAUNCHD_LABEL: &str = "com.meow.proxy";
 
+/// True when `a` and `b` resolve to the same directory entry, with `..`,
+/// repeated separators, and symlinks (e.g. macOS `/var` → `/private/var`)
+/// normalized away. Returns false when either path cannot be resolved.
+/// Used by the macOS `uninstall` guard to admit only a literal
+/// `$HOME` == `/var/root` without a prefix-match bypass like
+/// `/var/root/../Users/x` (issue #678).
+pub fn same_resolved_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(x), Ok(y)) if x == y
+    )
+}
+
 /// Escape a value for interpolation into a plist `<string>` node
 /// (issue #677): `&`, `<`, `>` are required and `"`/`'` are escaped too —
 /// a stray `]]>` or a quote in a HOME-derived path must not break the XML.

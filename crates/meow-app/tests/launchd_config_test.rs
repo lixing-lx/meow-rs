@@ -152,3 +152,47 @@ fn launchd_plist_rejects_xml_unrepresentable_chars() {
     meow_app::generate_launchd_plist("/x/a\nb", "/x/config.yaml", "/x", "/x/a\tb")
         .expect("newline/tab paths remain legal XML");
 }
+
+#[test]
+fn same_resolved_path_truth_table() {
+    // Backs the macOS `uninstall` sudo guard (issue #678): only a literal
+    // $HOME == /var/root may pass; `..` traversal, symlink aliases, and
+    // nonexistent paths must all resolve correctly.
+    let root = tempfile::tempdir().unwrap();
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let other = tempfile::tempdir().unwrap();
+
+    // Same dir, verbatim and via a subdir's `..`.
+    assert!(meow_app::same_resolved_path(root.path(), root.path()));
+    assert!(meow_app::same_resolved_path(root.path(), &sub.join("..")));
+
+    // A different directory is not the same.
+    assert!(!meow_app::same_resolved_path(root.path(), other.path()));
+
+    // "/var/root/../<victim>" must never equal "/var/root"-equivalent:
+    // root's parent dir is NOT root itself.
+    assert!(!meow_app::same_resolved_path(
+        &sub.join("../.."),
+        root.path()
+    ));
+
+    // Nonexistent paths fail closed.
+    assert!(!meow_app::same_resolved_path(
+        root.path(),
+        &root.path().join("missing")
+    ));
+    assert!(!meow_app::same_resolved_path(
+        std::path::Path::new("/nonexistent/definitely"),
+        std::path::Path::new("/nonexistent/definitely")
+    ));
+
+    // A symlink resolves to its target (e.g. macOS /var -> /private/var).
+    #[cfg(unix)]
+    {
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(other.path(), &link).unwrap();
+        assert!(meow_app::same_resolved_path(&link, other.path()));
+        assert!(!meow_app::same_resolved_path(&link, root.path()));
+    }
+}

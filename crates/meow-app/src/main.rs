@@ -665,6 +665,17 @@ fn macos_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::Pa
 
 #[cfg(target_os = "macos")]
 fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
+    // The agent installs into the calling user's gui/<uid> launchd domain
+    // and ~/Library. macOS sudo preserves HOME by default, so a sudo'd
+    // install would drop root-owned files into the user's ~/Library
+    // (/var/root under `sudo -i`/`-H`) and fail to bootstrap gui/0
+    // either way (issue #678).
+    if unsafe { libc::geteuid() } == 0 {
+        anyhow::bail!(
+            "do not run `meow install` via sudo on macOS: the LaunchAgent targets \
+             your per-user gui/<uid> domain — run it as your own user"
+        );
+    }
     let exe_path = std::env::current_exe()?;
     let exe_path = exe_path
         .canonicalize()
@@ -743,6 +754,28 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn uninstall_service() -> Result<()> {
+    // Under `sudo -i`/`-H` HOME resolves to /var/root, where the only files
+    // this can touch are debris from a pre-fix `sudo meow install` — allow
+    // that cleanup. With HOME preserved (`sudo`, `sudo -E`) the paths would
+    // resolve into the real user's ~/Library while `bootout gui/0` no-ops,
+    // deleting the plist+config and orphaning the loaded agent. The HOME
+    // comparison is canonicalized: a crafted "/var/root/../Users/x" must not
+    // pass as root's home (issue #678).
+    if unsafe { libc::geteuid() } == 0
+        && !std::env::var("HOME").is_ok_and(|home| {
+            meow_app::same_resolved_path(
+                std::path::Path::new(&home),
+                std::path::Path::new("/var/root"),
+            )
+        })
+    {
+        anyhow::bail!(
+            "do not run `meow uninstall` via sudo on macOS: it targets the \
+             calling user's gui/<uid> agent — run it as that user. Root-owned \
+             debris left by a previous `sudo meow install` can be removed with \
+             `sudo rm` under the affected ~/Library or /var/root/Library"
+        );
+    }
     let (app_support, _log_dir, launch_agents) = macos_dirs()?;
     let plist_path = launch_agents.join(format!("{LAUNCHD_LABEL}.plist"));
 
@@ -773,6 +806,14 @@ fn uninstall_service() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_status() -> Result<()> {
+    // gui/0 never hosts the agent, so under sudo this would falsely report
+    // "not loaded" (issue #678).
+    if unsafe { libc::geteuid() } == 0 {
+        anyhow::bail!(
+            "do not run `meow status` via sudo on macOS: it queries the calling \
+             user's gui/<uid> domain — run it as your own user"
+        );
+    }
     let uid = unsafe { libc::getuid() };
     let service_target = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let output = std::process::Command::new("launchctl")

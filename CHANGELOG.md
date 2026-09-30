@@ -437,6 +437,20 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **The macOS install guide no longer prefixes `meow install` with
+  `sudo`** (issue #678). The launchd agent installs into the calling
+  user's `gui/<uid>` domain and `~/Library` directories; under sudo it
+  wrote root-owned files into the user's `~/Library` (or `/var/root`
+  under `sudo -i`/`-H`) and tried to bootstrap `gui/0`, which has no
+  GUI session. The snippet now runs `./meow install` as the user and
+  the section preamble explains the per-OS elevation split (Linux
+  systemd keeps `sudo`; Windows keeps an elevated shell). `meow
+  install` on macOS also refuses to run with euid 0, and `meow
+  uninstall`/`meow status` refuse a sudo that would operate on the
+  wrong user's files or domain (`sudo -H meow uninstall` still clears
+  `/var/root` debris left by an older `sudo -i`/`-H` install;
+  root-owned debris inside your own `~/Library` needs `sudo rm`).
+
 - **`meow install` no longer writes a malformed launchd plist when a
   path contains XML characters** (issue #677). The plist interpolated
   the binary, config, working-directory, and log paths verbatim, so a
