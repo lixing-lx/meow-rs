@@ -161,6 +161,7 @@ cargo test --lib --bin meow \
   --test statistics_test --test rules_test --test api_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
+  --test launchd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
   --test shadow_tls_test --test restls_e2e --test jls_e2e --test kcptun_e2e --test pre_resolve_test \

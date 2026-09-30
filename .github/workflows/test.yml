@@ -240,6 +240,7 @@ jobs:
             --test http_connection_close \
             --test config_persistence_test \
             --test systemd_config_test \
+            --test launchd_config_test \
             --test trojan_integration \
             --test vless_config_test \
             --test vless_integration \

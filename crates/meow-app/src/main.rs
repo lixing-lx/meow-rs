@@ -649,7 +649,9 @@ fn service_status() -> Result<()> {
 // --- macOS launchd user agent ---
 
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "com.meow.proxy";
+use anyhow::Context as _;
+#[cfg(target_os = "macos")]
+use meow_app::LAUNCHD_LABEL;
 
 #[cfg(target_os = "macos")]
 fn macos_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
@@ -684,53 +686,25 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
 
     let (app_support, log_dir, launch_agents) = macos_dirs()?;
 
+    // Validate + generate the plist before any fs mutation so a rejected
+    // path leaves nothing behind (issue #677).
+    let dest_config = app_support.join("config.yaml");
+    let plist = meow_app::generate_launchd_plist(
+        &exe_path,
+        &dest_config.display().to_string(),
+        &app_support.display().to_string(),
+        &log_dir.display().to_string(),
+    )
+    .context("failed to generate launchd plist")?;
+
     // Create directories
     std::fs::create_dir_all(&app_support)?;
     std::fs::create_dir_all(&log_dir)?;
     std::fs::create_dir_all(&launch_agents)?;
 
     // Copy config to ~/Library/Application Support/meow/config.yaml
-    let dest_config = app_support.join("config.yaml");
     std::fs::copy(&src_config, &dest_config)?;
     println!("Config copied to {}", dest_config.display());
-
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>-f</string>
-        <string>{config}</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{work_dir}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>65536</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{log_dir}/meow.log</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/meow.err.log</string>
-</dict>
-</plist>
-"#,
-        label = LAUNCHD_LABEL,
-        exe = exe_path,
-        config = dest_config.display(),
-        work_dir = app_support.display(),
-        log_dir = log_dir.display(),
-    );
 
     let plist_path = launch_agents.join(format!("{LAUNCHD_LABEL}.plist"));
 
