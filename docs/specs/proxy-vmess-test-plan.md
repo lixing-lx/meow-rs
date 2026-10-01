@@ -219,7 +219,7 @@ If bundled, these cases are required:
 |---|------|---------|
 | J1 | `vmess_adapter_type_is_vmess` | `VmessAdapter.adapter_type()` returns `AdapterType::Vmess`. Guards the enum variant wiring in `meow-common`. |
 | J2 | `vmess_support_udp_false_by_default` | `VmessAdapter` built with `udp: false` returns `false` from `support_udp()`. |
-| J3 | `vmess_support_udp_true_when_configured` | `udp: true` config → `support_udp() == true`. |
+| J3 | `support_udp_reports_only_implemented_udp` | `udp: true` without a UDP-capable mux → `support_udp() == false` and `dial_udp` fails closed naming the flag (issue #662 — the original `udp: true → support_udp() == true` assertion was retired: it advertised an unimplemented path). |
 | J4 | `no_transport_code_in_vmess_rs` **[guard-rail]** | Walk `crates/meow-proxy/src/vmess/**/*.rs`, assert no line matches `\btokio_tungstenite\b` or `\bTlsConnector\b`. All transport plumbing must go through `meow-transport`. Mirrors transport-layer plan §F2 grep pattern. |
 
 ---

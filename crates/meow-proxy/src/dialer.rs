@@ -49,10 +49,17 @@ impl UdpTarget {
     /// Build a target from a host string: IP literals collapse to
     /// [`UdpTarget::Addr`] (nothing to delegate — the stricter source
     /// filter stays available), anything else becomes [`UdpTarget::Name`].
+    /// Bracketed IPv6 literals (`[::1]`, the usual `host:port` display
+    /// form) unwrap first — otherwise they would masquerade as a domain
+    /// and be delegated for resolution (issue #665). Shares the
+    /// [`metadata_ip_literal`](meow_common::metadata_ip_literal) fold the
+    /// inbound demux loops use (issue #648); `Name` keeps the caller's
+    /// string verbatim so a non-IP bracketed input stays unresolvable
+    /// rather than silently becoming a different name.
     pub fn named(host: &str, port: u16) -> Self {
-        match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => UdpTarget::Addr(SocketAddr::new(ip, port)),
-            Err(_) => UdpTarget::Name {
+        match meow_common::metadata_ip_literal(host) {
+            Some(ip) => UdpTarget::Addr(SocketAddr::new(ip, port)),
+            None => UdpTarget::Name {
                 host: SmolStr::new(host),
                 port,
             },
@@ -1278,6 +1285,41 @@ mod tests {
         assert_eq!(
             UdpTarget::named("::1", 53),
             UdpTarget::Addr("[::1]:53".parse().unwrap())
+        );
+        // Bracketed IPv6 literals (the `host:port` display form) collapse
+        // too — delegating them as a name would send a bogus domain to the
+        // front's resolver (issue #665).
+        assert_eq!(
+            UdpTarget::named("[::1]", 53),
+            UdpTarget::Addr("[::1]:53".parse().unwrap())
+        );
+        assert_eq!(
+            UdpTarget::named("[fe80::1]", 5353),
+            UdpTarget::Addr("[fe80::1]:5353".parse().unwrap())
+        );
+        // Mismatched/lone brackets stay names — unchanged behavior — and
+        // a non-IP bracketed string keeps its verbatim text: stripping
+        // would silently mint a *different, possibly resolvable* name.
+        assert_eq!(
+            UdpTarget::named("[x", 53),
+            UdpTarget::Name {
+                host: "[x".into(),
+                port: 53
+            }
+        );
+        assert_eq!(
+            UdpTarget::named("[foo]", 53),
+            UdpTarget::Name {
+                host: "[foo]".into(),
+                port: 53
+            }
+        );
+        assert_eq!(
+            UdpTarget::named("[]", 53),
+            UdpTarget::Name {
+                host: "[]".into(),
+                port: 53
+            }
         );
         assert_eq!(
             UdpTarget::named("ss.example.com", 8388),

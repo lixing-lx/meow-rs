@@ -437,6 +437,31 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **VMess `support_udp()` no longer over-advertises** (issue #662). With
+  `udp: true` configured but no UDP-capable mux session, the adapter
+  claimed UDP support while `dial_udp` always failed closed — routing
+  could pick the node for UDP traffic that then errored per packet.
+  Capability now reports only what is implemented: a mux session that
+  actually carries UDP. When plain VMess UDP relay lands the `udp:` flag
+  becomes a real capability source again; until then `dial_udp`'s
+  refusal names the configured flag so the misconfiguration is visible.
+
+- **`UdpTarget::named()` unwraps bracketed IPv6 literals** (issue #665).
+  `[::1]` / `[fe80::1]` — the display form produced by every `host:port`
+  join — failed the direct `IpAddr` parse and were delegated to the
+  front's resolver as a bogus domain name. Fully bracketed literals now
+  unwrap before parsing and collapse to `UdpTarget::Addr` like their
+  bare forms; mismatched or empty brackets still pass through as names.
+
+- **Documented the wildcard-BND family-hint gap** (issue #666). A SOCKS5
+  UDP ASSOCIATE reply with a wildcard `BND.ADDR` records its address
+  family for local resolution, but a `dialer-proxy` front that resolves
+  the delegated name may pick the other family. The hint cannot cross a
+  wire-carrying front (no protocol field for it) and the only honoring
+  consumer — a locally-resolving front — is documented in
+  `RelayAddr::Server` as a known semantic gap; the local-resolution
+  fallback already re-applies the family preference.
+
 - **Server-first protocols work over the TUN inbound** (issue #695). The
   TUN accept path waited up to 15 s for the client's first payload before
   dialing upstream, and reset the flow when none came. Protocols where

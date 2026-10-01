@@ -479,7 +479,13 @@ enum RelayAddr {
     /// connection". `v6` remembers the wildcard's address family so a
     /// local resolution can prefer it; when the endpoint is delegated to a
     /// front as `UdpTarget::Name` the hint is lost and the front's resolver
-    /// picks the family — a narrow divergence accepted for issue #657.
+    /// picks the family. Closing it would mean threading the preference
+    /// through `Metadata` — a hot, ADR-0011-tracked type — for the only
+    /// consumer that could honor it (a front resolving the name locally),
+    /// while wire-carrying fronts have no protocol field for it at all;
+    /// the local-resolution fallback already re-applies `v6` via
+    /// `resolve_relay`.
+    /// Documented as a known semantic gap (issue #666).
     Server { port: u16, v6: bool },
 }
 

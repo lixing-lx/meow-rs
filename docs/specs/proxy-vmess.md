@@ -136,7 +136,7 @@ subsection below):
 | `uuid` | string | yes | — | RFC 4122 UUID. Used as the VMess user ID and the AEAD header key seed. Hex or dashed form both accepted. |
 | `alterId` | integer | no | `0` | Deprecated. `> 0` logs a warn-once and is coerced to `0`. Non-negative integers are parsed; negative values are a parse error. |
 | `cipher` | enum | no | `auto` | Body AEAD cipher. `auto` selects AES-GCM on AES-NI hardware, ChaCha20-Poly1305 otherwise. `none` uses no body encryption (payload is plaintext but header is still AEAD-encrypted). `zero` from upstream is **rejected** at parse time: it disables body encryption while the config still reads `vmess`, so a user inheriting the file has no visual cue their traffic is plaintext-over-VMess (security gap per [ADR-0002](../adr/0002-upstream-divergence-policy.md)). |
-| `udp` | bool | no | `false` | Enables UDP-over-TCP framing. When true, `ProxyAdapter::support_udp()` returns true. |
+| `udp` | bool | no | `false` | Requested UDP-over-TCP capability. Plain VMess UDP relay is not yet implemented, so `ProxyAdapter::support_udp()` reports only a UDP-capable mux session (issue #662); `dial_udp` fails closed with `NotSupported`, naming the flag when it was set. |
 | `network` | enum | no | `tcp` | Outer transport. Delegated to `meow-transport` layer chain per M1.A spec. `tcp` = naked TCP, no transport layers. |
 | `tls` | bool | no | `false` | Wrap the transport in TLS via `meow-transport::tls`. Set automatically when `network` requires TLS (e.g. `ws` with `wss://`-style path). |
 
@@ -372,7 +372,7 @@ impl ProxyAdapter for VmessAdapter {
     fn name(&self) -> &str { &self.name }
     fn adapter_type(&self) -> AdapterType { AdapterType::Vmess }
     fn addr(&self) -> &str { /* "server:port" */ }
-    fn support_udp(&self) -> bool { self.udp }
+    fn support_udp(&self) -> bool { mux.supports_udp() /* plain UDP unimplemented — #662 */ }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let raw = self.dialer.dial(&self.server, self.port, metadata.is_internal()).await?;

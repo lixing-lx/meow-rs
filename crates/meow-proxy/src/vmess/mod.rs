@@ -214,18 +214,17 @@ impl ProxyAdapter for VmessAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        // With mux enabled, UDP rides the mux TCP session (unless
-        // `only-tcp` forces the plain path) — mirrors mihomo's
-        // SingMux.SupportUDP.
-        self.udp || {
-            #[cfg(feature = "mux")]
-            {
-                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
-            }
-            #[cfg(not(feature = "mux"))]
-            {
-                false
-            }
+        // Plain VMess UDP relay is unimplemented — `dial_udp` fails
+        // closed — so the config's `udp: true` request alone must not
+        // advertise capability (issue #662). Only a mux session that
+        // actually carries UDP counts.
+        #[cfg(feature = "mux")]
+        {
+            self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
+        }
+        #[cfg(not(feature = "mux"))]
+        {
+            false
         }
     }
 
@@ -266,21 +265,23 @@ impl ProxyAdapter for VmessAdapter {
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            if mux.supports_udp() {
+            if let Some(conn) = mux.open_packet_stream_for(metadata, "vmess").await? {
                 debug!(
                     "VMess mux UDP connecting to {} via {}",
                     metadata.remote_address(),
                     self.addr_str
                 );
-            }
-            if let Some(conn) = mux.open_packet_stream_for(metadata, "vmess").await? {
                 return Ok(conn);
             }
         }
 
-        Err(MeowError::NotSupported(
-            "vmess UDP relay not yet implemented".into(),
-        ))
+        Err(MeowError::NotSupported(if self.udp {
+            "vmess `udp: true` configured but plain UDP relay is not implemented; \
+             enable a UDP-capable mux or use another adapter"
+                .into()
+        } else {
+            "vmess UDP relay not yet implemented".into()
+        }))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -498,5 +499,95 @@ mod tests {
             .await
             .expect("server echo task timed out")
             .expect("server echo task panicked");
+    }
+
+    /// `udp: true` without a UDP-capable mux must not advertise support —
+    /// plain VMess UDP relay is unimplemented and `dial_udp` fails closed,
+    /// so `support_udp` reports only real mux capability (issue #662).
+    #[tokio::test]
+    async fn support_udp_reports_only_implemented_udp() {
+        const UUID: [u8; 16] = [
+            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
+            0x08, 0x11,
+        ];
+        let adapter = VmessAdapter::new(
+            "vmess-no-mux",
+            "127.0.0.1",
+            10086,
+            UUID,
+            Security::Aes128Gcm,
+            true, // udp: true configured
+            TransportChain::empty(),
+            Arc::new(DirectDialer),
+        );
+        assert!(
+            !adapter.support_udp(),
+            "`udp: true` alone must not advertise capability (issue #662)"
+        );
+        let Err(e) = adapter.dial_udp(&Metadata::default()).await else {
+            panic!("plain vmess UDP dial must fail closed");
+        };
+        assert!(
+            matches!(e, MeowError::NotSupported(_)),
+            "expected NotSupported, got {e:?}"
+        );
+        assert!(
+            e.to_string().contains("`udp: true`"),
+            "the configured-flag diagnostic should name the cause: {e}"
+        );
+
+        let adapter = VmessAdapter::new(
+            "vmess-udp-off",
+            "127.0.0.1",
+            10086,
+            UUID,
+            Security::Aes128Gcm,
+            false,
+            TransportChain::empty(),
+            Arc::new(DirectDialer),
+        );
+        assert!(!adapter.support_udp());
+        let Err(e) = adapter.dial_udp(&Metadata::default()).await else {
+            panic!("plain vmess UDP dial must fail closed");
+        };
+        assert!(
+            !e.to_string().contains("`udp: true`"),
+            "unconfigured adapter keeps the plain message: {e}"
+        );
+    }
+
+    /// A UDP-capable mux session is the one real capability source:
+    /// `support_udp` advertises it even with `udp` unset, and `only-tcp`
+    /// mux still declines (issue #662).
+    #[cfg(feature = "mux")]
+    #[tokio::test]
+    async fn support_udp_follows_mux_capability() {
+        const UUID: [u8; 16] = [
+            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
+            0x08, 0x11,
+        ];
+        let mk = |udp: bool| {
+            VmessAdapter::new(
+                "vmess-mux",
+                "127.0.0.1",
+                10086,
+                UUID,
+                Security::Aes128Gcm,
+                udp,
+                TransportChain::empty(),
+                Arc::new(DirectDialer),
+            )
+        };
+        let muxed = mk(false).with_mux(crate::mux::MuxOptions::default());
+        assert!(muxed.support_udp(), "UDP-capable mux advertises");
+
+        let only_tcp = mk(true).with_mux(crate::mux::MuxOptions {
+            only_tcp: true,
+            ..Default::default()
+        });
+        assert!(
+            !only_tcp.support_udp(),
+            "only-tcp mux carries no UDP; the `udp` flag must not rescue it"
+        );
     }
 }
