@@ -3433,12 +3433,24 @@ fn listener_bind_inputs(raw: &raw::RawConfig) -> (String, bool) {
 }
 
 /// Validate `listeners:` exactly as `load_config` would, without
-/// constructing anything — `PUT /configs` uses this to reject a section
-/// that would otherwise persist silently and hard-error on next boot.
+/// constructing anything. `PUT /configs` uses the richer
+/// [`resolve_named_listeners`] so it can also gate on the running
+/// binary's compiled feature set; this remains the structural-only
+/// check.
 pub fn validate_named_listeners(raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
-    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(raw);
-    build_named_listeners(raw, &bind_addr, global_tproxy_sni)?;
+    resolve_named_listeners(raw)?;
     Ok(())
+}
+
+/// Resolve `listeners:` into the same `NamedListener` list `load_config`
+/// produces, without constructing anything. `PUT /configs` uses the
+/// resolved list to gate the commit not just on structural validity but
+/// on runtime support — a listener type the running build did not compile
+/// (`ensure_listeners_supported`) would persist and hard-error the next
+/// boot.
+pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener>, anyhow::Error> {
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(raw);
+    build_named_listeners(raw, &bind_addr, global_tproxy_sni)
 }
 
 /// Build the authoritative list of named listeners from the raw config.

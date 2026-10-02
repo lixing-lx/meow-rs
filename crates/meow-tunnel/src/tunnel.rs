@@ -1892,6 +1892,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn resolve_proxy_invokes_process_enrichment() {
+        meow_common::disable_socket_table_cache();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap();
         let proc_name = std::env::current_exe()

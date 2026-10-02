@@ -314,7 +314,10 @@ mod tests {
     fn engine_enriches_process_and_matches_rule() {
         // Bind a real TCP listener so the kernel actually owns a socket we can
         // look up. This exercises the full /proc (Linux) or libproc (macOS)
-        // path end-to-end.
+        // path end-to-end. The cache-off call matters on Linux: as a
+        // dependent-crate test binary, meow-common's TTL snapshot path is
+        // live and a sibling test's lookup could miss this fresh socket.
+        meow_common::disable_socket_table_cache();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap();
 
@@ -342,6 +345,7 @@ mod tests {
     async fn async_enrich_matches_sync_result() {
         // The async variant must produce the same enrichment as the sync
         // one — it only moves the platform scan to the blocking pool.
+        meow_common::disable_socket_table_cache();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap();
         let meta = base_metadata(local);
@@ -379,6 +383,7 @@ mod tests {
     fn engine_falls_through_when_lookup_misses() {
         // Bind the same listener so the lookup succeeds but with the wrong name,
         // ensuring the process rule is skipped and the MATCH rule wins.
+        meow_common::disable_socket_table_cache();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap();
 

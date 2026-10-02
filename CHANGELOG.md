@@ -438,6 +438,41 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`meow -t` and startup now reject inbounds the binary did not
+  compile.** A `listeners:` entry such as `type: shadowsocks` without
+  the opt-in `listener-shadowsocks` feature used to pass
+  "Configuration test passed" and only `warn!`-and-skip at startup —
+  the declared port silently never listened (the shorthand
+  `mixed-port:`/`port:`/`socks-port:`/`tproxy-port:` fields fold
+  into the same list and are covered identically, as is
+  `tun.enable: true` on a build without `listener-tun`). Unknown type
+  names were already fatal at parse; a known-but-uncompiled inbound is
+  the same severity, so `-t` and normal startup now hard-error naming
+  the listener and the required feature, and the `PUT /configs`
+  persistence gate applies the same listener check so an unservable
+  `listeners:` section cannot wedge the next boot.
+
+- **Process lookup test flake fixed on both cache-bearing and
+  cache-free paths.** On macOS, `pbi_nfiles` is only a snapshot:
+  `PROC_PIDLISTFDS` silently truncates the fd list to the buffer a
+  parallel `cargo test` run could outgrow, dropping the just-bound
+  socket from the scan — the dependent-crate `meow-tunnel` tests
+  ("passes alone, fails in a full run") rode that cliff. The fetch now
+  retries with doubled capacity until the kernel reports headroom.
+  The same class exists on Linux for dependent test binaries (they
+  build `meow-common` without `cfg(test)`, so the 100 ms
+  `/proc/net` TTL snapshot is live); the new
+  `meow_common::disable_socket_table_cache()` hook forces a fresh
+  parse and the affected tests call it.
+
+- **`instant` dropped from the dependency tree** (issue #651,
+  RUSTSEC-2024-0384). `reed-solomon-erasure`'s default `std` feature
+  only contributed `parking_lot 0.11` — and transitively `instant` —
+  for an internal decode-matrix cache mutex that is never contended
+  (per-session codec); `default-features = false` keeps the identical
+  API on the `spin::Mutex` fallback. Also removes `parking_lot 0.11`,
+  `parking_lot_core 0.8`, `redox_syscall 0.2`, and `bitflags 1.3`.
+
 - **Bracketed IPv6 `server:` fields now work end-to-end** (issue #701).
   `server: "[::1]"` used to delegate the dial as the literal string
   `"[::1]"` — an unresolvable "domain" — so both the direct and the

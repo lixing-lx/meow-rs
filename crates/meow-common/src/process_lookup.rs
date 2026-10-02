@@ -55,6 +55,20 @@ pub async fn find_process_async(network: Network, local_addr: SocketAddr) -> Opt
     }
 }
 
+/// Test hook for **dependent** crates' test binaries: they build this
+/// crate without `cfg(test)`, so the Linux `/proc/net` socket-table TTL
+/// cache is live there — and a snapshot populated by a sibling test can
+/// omit a socket the test bound moments earlier (the "passes alone,
+/// fails in a full run" flake). Call once at test start to force a fresh
+/// parse on every lookup. A no-op elsewhere: non-Linux platforms hold no
+/// socket-table cache, and this crate's own `cfg(test)` build already
+/// bypasses it.
+#[doc(hidden)]
+pub fn disable_socket_table_cache() {
+    #[cfg(target_os = "linux")]
+    platform::disable_socket_table_cache();
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{Network, ProcessInfo, SocketAddr};
@@ -64,9 +78,26 @@ mod platform {
     use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
     use tracing::trace;
+
+    /// Set by the crate-level `disable_socket_table_cache` test hook. A
+    /// dependent crate's test binary builds this module without
+    /// `cfg(test)`, so the real `SOCK_TABLES` TTL path below would be live
+    /// and a snapshot populated by a sibling test can omit a socket the
+    /// test bound moments earlier — the dependent-crate full-run flake.
+    static DISABLE_TABLE_CACHE: AtomicBool = AtomicBool::new(false);
+
+    /// Backs [`super::disable_socket_table_cache`]. Relaxed is sufficient:
+    /// the flag is monotonic (never re-set to false) and every reader is
+    /// ordered after the test's store anyway — same-thread program order
+    /// for the sync tests, spawn's synchronize-with edge for
+    /// `find_process_async`.
+    pub fn disable_socket_table_cache() {
+        DISABLE_TABLE_CACHE.store(true, Ordering::Relaxed);
+    }
 
     /// Short-TTL caches bounding the synchronous /proc work (issue #515).
     ///
@@ -151,6 +182,9 @@ mod platform {
         }
         #[cfg(not(test))]
         {
+            if DISABLE_TABLE_CACHE.load(Ordering::Relaxed) {
+                return Arc::new(parse_proc_net(path, ipv6).unwrap_or_default());
+            }
             let tables = SOCK_TABLES.get_or_init(|| Mutex::new(Default::default()));
             let mut guard = tables.lock();
             let slot = &mut guard[idx][usize::from(ipv6)];
@@ -326,8 +360,7 @@ mod platform {
             let Ok(info) = pidinfo::<BSDInfo>(pid, 0) else {
                 continue;
             };
-            let fd_count = info.pbi_nfiles as usize;
-            let Ok(fds) = listpidinfo::<ListFDs>(pid, fd_count) else {
+            let Some(fds) = pid_fds(pid, info.pbi_nfiles as usize) else {
                 continue;
             };
             for fd in fds {
@@ -367,6 +400,41 @@ mod platform {
             }
         }
         None
+    }
+
+    /// Upper bound on the fd-list buffer in [`pid_fds`] — 64 Ki entries is
+    /// past any sane `RLIMIT_NOFILE`, and the buffer is a transient probe
+    /// allocation (`ProcFDInfo` is 8 B; a doubling can overshoot the cap
+    /// once, so ≤ ~1 MiB transient, reached only for a process that
+    /// actually nears the bound).
+    const PID_FD_CAP: usize = 1 << 16;
+
+    /// Fetch a pid's fd table. `pbi_nfiles` is only a snapshot: a process
+    /// that opened fds between the `PROC_PIDTBSDINFO` read and this call
+    /// has more entries than it reports, and `PROC_PIDLISTFDS` silently
+    /// truncates to the buffer size — the newest (highest-numbered) fds
+    /// fall off first. A buffer that comes back exactly full may be
+    /// hiding a tail, so retry with double capacity until the kernel
+    /// reports headroom (or the bound is hit). This is what the
+    /// dependent-crate test flake was: a parallel test opening sockets
+    /// could push our own test process past the snapshot count, dropping
+    /// the just-bound listener from the scan.
+    pub(crate) fn pid_fds(
+        pid: i32,
+        reported_count: usize,
+    ) -> Option<Vec<libproc::libproc::file_info::ProcFDInfo>> {
+        let mut cap = reported_count.clamp(16, PID_FD_CAP);
+        loop {
+            match listpidinfo::<ListFDs>(pid, cap) {
+                // Fewer entries than capacity: complete enumeration.
+                Ok(fds) if fds.len() < cap => return Some(fds),
+                // Exactly full: either the process holds precisely `cap`
+                // fds (one wasted retry proves it) or the tail was cut.
+                Ok(_) if cap < PID_FD_CAP => cap *= 2,
+                Ok(fds) => return Some(fds),
+                Err(_) => return None,
+            }
+        }
     }
 
     fn matches_socket(
@@ -680,6 +748,35 @@ mod platform {
 ))]
 mod tests {
     use super::*;
+
+    /// Regression for the dependent-crate full-run flake (seen on macOS in
+    /// `meow-tunnel`'s process-enrichment tests): `pbi_nfiles` is a
+    /// snapshot, `PROC_PIDLISTFDS` truncates to the buffer — under parallel
+    /// fd churn the just-bound socket's entry fell off the tail and the
+    /// lookup missed it. `pid_fds` must grow past a stale count.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pid_fds_grows_past_stale_snapshot_count() {
+        use std::os::fd::AsRawFd;
+        // Hold enough fds that the floor-clamped initial buffer (16)
+        // provably cannot fit the table — `len() > 16` then demonstrates
+        // the doubling retry actually ran, not merely the clamp floor.
+        let _held: Vec<std::net::TcpListener> = (0..24)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let marker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let marker_fd = marker.as_raw_fd();
+        let fds = platform::pid_fds(std::process::id() as i32, 1).expect("own pid must list fds");
+        assert!(
+            fds.len() > 16,
+            "stale count must grow past the initial cap: {} entries",
+            fds.len()
+        );
+        assert!(
+            fds.iter().any(|f| f.proc_fd == marker_fd),
+            "the just-bound socket fd must appear"
+        );
+    }
 
     #[test]
     fn finds_self_via_tcp_listener() {

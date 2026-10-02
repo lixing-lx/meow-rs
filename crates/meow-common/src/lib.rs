@@ -52,7 +52,9 @@ pub use network::Network;
 #[cfg(target_os = "linux")]
 pub use outbound_iface::apply_outbound_interface;
 pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
-pub use process_lookup::{find_process, find_process_async, ProcessInfo};
+pub use process_lookup::{
+    disable_socket_table_cache, find_process, find_process_async, ProcessInfo,
+};
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;

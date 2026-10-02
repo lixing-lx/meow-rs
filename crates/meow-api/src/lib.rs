@@ -177,6 +177,81 @@ pub fn preinstall_global_route_binding(_raw: &RawConfig) -> PreinstalledBinding 
     PreinstalledBinding::default()
 }
 
+/// Which cargo feature a listener type needs, when the running binary did
+/// not compile it. The gate is injected by the embedder (`meow-app` knows
+/// its own feature set); the API alone cannot observe the binary's cargo
+/// features.
+pub type ListenerGate = fn(&meow_config::ListenerSpec) -> Option<&'static str>;
+
+/// Default gate before [`set_listener_gate`] runs, and permanently for
+/// tests/embedders that never install one: report every listener type
+/// supported, preserving the pre-gate behaviour.
+pub fn permissive_listener_gate(_spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+    None
+}
+
+/// The feature set is a property of the compiled binary, not of an
+/// `ApiServer` instance — a process-global cell is the honest shape.
+static LISTENER_GATE: std::sync::OnceLock<ListenerGate> = std::sync::OnceLock::new();
+
+/// Install the binary's real listener-feature set (meow-app calls this at
+/// startup). A second install keeps the first — the binary's features do
+/// not change at runtime. Tests must not install a gate: `OnceLock` makes
+/// it process-global, so one test's install would leak into every
+/// sibling.
+pub fn set_listener_gate(gate: ListenerGate) {
+    let _ = LISTENER_GATE.set(gate);
+}
+
+/// The installed gate, or [`permissive_listener_gate`] when none was.
+pub fn listener_gate() -> ListenerGate {
+    LISTENER_GATE
+        .get()
+        .copied()
+        .unwrap_or(permissive_listener_gate)
+}
+
+/// Fail when `named` declares a listener type the running binary cannot
+/// serve, per `gate`.
+///
+/// Listener implementations are cargo-feature-gated (ADR-0007 size caps).
+/// Before this check a missing feature only produced a startup `warn!`
+/// and the declared port simply never listened — `-t` reported
+/// "Configuration test passed" on a config whose inbound was dead on
+/// arrival. Unknown *type names* already hard-error at parse; a
+/// known-but-uncompiled type is the same severity (the listener cannot
+/// exist), so it errors too.
+///
+/// Called by `meow -t` and the startup path after `load_config`, and by
+/// the `PUT /configs` gate (on `resolve_named_listeners`' output) so a
+/// persisted `listeners:` section cannot wedge the next boot — unless
+/// `force` is set, which logs-and-commits by design.
+pub fn ensure_listeners_supported(
+    named: &[NamedListener],
+    gate: ListenerGate,
+) -> Result<(), anyhow::Error> {
+    let missing: Vec<String> = named
+        .iter()
+        .filter_map(|l| {
+            gate(&l.spec).map(|feature| {
+                format!(
+                    "'{}' (type {}, needs feature '{feature}')",
+                    l.name,
+                    l.spec.type_name()
+                )
+            })
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "listener(s) require cargo features this build lacks: {} — \
+         rebuild with the named feature(s) or remove the listener entries",
+        missing.join(", ")
+    )
+}
+
 pub struct ApiServer {
     tunnel: Tunnel,
     listen_addr: SocketAddr,

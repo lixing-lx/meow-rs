@@ -2980,9 +2980,14 @@ async fn put_configs(
     // Same contract for `listeners:` — an entry the startup parser rejects
     // (bad type, duplicate port, `udp: true` + managed firewall, IPv6 UDP
     // bind, …) must not be committed into `raw_config`: the next
-    // `load_config` would hard-error on boot. Listeners are still a
-    // startup snapshot (no hot-reload), this only gates persistence.
-    if let Err(e) = meow_config::validate_named_listeners(&raw_config) {
+    // `load_config` would hard-error on boot. So is an entry this build
+    // cannot serve (e.g. `type: shadowsocks` without the
+    // `listener-shadowsocks` feature) — startup now hard-errors on it too.
+    // Listeners are still a startup snapshot (no hot-reload), this only
+    // gates persistence.
+    if let Err(e) = meow_config::resolve_named_listeners(&raw_config)
+        .and_then(|named| crate::ensure_listeners_supported(&named, crate::listener_gate()))
+    {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
         } else {

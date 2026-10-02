@@ -484,7 +484,10 @@ fn run_application_inner(
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            load_config(&config_path).await?;
+            let config = load_config(&config_path).await?;
+            // An inbound this build did not compile would be
+            // warn-skipped at startup — that must not pass a config test.
+            ensure_inbounds_supported(&config)?;
             info!("Configuration test passed");
             Ok::<(), anyhow::Error>(())
         })?;
@@ -547,6 +550,13 @@ fn run_application_inner(
             info!("External UI overridden by --ext-ui");
         }
 
+        // A declared inbound this build cannot serve must fail startup,
+        // not warn-and-skip: the port would never listen (silent inbound
+        // outage). Unknown type names are already fatal at parse.
+        ensure_inbounds_supported(&config)?;
+        // The `PUT /configs` persistence gate checks the same feature set.
+        meow_api::set_listener_gate(listener_feature_gate);
+
         run(
             config,
             config_path,
@@ -596,6 +606,49 @@ fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOu
 #[cfg(not(feature = "listener-tun"))]
 fn preinstall_global_route_binding(_raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
     None
+}
+
+/// The cargo feature a `listeners:` entry needs when this binary did not
+/// compile it — `None` when the entry can run. Mirrors the
+/// `#[cfg(feature = …)]` arms in the listener spawn loop below: `mixed`,
+/// `http` and `socks5` are all served by `MixedListener` under
+/// `listener-mixed`; `listener-http`/`listener-socks5` do not gate named
+/// listeners. Installed into [`meow_api::set_listener_gate`] so the
+/// `PUT /configs` persistence gate enforces the same contract.
+fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+    use meow_config::ListenerSpec as S;
+    // Exhaustive on purpose — no `_` arm: a future ListenerSpec variant
+    // must fail compile here, not silently map to "supported".
+    match spec {
+        S::Mixed | S::Http | S::Socks5 => {
+            (!cfg!(feature = "listener-mixed")).then_some("listener-mixed")
+        }
+        S::TProxy { .. } => (!cfg!(feature = "listener-tproxy")).then_some("listener-tproxy"),
+        S::Shadowsocks(_) => {
+            (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
+        }
+    }
+}
+
+/// All declared inbounds (`listeners:` and the top-level `tun:` section)
+/// must be servable by this build — `meow -t` and startup share the check
+/// so a config that can never listen fails identically on both paths.
+fn ensure_inbounds_supported(config: &meow_config::Config) -> anyhow::Result<()> {
+    meow_api::ensure_listeners_supported(&config.listeners.named, listener_feature_gate)?;
+    if let Some(feature) = tun_feature_gate(config.tun.enable) {
+        anyhow::bail!(
+            "tun.enable is set but this build lacks the '{feature}' feature — \
+             rebuild with it or set tun.enable: false"
+        );
+    }
+    Ok(())
+}
+
+/// `tun:` isn't a `listeners:` entry so [`listener_feature_gate`] can't
+/// see it — same contract separately: enabled on a build without the
+/// feature is unservable.
+fn tun_feature_gate(enable: bool) -> Option<&'static str> {
+    (enable && !cfg!(feature = "listener-tun")).then_some("listener-tun")
 }
 
 fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
@@ -1604,6 +1657,81 @@ mod tests {
     #[test]
     fn invalid_bind_address_errors() {
         assert!(bind_socket_addr("not-an-ip", 80).is_err());
+    }
+
+    fn ss_spec() -> meow_config::ListenerSpec {
+        meow_config::ListenerSpec::Shadowsocks(meow_config::SsListenerConfig {
+            cipher: "aes-128-gcm".into(),
+            password: "p".into(),
+            udp: true,
+            simple_obfs: None,
+        })
+    }
+
+    /// The spawn-loop feature mapping is `listener-mixed` for
+    /// mixed/http/socks5, `listener-tproxy` for tproxy, and
+    /// `listener-shadowsocks` for shadowsocks (opt-in, outside `full`).
+    /// Asserting the exact feature *name* (not just polarity) catches a
+    /// typo'd or drifted mapping.
+    #[test]
+    fn listener_gate_matches_spawn_arms() {
+        use meow_config::ListenerSpec as S;
+        let gate = super::listener_feature_gate;
+        assert_eq!(
+            gate(&S::Mixed),
+            (!cfg!(feature = "listener-mixed")).then_some("listener-mixed")
+        );
+        assert_eq!(
+            gate(&S::Http),
+            (!cfg!(feature = "listener-mixed")).then_some("listener-mixed"),
+            "http rides the mixed-listener feature, not listener-http"
+        );
+        assert_eq!(
+            gate(&S::Socks5),
+            (!cfg!(feature = "listener-mixed")).then_some("listener-mixed")
+        );
+        assert_eq!(
+            gate(&S::TProxy {
+                sni: true,
+                firewall: true,
+                udp: false,
+                udp_timeout: 60,
+            }),
+            (!cfg!(feature = "listener-tproxy")).then_some("listener-tproxy")
+        );
+        assert_eq!(
+            gate(&ss_spec()),
+            (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
+        );
+    }
+
+    /// `tun:` rides its own gate — disabled is always servable, enabled
+    /// demands `listener-tun`.
+    #[test]
+    fn tun_gate() {
+        assert_eq!(super::tun_feature_gate(false), None);
+        assert_eq!(
+            super::tun_feature_gate(true),
+            (!cfg!(feature = "listener-tun")).then_some("listener-tun")
+        );
+    }
+
+    /// `listener-shadowsocks` is the regression case behind this gate: a
+    /// `type: shadowsocks` listener used to warn-and-skip, leaving the
+    /// port dead while `-t` still passed.
+    #[cfg(not(feature = "listener-shadowsocks"))]
+    #[test]
+    fn ensure_rejects_uncompiled_shadowsocks_listener() {
+        let named = meow_config::NamedListener {
+            name: "ss-in".into(),
+            spec: ss_spec(),
+            port: 23300,
+            listen: "0.0.0.0".into(),
+            max_connections: 256,
+        };
+        let err = meow_api::ensure_listeners_supported(&[named], super::listener_feature_gate)
+            .expect_err("ss listener must fail on a feature-less build");
+        assert!(err.to_string().contains("listener-shadowsocks"), "{err}");
     }
 
     #[cfg(target_os = "windows")]

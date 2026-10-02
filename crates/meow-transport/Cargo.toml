@@ -156,7 +156,13 @@ x25519-dalek = { workspace = true, optional = true }
 
 # kcptun feature — see the `kcptun` feature comment above for why aes is pinned
 # to the cipher-0.5 line while vmess's aes stays on 0.8.
-reed-solomon-erasure = { version = "6", optional = true }
+# `default-features = false` drops the `std` feature, whose only payload is
+# `parking_lot` (unmaintained dep `instant`, RUSTSEC-2024-0384) for the
+# internal decode-matrix cache mutex — `spin::Mutex` is already the no_std
+# fallback and the cache is per-session, so the lock is never contended.
+# Error paths in kcptun/fec.rs use `.ok()`/`.is_ok()`, not `?`, so losing
+# the `std::error::Error` impl is invisible.
+reed-solomon-erasure = { version = "6", optional = true, default-features = false }
 crc32fast = { workspace = true, optional = true }
 # pbkdf2 0.12 pairs with the digest-0.10 sha1 the workspace already pins
 # (0.13 moved to digest 0.11 and would pull a second sha1).

@@ -88,6 +88,11 @@ own OS-assigned port.
 - **`tproxy`** — firewall transparent proxy (Linux / experimental macOS); see [Transparent Proxy](./transparent-proxy).
 - **`shadowsocks`** — Shadowsocks server inbound; its `udp` field gates the
   SS UDP relay (default `true`) and is unrelated to tproxy's `udp`.
+  Requires the opt-in `listener-shadowsocks` cargo feature (excluded from
+  `full`/`minimal` — see
+  [ss-listener.md](https://github.com/meow-rs/meow-rs/blob/main/docs/ss-listener.md));
+  a build without it fails `-t`/startup rather than silently skipping the
+  port.
 - **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
   Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
