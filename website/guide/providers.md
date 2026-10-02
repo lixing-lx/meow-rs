@@ -185,4 +185,4 @@ Subscriptions are also managed at runtime through the
   contribution it tracked** (`applied-*` bookkeeping): nodes, groups, and
   rules that subscription added are dropped, while local content it never
   declared survives. Note the delete itself saves on file-backed runs,
-  so `.bak` afterwards holds the post-delete file.
+  so `.bak` afterwards holds the pre-delete file.

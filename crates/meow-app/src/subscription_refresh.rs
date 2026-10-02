@@ -388,7 +388,7 @@ pub async fn run_loop(
                             // backing file — keep the in-memory refresh and
                             // skip the write instead of inventing
                             // `./config.yaml` (issue #717).
-                            match &config_path {
+                            match config_path.as_deref().filter(|p| !p.is_empty()) {
                                 Some(path) => {
                                     if let Err(e) =
                                         meow_config::save_raw_config_async(path, &candidate).await

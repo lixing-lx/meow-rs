@@ -1907,11 +1907,10 @@ async fn delete_subscription_without_backing_file_skips_persist() {
     );
 }
 
-/// The add response must report `"persisted": false` under
-/// `--config-string` — the merge applies in memory, the skipped write is
-/// explicit in the API contract (issue #717).
-#[tokio::test]
-async fn add_subscription_without_backing_file_reports_not_persisted() {
+/// Single-body subscription origin for the `persisted:false` tests. The
+/// request head is drained to `\r\n\r\n` before responding so a short
+/// read + `Connection: close` cannot RST-clobber the buffered response.
+async fn spawn_sub_origin(body: &'static str) -> std::net::SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1921,9 +1920,19 @@ async fn add_subscription_without_backing_file_reports_not_persisted() {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
-            let body = "proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n";
-            let mut sink = [0u8; 2048];
-            let _ = sock.read(&mut sink).await;
+            let mut buf = [0u8; 2048];
+            let mut head = Vec::new();
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -1932,6 +1941,17 @@ async fn add_subscription_without_backing_file_reports_not_persisted() {
             let _ = sock.shutdown().await;
         }
     });
+    addr
+}
+
+/// The add response must report `"persisted": false` under
+/// `--config-string` — the merge applies in memory, the skipped write is
+/// explicit in the API contract (issue #717).
+#[tokio::test]
+async fn add_subscription_without_backing_file_reports_not_persisted() {
+    let addr =
+        spawn_sub_origin("proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n")
+            .await;
 
     let state = test_state_ephemeral(test_raw_config());
     let app = create_router(Arc::clone(&state));
@@ -1954,6 +1974,49 @@ async fn add_subscription_without_backing_file_reports_not_persisted() {
     assert!(
         state.raw_config.read().subscriptions.is_some(),
         "the subscription must be committed in memory even unpersisted"
+    );
+}
+
+/// Refresh shares the same `persist_candidate` plumbing as add — pin the
+/// `"persisted": false` contract on this endpoint too (issue #717).
+#[tokio::test]
+async fn refresh_subscription_without_backing_file_reports_not_persisted() {
+    let addr =
+        spawn_sub_origin("proxies:\n  - {name: node-2, type: http, server: 127.0.0.1, port: 9}\n")
+            .await;
+
+    let mut raw = test_raw_config();
+    raw.subscriptions = Some(vec![RawSubscription {
+        name: "s".into(),
+        url: format!("http://{addr}/sub.yaml"),
+        interval: Some(600),
+        last_updated: None,
+        proxy: None,
+        applied_proxies: vec![],
+        applied_groups: vec![],
+        applied_rules: vec![],
+    }]);
+    let state = test_state_ephemeral(raw);
+    let app = create_router(Arc::clone(&state));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions/s/refresh")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["persisted"], false, "{json}");
+    assert!(
+        state.raw_config.read().subscriptions.as_deref().unwrap()[0]
+            .applied_proxies
+            .contains(&"node-2".to_string()),
+        "the refresh must commit its contribution in memory"
     );
 }
 

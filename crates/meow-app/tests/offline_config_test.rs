@@ -387,10 +387,13 @@ async fn config_string_run_never_writes_phantom_config() {
             .expect("save request failed");
     assert_eq!(response, 200, "file-backed save must succeed");
     child.kill().await.unwrap();
-    let saved = std::fs::read_to_string(&config_file).unwrap();
+    // `.bak` is only created by an actual write — its existence proves the
+    // save rewrote the file (the input already contained the same keys, so
+    // asserting on the body alone could not discriminate a skipped write).
+    let bak = std::path::PathBuf::from(format!("{}.bak", config_file.display()));
     assert!(
-        saved.contains("external-controller"),
-        "the save must rewrite the backing file: {saved}"
+        bak.exists(),
+        "a real save must rotate the previous file to .bak"
     );
 }
 
@@ -405,6 +408,11 @@ fn spawn_meow(args: &[String], cwd: &std::path::Path) -> tokio::process::Child {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
     child
         .args(args)
+        // `-d` pins the resolved home dir inside the tempdir so the
+        // spawned daemon's geodata/fake-ip writes never touch the real
+        // $HOME — this test exists to prove there are no stray writes.
+        .arg("-d")
+        .arg(cwd)
         .current_dir(cwd)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
