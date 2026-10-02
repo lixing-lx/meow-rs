@@ -670,16 +670,6 @@ fn parse_config_string(cs: &str) -> anyhow::Result<meow_config::raw::RawConfig> 
     meow_config::parse_raw_yaml(yaml).map_err(|e| anyhow::anyhow!("--config-string: {e}"))
 }
 
-/// Cache dir for geodata DBs and provider payloads: beside the config
-/// file when one exists, else the `-d`/XDG home — `--config-string`
-/// runs have no file to resolve against (issue #717).
-fn resource_cache_dir(config_path: Option<&str>) -> std::path::PathBuf {
-    config_path.map_or_else(
-        || meow_common::meow_home_dir().unwrap_or_else(meow_common::xdg_home_dir),
-        meow_config::resource_cache_dir_for_config_path,
-    )
-}
-
 /// `tun:` isn't a `listeners:` entry so [`listener_feature_gate`] can't
 /// see it — same contract separately: enabled on a build without the
 /// feature is unservable.
@@ -1220,7 +1210,13 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
-        let cache_dir = resource_cache_dir(config_path.as_deref());
+        // Rebuild context mirrors startup: a `--config-string` run had no
+        // backing file, so provider `path:`/fakeip resolution must see the
+        // same `cache_dir: None` here (issue #717). Geodata download
+        // targets resolve under the `-d`/XDG home independently.
+        let cache_dir = config_path
+            .as_deref()
+            .map(meow_config::resource_cache_dir_for_config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::run_on_startup(
                 geodata,
@@ -1243,7 +1239,13 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
-        let cache_dir = resource_cache_dir(config_path.as_deref());
+        // Rebuild context mirrors startup: a `--config-string` run had no
+        // backing file, so provider `path:`/fakeip resolution must see the
+        // same `cache_dir: None` here (issue #717). Geodata download
+        // targets resolve under the `-d`/XDG home independently.
+        let cache_dir = config_path
+            .as_deref()
+            .map(meow_config::resource_cache_dir_for_config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,

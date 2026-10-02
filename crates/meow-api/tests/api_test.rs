@@ -1907,6 +1907,56 @@ async fn delete_subscription_without_backing_file_skips_persist() {
     );
 }
 
+/// The add response must report `"persisted": false` under
+/// `--config-string` — the merge applies in memory, the skipped write is
+/// explicit in the API contract (issue #717).
+#[tokio::test]
+async fn add_subscription_without_backing_file_reports_not_persisted() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let body = "proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n";
+            let mut sink = [0u8; 2048];
+            let _ = sock.read(&mut sink).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let state = test_state_ephemeral(test_raw_config());
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"name":"s","url":"http://{addr}/sub.yaml"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["persisted"], false, "{json}");
+    assert!(
+        state.raw_config.read().subscriptions.is_some(),
+        "the subscription must be committed in memory even unpersisted"
+    );
+}
+
 // ── PUT /proxies/{name} selector switch test ─────────────────────
 
 #[tokio::test]

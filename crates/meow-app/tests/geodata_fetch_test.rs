@@ -316,7 +316,7 @@ async fn run_on_startup_republishes_resolver_with_downloaded_geosite() {
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(dashmap::DashMap::new()),
         Arc::new(RwLock::new(None)),
-        dir.path().to_path_buf(),
+        Some(dir.path().to_path_buf()),
     )
     .await;
 

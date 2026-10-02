@@ -112,6 +112,9 @@ no line breaks).
   declaration/membership cycles — fail under force too; the raw config is persisted
   while the previous routing is retained. Default: `false`.
 
+  Persistence is in-memory only when the daemon was started via
+  `--config-string` — there is no backing file to write (issue #717).
+
 **Response (success):** `204 No Content`
 
 **Response (parse error, force=false):**

@@ -696,3 +696,67 @@ async fn refresh_fetches_through_subscription_proxy() {
         "an unresolvable subscription proxy must not fetch"
     );
 }
+
+/// Issue #717: a `--config-string` run hands the loop `config_path:
+/// None` — the interval refresh must still apply in memory while
+/// skipping the disk write; no phantom `config.yaml` may appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_without_backing_file_applies_in_memory_only() {
+    let sub_addr =
+        spawn_origin("proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n")
+            .await;
+    let dir = tempfile::tempdir().unwrap();
+    // No `proxy-providers:` — a `file` provider `path:` hard-errors under
+    // `cache_dir: None`, which is exactly the strictness contract.
+    let raw: RawConfig = serde_yaml::from_str(&format!(
+        "mode: rule\n\
+         subscriptions:\n\
+         \x20 - name: s\n\
+         \x20   url: http://{sub_addr}/sub\n\
+         \x20   interval: 3600\n\
+         rules:\n\
+         \x20 - MATCH,DIRECT\n"
+    ))
+    .unwrap();
+    let fx = Fixture {
+        dir,
+        tunnel: Tunnel::new(resolver()),
+        raw_config: Arc::new(RwLock::new(raw)),
+        config_path: String::new(),
+        proxy_providers: Arc::new(DashMap::new()),
+        provider_dialer_registry: Default::default(),
+    };
+    tokio::spawn(meow_app::subscription_refresh::run_loop(
+        Arc::clone(&fx.raw_config),
+        fx.tunnel.clone(),
+        None,
+        Arc::new(RwLock::new(None)),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::clone(&fx.proxy_providers),
+        fx.provider_dialer_registry.clone(),
+        Arc::new(RefreshSupervisor::default()),
+        Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default()),
+    ));
+
+    wait_group(&fx.tunnel, "node-1").await;
+
+    // In-memory apply committed the node…
+    assert!(
+        fx.tunnel.proxy("node-1").is_some(),
+        "fetched node must land in the live route map"
+    );
+    // …and stamped the subscription entry…
+    assert!(
+        fx.raw_config
+            .read()
+            .subscriptions
+            .as_deref()
+            .is_some_and(|s| s[0].last_updated.is_some()),
+        "last_updated must be stamped even without a backing file"
+    );
+    // …but nothing was written to a phantom path.
+    assert!(
+        !fx.dir.path().join("config.yaml").exists(),
+        "a --config-string refresh must not create ./config.yaml"
+    );
+}

@@ -120,7 +120,7 @@ pub async fn fetch_missing(
 /// resolver), so computing them before the rules commit is equivalent.
 async fn republish_dns_for_geo_dbs(
     raw: &RawConfig,
-    cache_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
     rule_providers: &std::collections::HashMap<String, Arc<RuleProvider>>,
     rules: Vec<Box<dyn meow_common::rule::Rule>>,
     tunnel: &Tunnel,
@@ -132,14 +132,14 @@ async fn republish_dns_for_geo_dbs(
         "{label}: republish outside the CONFIG_MUTATION lane"
     );
     let raw = raw.clone();
-    let cache_dir = cache_dir.to_path_buf();
+    let cache_dir = cache_dir.map(std::path::Path::to_path_buf);
     let providers = rule_providers.clone();
     let prior = tunnel.resolver();
     let route = tunnel.route_snapshot();
     let parse = tokio::spawn(async move {
         meow_config::parse_dns_from_raw(
             &raw,
-            Some(&cache_dir),
+            cache_dir.as_deref(),
             &route.proxies,
             Some(&providers),
             None,
@@ -190,7 +190,7 @@ pub async fn run_on_startup(
     // an empty map fails every `use:` group under `strict: true`.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
     dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
-    cache_dir: PathBuf,
+    cache_dir: Option<std::path::PathBuf>,
 ) {
     let targets = compute_targets(&geo);
 
@@ -226,7 +226,7 @@ pub async fn run_on_startup(
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
                 Some(&resolver),
-                Some(cache_dir.as_path()),
+                cache_dir.as_deref(),
                 &proxy_providers,
                 // Rules-only refresh — bind the rebuilt RULE-SET rules to
                 // the LIVE provider objects so the rebuild sees each
@@ -249,7 +249,7 @@ pub async fn run_on_startup(
             // (issue #543).
             republish_dns_for_geo_dbs(
                 &raw,
-                &cache_dir,
+                cache_dir.as_deref(),
                 &rebuild.rule_providers,
                 rebuild.rules,
                 &tunnel,
@@ -301,7 +301,7 @@ pub async fn auto_update_loop(
     // Same contract as `run_on_startup` — the live provider registry.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
     dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
-    cache_dir: PathBuf,
+    cache_dir: Option<std::path::PathBuf>,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
     let mut ticker = tokio::time::interval(interval);
@@ -339,7 +339,7 @@ pub async fn auto_update_loop(
             Arc::clone(&rule_providers),
             &proxy_providers,
             &dns_server,
-            &cache_dir,
+            cache_dir.as_deref(),
             &asn_target,
             &geosite_target,
         )
@@ -360,7 +360,7 @@ async fn auto_update_tick(
     rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
     proxy_providers: &dashmap::DashMap<String, Arc<ProxyProvider>>,
     dns_server: &RwLock<Option<meow_api::routes::DnsServerHandle>>,
-    cache_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
     asn_target: &std::path::Path,
     geosite_target: &std::path::Path,
 ) {
@@ -401,7 +401,7 @@ async fn auto_update_tick(
     // tracks later `set_resolver` swaps (issue #514).
     let resolver = tunnel.resolver_slot();
     let rebuild = tokio::task::spawn_blocking({
-        let cache_dir = cache_dir.to_path_buf();
+        let cache_dir = cache_dir.map(std::path::Path::to_path_buf);
         let raw = raw.clone();
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
@@ -412,7 +412,7 @@ async fn auto_update_tick(
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
                 Some(&resolver),
-                Some(cache_dir.as_path()),
+                cache_dir.as_deref(),
                 &proxy_providers,
                 // Rules-only refresh — bind the rebuilt RULE-SET rules
                 // to the LIVE provider set so API/provider refreshes
@@ -577,7 +577,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -648,7 +648,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -748,7 +748,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -807,7 +807,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -869,7 +869,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -949,7 +949,7 @@ mod tests {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(
             &raw,
-            dir.path(),
+            Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
             &tunnel,
@@ -1095,7 +1095,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             &dashmap::DashMap::new(),
             &dns_server,
-            dir.path(),
+            Some(dir.path()),
             &asn_target,
             &geosite_path,
         )

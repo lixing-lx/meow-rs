@@ -158,8 +158,10 @@ local `proxies:` and `rules:` stay yours. A subscription instead merges the
 remote document's `proxies:`/`proxy-groups:`/`rules:` into the live config as
 its tracked contribution (remote wins name collisions, remote rules prepend
 ahead of the local table), and the result is **written back to the config
-file** on every successful refresh. Local entries survive — but the remote
-content lands directly in the main sections rather than a namespaced pool.
+file** on every successful refresh (file-backed runs — a `--config-string`
+daemon has no backing file and keeps the refresh in memory only). Local
+entries survive — but the remote content lands directly in the main
+sections rather than a namespaced pool.
 
 ```yaml
 subscriptions:
@@ -182,5 +184,5 @@ Subscriptions are also managed at runtime through the
 - `DELETE /api/subscriptions/{name}` — remove the entry **and the
   contribution it tracked** (`applied-*` bookkeeping): nodes, groups, and
   rules that subscription added are dropped, while local content it never
-  declared survives. Note the delete itself saves, so `.bak` afterwards
-  holds the post-delete file.
+  declared survives. Note the delete itself saves on file-backed runs,
+  so `.bak` afterwards holds the post-delete file.

@@ -69,7 +69,7 @@ static files instead.
 | `GET` | `/configs` | Current `mode`, `log-level`, ports, controller |
 | `PATCH` | `/configs` | Update `mode` and/or `log-level` → 204 |
 | `PUT` | `/configs` | Hot-reload the whole config (below) |
-| `POST` | `/api/config/save` | Persist the current config to disk |
+| `POST` | `/api/config/save` | Persist the current config to disk (400 when the daemon was started via `--config-string` — there is no backing file) |
 
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
@@ -137,6 +137,11 @@ report each subscription's own recorded contribution (`applied-*` counts).
 `DELETE` shares the rebuild-and-commit path, so it can return 400 when
 removing the contribution would starve a local group — fix or remove the
 group first.
+
+All three mutation endpoints auto-save the merged config to the backing
+file. Under `--config-string` there is no backing file: the change still
+applies in memory, the write is skipped, and add/refresh report
+`"persisted": false` in the response JSON.
 
 `POST`'s `proxy` is resolved eagerly at request time — an unknown or
 whitespace-only name is a `400` and nothing is stored. That is stricter

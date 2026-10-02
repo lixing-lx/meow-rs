@@ -227,10 +227,12 @@ async fn install_fakeip(
     // before the reuse check so the check can compare store identity, not
     // just store kind.
     let wanted_store_path = persist.then(|| {
-        let base = cache_dir.map_or_else(
-            || std::path::PathBuf::from("."),
-            std::path::Path::to_path_buf,
-        );
+        // `cache_dir` is `None` for a `--config-string` run — the launch
+        // CWD is not the daemon's to write into, so persist under the
+        // resolved home (same base geodata defaults use) instead of
+        // `./fakeip-*.json` (issue #717).
+        let base =
+            cache_dir.map_or_else(meow_common::resolved_home_dir, std::path::Path::to_path_buf);
         let suffix = match &prefix {
             ipnet::IpNet::V4(_) => "v4",
             ipnet::IpNet::V6(_) => "v6",

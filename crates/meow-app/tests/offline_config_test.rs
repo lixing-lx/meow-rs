@@ -338,30 +338,78 @@ async fn install_rejects_config_string() {
 
 /// Issue #717 end-to-end: a daemon started from `--config-string` has no
 /// backing file — `POST /api/config/save` must refuse (400) and the launch
-/// directory must NOT gain a phantom `config.yaml`.
+/// directory must NOT gain a phantom `config.yaml`. The `-f` leg is the
+/// positive control: the same endpoint succeeds and rewrites the file.
 #[tokio::test]
 async fn config_string_run_never_writes_phantom_config() {
     use base64::Engine;
 
-    // Reserve a loopback port for the API.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let api_port = probe.local_addr().unwrap().port();
-    drop(probe);
+    let yaml_for = |port: u16| {
+        format!("mixed-port: 0\nexternal-controller: '127.0.0.1:{port}'\nrules: ['MATCH,DIRECT']\n")
+    };
 
+    // (a) string-backed run → save refused, no phantom file in the launch dir.
     let workdir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "mixed-port: 0\nexternal-controller: '127.0.0.1:{api_port}'\nrules: ['MATCH,DIRECT']\n"
-    );
-    let b64 = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let api_port = free_port();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(yaml_for(api_port));
+    let mut child = spawn_meow(&["--config-string".to_string(), b64], workdir.path());
+    wait_api(api_port, &mut child).await;
 
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(10), raw_http_save(api_port))
+            .await
+            .expect("save request must not hang")
+            .expect("save request failed");
+    assert_eq!(
+        response, 400,
+        "save on a --config-string daemon must be refused, got {response}"
+    );
+    child.kill().await.unwrap();
+    assert!(
+        !workdir.path().join("config.yaml").exists(),
+        "a --config-string run must not create ./config.yaml"
+    );
+
+    // (b) file-backed positive control → save succeeds and rewrites the file.
+    let filedir = tempfile::tempdir().unwrap();
+    let api_port = free_port();
+    let config_file = filedir.path().join("real.yaml");
+    std::fs::write(&config_file, yaml_for(api_port)).unwrap();
+    let mut child = spawn_meow(
+        &["-f".to_string(), config_file.to_string_lossy().into_owned()],
+        filedir.path(),
+    );
+    wait_api(api_port, &mut child).await;
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(10), raw_http_save(api_port))
+            .await
+            .expect("save request must not hang")
+            .expect("save request failed");
+    assert_eq!(response, 200, "file-backed save must succeed");
+    child.kill().await.unwrap();
+    let saved = std::fs::read_to_string(&config_file).unwrap();
+    assert!(
+        saved.contains("external-controller"),
+        "the save must rewrite the backing file: {saved}"
+    );
+}
+
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    port
+}
+
+fn spawn_meow(args: &[String], cwd: &std::path::Path) -> tokio::process::Child {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
     child
-        .arg("--config-string")
-        .arg(b64)
-        .current_dir(workdir.path())
+        .args(args)
+        .current_dir(cwd)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // Piped so a startup failure can be surfaced by `wait_api`.
+        .stderr(std::process::Stdio::piped());
     for variable in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -372,12 +420,15 @@ async fn config_string_run_never_writes_phantom_config() {
     ] {
         child.env_remove(variable);
     }
-    let mut child = child.spawn().expect("spawn meow");
+    child.spawn().expect("spawn meow")
+}
 
-    // Wait for the API to accept connections (bounded).
+/// Wait for the API port to accept a connection; on timeout, kill the
+/// daemon and panic with its stderr so startup failures are diagnosable.
+async fn wait_api(port: u16, child: &mut tokio::process::Child) {
     let ready = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", api_port))
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok()
             {
@@ -389,28 +440,18 @@ async fn config_string_run_never_writes_phantom_config() {
     .await;
     if ready.is_err() {
         let _ = child.kill().await;
-        panic!("api server did not come up within 15s");
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = pipe.read_to_string(&mut stderr).await;
+        }
+        panic!("api server did not come up within 15s; daemon stderr: {stderr}");
     }
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), reqwest_save(api_port))
-        .await
-        .expect("save request must not hang")
-        .expect("save request failed");
-    assert_eq!(
-        response, 400,
-        "save on a --config-string daemon must be refused, got {response}"
-    );
-
-    child.kill().await.unwrap();
-    assert!(
-        !workdir.path().join("config.yaml").exists(),
-        "a --config-string run must not create ./config.yaml"
-    );
 }
 
 /// Minimal HTTP POST for the e2e above — keeps the test file free of an
 /// HTTP-client dependency; returns the status code.
-async fn reqwest_save(port: u16) -> std::io::Result<u16> {
+async fn raw_http_save(port: u16) -> std::io::Result<u16> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     stream

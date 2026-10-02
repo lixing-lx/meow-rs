@@ -1070,12 +1070,16 @@ async fn close_all_connections(State(state): State<Arc<AppState>>) -> StatusCode
 /// daemon was started from `--config-string` — persisting would otherwise
 /// create a phantom `config.yaml` the user never asked for (issue #717).
 fn backing_config_path(state: &AppState) -> Result<&str, (StatusCode, String)> {
-    state.config_path.as_deref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "no backing config file — the daemon was started via --config-string".into(),
-        )
-    })
+    state
+        .config_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "no backing config file — the daemon was started via --config-string".into(),
+            )
+        })
 }
 
 async fn save_config(
@@ -1942,7 +1946,7 @@ async fn persist_candidate(
         }
         None => {
             warn!(
-                "subscription '{name}' applied in memory only — \
+                "subscription '{name}' change not persisted — \
                  no backing config file (--config-string)"
             );
             Ok(false)

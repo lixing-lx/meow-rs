@@ -152,7 +152,8 @@ The semantics differ sharply from `proxy-providers`:
   from `--config-string` there is no backing file at all: every write-back
   (auto-save, `POST /api/config/save`, subscription add/refresh/delete)
   is skipped or refused rather than creating a `config.yaml` next boot
-  would pick up — subscription responses report `"persisted": false`.
+  would pick up — subscription add/refresh responses report
+  `"persisted": false` (a delete's bare 204 has no body to carry it).
 - **Refetch cadence.** A background task polls every 60 s: an entry is
   fetched when it has no `last-updated` (first run) or when `interval`
   seconds have elapsed. An entry without `interval` fetches once at
