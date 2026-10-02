@@ -1149,6 +1149,7 @@ async fn apply_raw_to_tunnel(
     let cache_dir = state
         .config_path
         .as_deref()
+        .filter(|p| !p.is_empty())
         .map(meow_config::resource_cache_dir_for_config_path);
     // Share the tunnel's resolver slot so the rebuilt map's DIRECT adapter
     // tracks later `set_resolver` swaps (issue #514).
@@ -1467,7 +1468,9 @@ pub async fn reconcile_dns_config(
     if unchanged {
         return Ok(None);
     }
-    let cache_dir = config_path.map(meow_config::resource_cache_dir_for_config_path);
+    let cache_dir = config_path
+        .filter(|p| !p.is_empty())
+        .map(meow_config::resource_cache_dir_for_config_path);
     meow_config::parse_dns_from_raw(
         candidate,
         cache_dir.as_deref(),
@@ -1937,14 +1940,14 @@ async fn persist_candidate(
     snapshot: &RawConfig,
     name: &str,
 ) -> Result<bool, (StatusCode, String)> {
-    match state.config_path.as_deref() {
-        Some(path) => {
+    match backing_config_path(state) {
+        Ok(path) => {
             meow_config::save_raw_config_async(path, snapshot)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             Ok(true)
         }
-        None => {
+        Err(_) => {
             warn!(
                 "subscription '{name}' change not persisted — \
                  no backing config file (--config-string)"
@@ -2920,6 +2923,7 @@ async fn put_configs(
     let cache_dir = state
         .config_path
         .as_deref()
+        .filter(|p| !p.is_empty())
         .map(meow_config::resource_cache_dir_for_config_path);
     // When the strict rebuild fails and `force` retries leniently, the
     // DNS reconcile below must parse with the SAME effective strictness —

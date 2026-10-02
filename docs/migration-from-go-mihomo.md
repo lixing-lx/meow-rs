@@ -510,9 +510,10 @@ dns:
   to IPv4 cleanly. To allocate v6 fake IPs, point `fake-ip-range` at an
   IPv6 prefix (e.g. `fc00::/64`).
 - **Persistence.** `store-fake-ip: true` writes `fakeip-v4.json` /
-  `fakeip-v6.json` next to the config file (atomic via tmp + rename).
-  Differs from upstream's bbolt format — there is no migration path
-  between the two on-disk layouts.
+  `fakeip-v6.json` under the provider cache dir (next to the config file
+  for file-backed runs; the resolved home dir under `--config-string`),
+  atomic via tmp + rename. Differs from upstream's bbolt format — there
+  is no migration path between the two on-disk layouts.
 - **Flush.** `POST /cache/fakeip/flush` clears every allocation and resets
   cursors. 204 on success.
 

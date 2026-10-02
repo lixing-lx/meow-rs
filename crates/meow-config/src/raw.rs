@@ -390,7 +390,8 @@ pub struct RawDns {
     pub fake_ip_filter_mode: Option<String>,
     /// If true, the fake-IP host↔ip map is persisted to disk and survives
     /// restarts. The on-disk file is `fakeip-v4.json` / `fakeip-v6.json`
-    /// alongside the working directory.
+    /// under the provider cache dir (file-backed config) or the resolved
+    /// home dir (`--config-string`).
     pub store_fake_ip: Option<bool>,
     pub default_nameserver: Option<Vec<String>>,
     pub nameserver: Option<Vec<String>>,

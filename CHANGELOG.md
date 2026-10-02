@@ -518,6 +518,7 @@ the canonical, in-repo source a release is cut from.
   a service unit must point at a real `-f` file — instead of silently
   installing a unit that resurrects a different config. Embedders:
   `ApiServer::new`, `subscription_refresh::run_loop`,
+  `geodata_fetch::run_on_startup`/`auto_update_loop`,
   `routes::reconcile_dns_config`, and `AppState::config_path` now take
   `Option` backing paths.
 

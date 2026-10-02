@@ -64,6 +64,7 @@ pub async fn run_loop(
     // (issue #717).
     let cache_dir = config_path
         .as_deref()
+        .filter(|p| !p.is_empty())
         .map(meow_config::resource_cache_dir_for_config_path);
     let weak = tunnel.weak_inner();
     drop(tunnel);

@@ -1216,6 +1216,7 @@ async fn run(
         // targets resolve under the `-d`/XDG home independently.
         let cache_dir = config_path
             .as_deref()
+            .filter(|p| !p.is_empty())
             .map(meow_config::resource_cache_dir_for_config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::run_on_startup(
@@ -1245,6 +1246,7 @@ async fn run(
         // targets resolve under the `-d`/XDG home independently.
         let cache_dir = config_path
             .as_deref()
+            .filter(|p| !p.is_empty())
             .map(meow_config::resource_cache_dir_for_config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(

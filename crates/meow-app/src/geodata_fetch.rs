@@ -181,6 +181,11 @@ async fn republish_dns_for_geo_dbs(
 /// the shared DNS-server handle — after a DB download the resolver is
 /// reparsed and republished so `geosite:`/`rule-set:` policy matchers
 /// bind the new DB generation (issue #543).
+///
+/// `cache_dir` feeds only the post-download rebuild context (provider
+/// `path:` containment, fake-IP store base) — pass the same value startup
+/// used so a republish cannot admit paths `-t` would have rejected.
+/// Download targets come from `compute_targets` and are unaffected.
 pub async fn run_on_startup(
     geo: GeoDataConfig,
     tunnel: Tunnel,
@@ -292,7 +297,9 @@ pub async fn run_on_startup(
 /// pinning `TunnelInner` forever.
 ///
 /// See [`run_on_startup`] for the `rule_providers` / `proxy_providers` /
-/// `dns_server` sharing contract.
+/// `dns_server` sharing contract — and for `cache_dir`, which feeds only
+/// the post-download rebuild context (download targets resolve via
+/// `compute_targets` independently).
 pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
