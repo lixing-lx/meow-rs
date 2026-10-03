@@ -65,6 +65,7 @@ struct Inner {
     sessions: Mutex<Vec<Arc<Session>>>,
     creating: AsyncMutex<()>,
     generation: AtomicU64,
+    network_cancel: Mutex<CancellationToken>,
 }
 
 struct Session {
@@ -155,11 +156,19 @@ impl Client {
             sessions: Mutex::new(Vec::new()),
             creating: AsyncMutex::new(()),
             generation: AtomicU64::new(1),
+            network_cancel: Mutex::new(CancellationToken::new()),
         })))
     }
 
     pub fn reset(&self) {
         self.0.generation.fetch_add(1, Ordering::AcqRel);
+        {
+            // Live GOAWAY streams leave the admission pool. Cancel their
+            // network generation too, without retaining a session registry.
+            let mut network = lock(&self.0.network_cancel);
+            network.cancel();
+            *network = CancellationToken::new();
+        }
         for session in lock(&self.0.sessions).drain(..) {
             session.cancel.cancel();
         }
@@ -213,7 +222,7 @@ impl Client {
         if let Some(lease) = self.existing(false)? {
             return Ok(lease);
         }
-        let cancel = CancellationToken::new();
+        let cancel = lock(&self.0.network_cancel).child_token();
         let reusable = Arc::new(AtomicBool::new(true));
         let io = self.0.connector.connect(internal).await?;
         let (sender, connection) = h2::client::Builder::new()
@@ -353,6 +362,7 @@ impl Client {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        lock(&self.network_cancel).cancel();
         for session in lock(&self.sessions).drain(..) {
             session.cancel.cancel();
         }

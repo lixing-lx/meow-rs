@@ -301,3 +301,28 @@ async fn empty_frame_flood_still_closes_connection_with_bounded_budget() {
         .unwrap_err();
     assert!(error.to_string().contains("too_many_data_frames"));
 }
+
+#[tokio::test]
+async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
+    let mock = Arc::new(Mock {
+        connections: AtomicUsize::new(0),
+        reject: false,
+        malformed_udp: false,
+        goaway: true,
+    });
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    let client = Client::new(mock, options).unwrap();
+    let mut stream = client.tcp("drain.test:443").await.unwrap();
+    stream.write_all(b"live").await.unwrap();
+    stream.read_exact(&mut [0; 4]).await.unwrap();
+    assert!(client.tcp("retire.test:80").await.is_err());
+    let _new = client.tcp("new.test:80").await.unwrap();
+    client.reset();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0; 1]))
+            .await
+            .expect("retired session survived network reset")
+            .is_err()
+    );
+}
