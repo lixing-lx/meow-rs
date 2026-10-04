@@ -18,16 +18,18 @@ struct Mock {
     malformed_udp: bool,
     goaway: bool,
     stall_check: bool,
+    check_started: Arc<tokio::sync::Notify>,
 }
 #[async_trait]
 impl Connector for Mock {
-    async fn connect(&self, _internal: bool) -> io::Result<Box<dyn IoStream>> {
+    async fn connect(&self) -> io::Result<Box<dyn IoStream>> {
         self.connections.fetch_add(1, Ordering::SeqCst);
         let (client, peer) = tokio::io::duplex(8192);
         let reject = self.reject;
         let malformed = self.malformed_udp;
         let goaway = self.goaway;
         let stall_check = self.stall_check;
+        let check_started = Arc::clone(&self.check_started);
         tokio::spawn(async move {
             let mut server = h2::server::handshake(peer).await.unwrap();
             while let Some(Ok((request, mut response))) = server.accept().await {
@@ -38,6 +40,7 @@ impl Connector for Mock {
                 );
                 let authority = request.uri().authority().unwrap().as_str().to_owned();
                 if stall_check && authority == "_check" {
+                    check_started.notify_one();
                     tokio::spawn(async move {
                         let _request = request;
                         let _response = response;
@@ -136,6 +139,7 @@ fn setup(reject: bool, malformed_udp: bool) -> (Client, Arc<Mock>) {
         malformed_udp,
         goaway: false,
         stall_check: false,
+        check_started: Arc::new(tokio::sync::Notify::new()),
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -154,6 +158,7 @@ async fn goaway_retires_new_admission_but_keeps_existing_streams_alive() {
         malformed_udp: false,
         goaway: true,
         stall_check: false,
+        check_started: Arc::new(tokio::sync::Notify::new()),
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -325,6 +330,7 @@ async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
         malformed_udp: false,
         goaway: true,
         stall_check: false,
+        check_started: Arc::new(tokio::sync::Notify::new()),
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -410,13 +416,28 @@ async fn stalled_health_check_times_out_without_publishing_a_session() {
         malformed_udp: false,
         goaway: false,
         stall_check: true,
+        check_started: Arc::new(tokio::sync::Notify::new()),
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.health_check = true;
-    options.timeout = Duration::from_millis(100);
-    let client = Client::new(mock, options).unwrap();
-    let error = client.tcp("example.test:80").await.err().unwrap();
+    options.timeout = Duration::from_millis(500);
+    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let first = client.tcp("example.test:80");
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => panic!("dial finished before the pending check: {}", result.is_ok()),
+        () = mock.check_started.notified() => {},
+    }
+    assert_eq!(
+        client.session_count(),
+        0,
+        "unchecked session must stay private"
+    );
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 1);
+    let (first, concurrent) = tokio::join!(first, client.tcp("concurrent.test:80"));
+    let error = first.err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(concurrent.err().unwrap().kind(), io::ErrorKind::TimedOut);
     assert_eq!(client.session_count(), 0);
     let next = tokio::time::timeout(Duration::from_secs(1), client.tcp("next.test:80"))
         .await

@@ -39,7 +39,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> IoStream for T {}
 
 #[async_trait]
 pub trait Connector: Send + Sync {
-    async fn connect(&self, internal: bool) -> io::Result<Box<dyn IoStream>>;
+    async fn connect(&self) -> io::Result<Box<dyn IoStream>>;
 }
 
 /// Credentials intentionally have no Debug implementation.
@@ -214,7 +214,7 @@ impl Client {
         Ok(None)
     }
 
-    async fn session(&self, internal: bool) -> io::Result<Lease> {
+    async fn session(&self) -> io::Result<Lease> {
         if let Some(lease) = self.existing()? {
             return Ok(lease);
         }
@@ -231,7 +231,7 @@ impl Client {
         }
         let cancel = lock(&self.0.network_cancel).child_token();
         let reusable = Arc::new(AtomicBool::new(true));
-        let io = self.0.connector.connect(internal).await?;
+        let io = self.0.connector.connect().await?;
         let (sender, connection) = h2::client::Builder::new()
             .initial_window_size(131072)
             .initial_connection_window_size(2 * 1024 * 1024)
@@ -324,11 +324,7 @@ impl Client {
         Ok(TunnelStream::new(send, result.into_body(), lease, end))
     }
 
-    pub async fn tcp_with_context(
-        &self,
-        authority: &str,
-        internal: bool,
-    ) -> io::Result<TunnelStream> {
+    pub async fn tcp(&self, authority: &str) -> io::Result<TunnelStream> {
         if authority.starts_with('_') || !authority.contains(':') || authority.len() > 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -336,20 +332,19 @@ impl Client {
             ));
         }
         tokio::time::timeout(self.0.options.timeout, async {
-            self.open(self.session(internal).await?, authority).await
+            self.open(self.session().await?, authority).await
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel CONNECT timed out"))?
     }
 
-    pub async fn udp_with_context(
+    pub async fn udp(
         &self,
         source: std::net::SocketAddr,
         app_name: &str,
-        internal: bool,
     ) -> io::Result<UdpAssociation> {
         tokio::time::timeout(self.0.options.timeout, async {
-            let lease = self.session(internal).await?;
+            let lease = self.session().await?;
             let session = Arc::clone(&lease.0);
             let mut slot = session.udp.lock().await;
             let mux = if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
@@ -364,15 +359,6 @@ impl Client {
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel UDP CONNECT timed out"))?
-    }
-    #[cfg(test)]
-    pub async fn tcp(&self, authority: &str) -> io::Result<TunnelStream> {
-        self.tcp_with_context(authority, false).await
-    }
-
-    #[cfg(test)]
-    pub async fn udp(&self, source: std::net::SocketAddr, app: &str) -> io::Result<UdpAssociation> {
-        self.udp_with_context(source, app, false).await
     }
 }
 

@@ -3,10 +3,12 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use meow_common::{MeowError, Metadata, ProxyAdapter};
+use meow_common::{MeowError, Metadata, Proxy, ProxyAdapter};
 use meow_proxy::{
-    dialer::{DirectDialer, TcpDialer},
+    dialer::{DirectDialer, ProxyDialer, TcpDialer},
+    group::load_balance::{LbStrategy, LoadBalanceGroup},
     trusttunnel::{CertificateVerificationError, Options, TrustTunnelAdapter},
+    DirectAdapter,
 };
 use meow_transport::{tls::TlsConfig, Stream};
 use std::{
@@ -250,33 +252,72 @@ async fn authentication_failure_maps_to_proxy_auth_error() {
     ));
 }
 
-struct ContextDialer(Arc<AtomicUsize>);
+struct ContextDialer {
+    observed: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+    inner: Arc<dyn TcpDialer>,
+}
 #[async_trait]
 impl TcpDialer for ContextDialer {
     async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>> {
-        self.0.store(if internal { 2 } else { 1 }, Ordering::SeqCst);
-        DirectDialer.dial(host, port, internal).await
+        self.observed
+            .store(if internal { 2 } else { 1 }, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.dial(host, port, internal).await
     }
 }
 
 #[tokio::test]
-async fn internal_dials_preserve_the_usage_accounting_hint() {
-    let endpoint = Endpoint::start(true).await;
-    let observed = Arc::new(AtomicUsize::new(0));
-    let proxy = endpoint.adapter(
-        endpoint.tls(true, "localhost"),
-        "secret",
-        Arc::new(ContextDialer(Arc::clone(&observed))),
-    );
-    let mut metadata = destination();
-    metadata.internal = true;
-    let stream = proxy.dial_tcp(&metadata).await.unwrap();
-    assert_eq!(observed.load(Ordering::SeqCst), 2);
-    drop(stream);
-    proxy.reset_sessions();
-    metadata.internal = false;
-    let _next = proxy.dial_tcp(&metadata).await.unwrap();
-    assert_eq!(observed.load(Ordering::SeqCst), 1);
+async fn internally_opened_sessions_mark_front_group_use_for_later_user_streams() {
+    for udp_first in [false, true] {
+        let endpoint = Endpoint::start(true).await;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let member: Arc<dyn Proxy> = Arc::new(GroupMember(Box::new(DirectAdapter::new())));
+        let front = Arc::new(LoadBalanceGroup::new(
+            "front",
+            vec![member],
+            LbStrategy::RoundRobin,
+        ));
+        let front_proxy: Arc<dyn Proxy> = Arc::<LoadBalanceGroup>::clone(&front);
+        let proxy = endpoint.adapter(
+            endpoint.tls(true, "localhost"),
+            "secret",
+            Arc::new(ContextDialer {
+                observed: Arc::clone(&observed),
+                calls: Arc::clone(&calls),
+                inner: Arc::new(ProxyDialer::new(front_proxy)),
+            }),
+        );
+        assert_eq!(front.usage_generation(), 0);
+        let mut metadata = destination();
+        metadata.internal = true;
+        let internal_tcp = if udp_first {
+            None
+        } else {
+            Some(proxy.dial_tcp(&metadata).await.unwrap())
+        };
+        let internal_udp = if udp_first {
+            Some(proxy.dial_udp(&metadata).await.unwrap())
+        } else {
+            None
+        };
+        assert_eq!(
+            front.usage_generation(),
+            1,
+            "shared session must record use"
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        metadata.internal = false;
+        let mut user = proxy.dial_tcp(&metadata).await.unwrap();
+        user.write_all(b"user").await.unwrap();
+        let mut reply = [0; 4];
+        user.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"user");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "user stream must reuse H2");
+        assert_eq!(front.usage_generation(), 1);
+        drop((internal_tcp, internal_udp));
+    }
 }
 
 #[tokio::test]
@@ -365,8 +406,8 @@ async fn health_check_runs_on_new_session_and_is_not_repeated_on_reuse() {
 }
 
 // Proxy groups consume Proxy, while leaf adapters expose ProxyAdapter.
-// Keep a thin fixture wrapper so this exercises the real TT admission path.
-struct GroupMember(TrustTunnelAdapter);
+// Keep a thin fixture wrapper to exercise real adapter admission and group use.
+struct GroupMember(Box<dyn ProxyAdapter>);
 #[async_trait]
 impl ProxyAdapter for GroupMember {
     fn name(&self) -> &str {
@@ -417,8 +458,6 @@ impl meow_common::Proxy for GroupMember {
 
 #[tokio::test]
 async fn stream_pool_pressure_keeps_load_balance_member_alive() {
-    use meow_common::Proxy;
-    use meow_proxy::group::load_balance::{LbStrategy, LoadBalanceGroup};
     let endpoint = Endpoint::start(true).await;
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -434,7 +473,7 @@ async fn stream_pool_pressure_keeps_load_balance_member_alive() {
         Arc::new(DirectDialer),
     )
     .unwrap();
-    let member: Arc<dyn Proxy> = Arc::new(GroupMember(adapter));
+    let member: Arc<dyn Proxy> = Arc::new(GroupMember(Box::new(adapter)));
     let group = LoadBalanceGroup::new(
         "balanced",
         vec![Arc::clone(&member)],

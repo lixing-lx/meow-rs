@@ -48,8 +48,11 @@ struct TlsConnector {
 }
 #[async_trait]
 impl Connector for TlsConnector {
-    async fn connect(&self, internal: bool) -> io::Result<Box<dyn IoStream>> {
-        let stream = self.dialer.dial(&self.server, self.port, internal).await?;
+    async fn connect(&self) -> io::Result<Box<dyn IoStream>> {
+        // Shared sessions serve user streams even when housekeeping opens
+        // them first. Mark the physical dial as user use, like other mux
+        // adapters, so lazy front groups stay active during session reuse.
+        let stream = self.dialer.dial(&self.server, self.port, false).await?;
         let tls = self
             .tls
             .connect_typed(stream)
@@ -169,10 +172,7 @@ impl ProxyAdapter for TrustTunnelAdapter {
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let stream = self
             .client
-            .tcp_with_context(
-                &metadata.remote_address().to_string(),
-                metadata.is_internal(),
-            )
+            .tcp(&metadata.remote_address().to_string())
             .await
             .map_err(protocol_error)?;
         Ok(Box::new(crate::StreamConn(Box::new(stream))))
@@ -191,10 +191,7 @@ impl ProxyAdapter for TrustTunnelAdapter {
             metadata.src_port,
         );
         Ok(Box::new(PacketConn(
-            self.client
-                .udp_with_context(source, "", metadata.is_internal())
-                .await
-                .map_err(protocol_error)?,
+            self.client.udp(source, "").await.map_err(protocol_error)?,
         )))
     }
 }

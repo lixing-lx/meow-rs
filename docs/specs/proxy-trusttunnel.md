@@ -60,7 +60,10 @@ behavior.
 ## Runtime boundaries
 
 - TLS uses the existing BoringSSL transport and pluggable dialer; the
-  protocol module creates no sockets. Internal dial metadata is preserved.
+  protocol module creates no sockets. Shared physical sessions dial with
+  `internal: false`, matching other pooled adapters: a session opened by
+  housekeeping can later serve user streams without a new physical dial.
+  This records front-group use so lazy probing remains active during reuse.
 - Authenticated CONNECT multiplexes TCP, `_check`, and `_udp2` over H2.
   TCP writes respect flow control, support half-close, and reset unfinished
   streams on drop. A GOAWAY retires admission while successful streams drain.
@@ -118,7 +121,9 @@ Tests use in-memory H2 peers and self-signed loopback TLS fixtures. The TLS
 fixtures explicitly install their generated CA and include certificate/name
 failure paths asserting actual X509 verification results. Non-TLS/socket
 failures are separately checked not to be classified as certificate failures.
-Tests also cover process-name privacy, pool saturation without dead-marking,
+Tests also cover front-group use when internal TCP/UDP opens a session later
+reused by user traffic, unchecked-session admission during a pending health
+check, process-name privacy, pool saturation without dead-marking,
 shared receive-budget drops/recovery, and a length guard independent of EOF;
 examples retain normal certificate verification. The full
 regression bar in `CONTRIBUTING.md` / `CLAUDE.md` is additionally required
