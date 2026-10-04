@@ -24,6 +24,50 @@ fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
     node("quic: true\n")
 }
 
+#[cfg(feature = "trusttunnel")]
+#[test]
+fn optional_null_and_empty_policy_fields_use_defaults() {
+    let config = node("udp: null\nsni: null\nskip-cert-verify: null\nhealth-check: null\nmax-connections: null\nmin-streams: null\nmax-streams: null\nname-cert-verify: null\nclient-fingerprint: null\nalpn: []\nfingerprint: null\ncertificate: ''\nech-opts: {}\nbbr-opts: null\n");
+    meow_config::proxy_parser::parse_proxy(&config, false)
+        .expect("optional nulls and inert declarations must not reject generated subscriptions");
+}
+
+#[tokio::test]
+async fn initial_acquisition_retains_typed_trusttunnel_error() {
+    use meow_config::proxy_provider::{ProxyProvider, TrustTunnelConfigError};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bad.yaml");
+    std::fs::write(&path, provider_document()).unwrap();
+    for strict in [false, true] {
+        let provider = ProxyProvider::new(
+            "p",
+            &file_provider(&path),
+            Some(directory.path()),
+            false,
+            strict,
+            Default::default(),
+        )
+        .unwrap();
+        let error = provider
+            .acquire_initial()
+            .await
+            .expect_err("invalid TT must fail acquisition");
+        assert!(error.is::<TrustTunnelConfigError>(), "{error:#}");
+        assert!(provider.proxies().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn whitespace_type_cannot_bypass_fail_closed_gate() {
+    let mut config = unsupported_node();
+    config.insert("type".into(), "trusttunnel ".into());
+    let raw = meow_config::raw::RawConfig {
+        proxies: Some(vec![config]),
+        ..Default::default()
+    };
+    assert!(meow_config::rebuild_from_raw(&raw).is_err());
+}
+
 fn provider_document() -> String {
     serde_yaml::to_string(&serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter(
         [(
@@ -243,7 +287,7 @@ mod enabled {
             ("quic: true\n", "HTTP/3"),
             ("alpn: [http/1.1]\n", "alpn"),
             ("fingerprint: 00\n", "fingerprint"),
-            ("ech-opts: {}\n", "ech-opts"),
+            ("ech-opts: {enable: true}\n", "ech-opts"),
             ("certificate: client.pem\n", "certificate"),
             ("congestion-controller: cubic\n", "congestion-controller"),
             ("cwnd: 10\n", "cwnd"),

@@ -2,6 +2,7 @@ use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use meow_common::atomic::AtomicU;
 use meow_common::{ProviderSlot, Proxy};
+use meow_proxy::dialer::ProxyRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -103,7 +104,7 @@ type WeakSlot = std::sync::Weak<RwLock<Vec<Arc<dyn Proxy>>>>;
 /// Typed so initial acquisition can distinguish a transport/policy defect
 /// from a transient fetch error without inspecting diagnostic strings.
 #[derive(Debug)]
-struct TrustTunnelConfigError(String);
+pub struct TrustTunnelConfigError(String);
 
 impl std::fmt::Display for TrustTunnelConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -484,6 +485,10 @@ impl ProxyProvider {
     /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
     /// a 200-OK garbage body can't durably poison the fallback cache.
     async fn fetch_source(&self) -> Result<String, String> {
+        self.fetch_source_with_registry(&self.dialer_registry).await
+    }
+
+    async fn fetch_source_with_registry(&self, registry: &ProxyRegistry) -> Result<String, String> {
         match &self.vehicle {
             Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
                 format!(
@@ -493,7 +498,7 @@ impl ProxyProvider {
             }),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
-                    &self.dialer_registry,
+                    registry,
                     self.download_proxy.as_deref(),
                 ) {
                     Ok(p) => {
@@ -530,7 +535,15 @@ impl ProxyProvider {
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
     async fn fetch_content(&self) -> Result<(String, bool), String> {
-        match self.fetch_source().await {
+        self.fetch_content_with_registry(&self.dialer_registry)
+            .await
+    }
+
+    async fn fetch_content_with_registry(
+        &self,
+        registry: &ProxyRegistry,
+    ) -> Result<(String, bool), String> {
+        match self.fetch_source_with_registry(registry).await {
             Ok(text) => Ok((text, true)),
             Err(e) => match &self.vehicle {
                 Vehicle::Http { cache_path, .. } => {
@@ -686,16 +699,16 @@ impl ProxyProvider {
             match self.parse_node(raw_map, raw_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
-                    if strict {
-                        return Err(anyhow::anyhow!(
-                            "node '{raw_name}' failed to parse (strict mode): {e}"
-                        ));
-                    }
                     if proxy_parser::node_is_trusttunnel(raw_map) {
                         return Err(TrustTunnelConfigError(format!(
                             "trusttunnel node '{raw_name}' must not be skipped: {e}"
                         ))
                         .into());
+                    }
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "node '{raw_name}' failed to parse (strict mode): {e}"
+                        ));
                     }
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
                 }
@@ -880,21 +893,26 @@ impl ProxyProvider {
         }
     }
 
-    /// First acquisition for a freshly built provider — startup and the
-    /// detached post-commit fetch. Unlike [`Self::refresh`] this DOES fall
-    /// back to the on-disk cache when the remote is unreachable (offline
-    /// bootstrap); the slot is empty at this point, so last-good
-    /// retention is moot.
-    pub async fn acquire_initial(&self) -> Result<(), String> {
+    /// Initial acquisition, with HTTP cache fallback. Typed TrustTunnel
+    /// defects survive this boundary so a candidate can fail before commit.
+    pub async fn acquire_initial(&self) -> anyhow::Result<()> {
+        self.acquire_initial_with_registry(&self.dialer_registry)
+            .await
+    }
+
+    /// Fetch a candidate through its unpublished route map. Parsed nodes
+    /// still bind to the long-lived provider registry, which the tunnel
+    /// updates at commit; only the download uses this temporary registry.
+    pub async fn acquire_initial_with_registry(
+        &self,
+        registry: &ProxyRegistry,
+    ) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        match self.fetch_content().await {
-            Ok((content, from_remote)) => self
-                .ingest(content, from_remote)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        }
+        let (content, from_remote) = self
+            .fetch_content_with_registry(registry)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        self.ingest(content, from_remote).await.map(|_| ())
     }
 
     /// Consumes the deferred-initial-fetch flag: `true` once per provider
@@ -988,10 +1006,10 @@ pub async fn load_proxy_providers(
                     // scheduled tick or manual refresh succeeds.
                     match provider.fetch_content().await {
                         Ok((content, from_remote)) => {
-                            provider
-                                .ingest(content, from_remote)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("proxy-provider '{name}': {e}"))?;
+                            provider.ingest(content, from_remote).await.map_err(|e| {
+                                let context = format!("proxy-provider '{name}': {e}");
+                                e.context(context)
+                            })?;
                         }
                         Err(e) => warn_initial_load_failure(&provider, &e),
                     }
@@ -1000,7 +1018,8 @@ pub async fn load_proxy_providers(
                         Ok((content, from_remote)) => {
                             if let Err(e) = provider.ingest(content, from_remote).await {
                                 if e.is::<TrustTunnelConfigError>() {
-                                    return Err(anyhow::anyhow!("proxy-provider '{name}': {e}"));
+                                    let context = format!("proxy-provider '{name}': {e}");
+                                    return Err(e.context(context));
                                 }
                                 warn_initial_load_failure(&provider, &e.to_string());
                             }
@@ -1021,6 +1040,34 @@ pub async fn load_proxy_providers(
         }
     }
     Ok(result)
+}
+
+/// Acquire new/changed providers before publishing a candidate generation.
+/// Reused objects retain their last-good slots and refresh on their normal
+/// schedule. Transient fetch failures keep the established offline-bootstrap
+/// behavior; a parsed TrustTunnel policy/transport defect rejects the whole
+/// candidate, with its typed cause intact. Call before any DNS/routing swap.
+pub async fn prepare_proxy_providers(
+    live: &HashMap<String, Arc<ProxyProvider>>,
+    candidate: &HashMap<String, Arc<ProxyProvider>>,
+    registry: &ProxyRegistry,
+) -> anyhow::Result<()> {
+    for (name, provider) in candidate {
+        if live
+            .get(name)
+            .is_some_and(|previous| Arc::ptr_eq(previous, provider))
+        {
+            continue;
+        }
+        if let Err(error) = provider.acquire_initial_with_registry(registry).await {
+            if error.is::<TrustTunnelConfigError>() {
+                let context = format!("proxy-provider '{name}': {error}");
+                return Err(error.context(context));
+            }
+            warn_initial_load_failure(provider, &error.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Warn for an initial-load failure, distinguishing a not-yet-resolvable
@@ -2504,6 +2551,40 @@ header:
         registry
     }
 
+    #[tokio::test]
+    async fn candidate_provider_validation_uses_unpublished_download_registry() {
+        let front = Arc::new(PassthroughProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let candidate_registry = registry_with_front(Arc::<PassthroughProxy>::clone(&front));
+        let live_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let url = spawn_payload_server("proxies:\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(
+            ProxyProvider::new(
+                "p",
+                &raw_http_provider(&url, Some("front")),
+                Some(dir.path()),
+                false,
+                false,
+                live_registry.clone(),
+            )
+            .unwrap(),
+        );
+        let candidate = HashMap::from([("p".into(), Arc::clone(&provider))]);
+        let error = prepare_proxy_providers(&HashMap::new(), &candidate, &candidate_registry)
+            .await
+            .expect_err("invalid TT must fail before the candidate registry is published");
+        assert!(error.is::<TrustTunnelConfigError>());
+        assert_eq!(front.seen.lock().unwrap().len(), 1);
+        assert!(provider.proxies().is_empty());
+        assert!(
+            crate::internal_http::resolve_download_proxy(&live_registry, Some("front")).is_err(),
+            "preflight must not publish into the live registry"
+        );
+    }
+
     /// `proxy: <name>` routes the provider fetch through that registry
     /// entry — the dial lands on the named hop, not on a direct socket.
     #[tokio::test]
@@ -2562,7 +2643,7 @@ header:
         // cache exists — the resolution failure itself still flagged the
         // deferred retry inside `fetch_source`.
         assert!(
-            err.contains("cache") || err.contains("'front'"),
+            err.to_string().contains("cache") || err.to_string().contains("'front'"),
             "unexpected: {err}"
         );
         assert!(p.proxies().is_empty());

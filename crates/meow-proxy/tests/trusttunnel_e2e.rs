@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use meow_common::{MeowError, Metadata, Network, ProxyAdapter};
 use meow_proxy::{
     dialer::{DirectDialer, TcpDialer},
-    trusttunnel::{Options, TrustTunnelAdapter},
+    trusttunnel::{CertificateVerificationError, Options, TrustTunnelAdapter},
 };
 use meow_transport::{tls::TlsConfig, Stream};
 use std::{
@@ -79,6 +79,30 @@ impl Drop for Endpoint {
 impl Endpoint {
     async fn start() -> Option<Self> {
         let binary = endpoint_binary()?;
+        // The official process binds its own socket, so an ephemeral-port
+        // reservation cannot be inherited. Retry only an explicit bind
+        // collision, never authentication/protocol/startup failures.
+        for attempt in 0..3 {
+            let (endpoint, ready) = Self::start_once(&binary).await;
+            if ready {
+                return Some(endpoint);
+            }
+            let diagnostic = endpoint.log();
+            let console =
+                fs::read_to_string(endpoint.directory.path().join("endpoint-console.log"))
+                    .unwrap_or_default();
+            assert!(
+                attempt < 2
+                    && format!("{diagnostic} {console}")
+                        .to_ascii_lowercase()
+                        .contains("address already in use"),
+                "official endpoint startup failed: {diagnostic} {console}"
+            );
+        }
+        unreachable!("bounded startup attempts always return or panic")
+    }
+
+    async fn start_once(binary: &std::path::Path) -> (Self, bool) {
         let directory = tempfile::tempdir().unwrap();
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         fs::write(directory.path().join("cert.pem"), generated.cert.pem()).unwrap();
@@ -133,25 +157,23 @@ impl Endpoint {
             port,
             certificate: generated.cert.der().to_vec(),
         };
-        timeout(WAIT, async {
+        let ready = timeout(WAIT, async {
             loop {
-                assert!(
-                    endpoint.child.try_wait().unwrap().is_none(),
-                    "official endpoint exited before listening: {}",
-                    endpoint.log()
-                );
+                if endpoint.child.try_wait().unwrap().is_some() {
+                    return false;
+                }
                 if TcpStream::connect((Ipv4Addr::LOCALHOST, port))
                     .await
                     .is_ok()
                 {
-                    break;
+                    return true;
                 }
                 sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("official endpoint startup timed out: {}", endpoint.log()));
-        Some(endpoint)
+        .unwrap_or(false);
+        (endpoint, ready)
     }
 
     fn log(&self) -> String {
@@ -305,7 +327,15 @@ async fn official_h2_authentication_and_certificate_fail_closed() {
             .await
             .err()
             .unwrap();
-        assert!(error.to_string().contains("certificate"), "{error}");
+        let MeowError::Io(error) = error else {
+            panic!("expected certificate IO failure")
+        };
+        let certificate = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CertificateVerificationError>()
+            .expect("official peer failure must retain X509 verification result");
+        assert_eq!(certificate.code(), if trust { 62 } else { 18 });
     }
 }
 

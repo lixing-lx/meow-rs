@@ -17,6 +17,7 @@ struct Mock {
     reject: bool,
     malformed_udp: bool,
     goaway: bool,
+    stall_check: bool,
 }
 #[async_trait]
 impl Connector for Mock {
@@ -26,6 +27,7 @@ impl Connector for Mock {
         let reject = self.reject;
         let malformed = self.malformed_udp;
         let goaway = self.goaway;
+        let stall_check = self.stall_check;
         tokio::spawn(async move {
             let mut server = h2::server::handshake(peer).await.unwrap();
             while let Some(Ok((request, mut response))) = server.accept().await {
@@ -35,6 +37,14 @@ impl Connector for Mock {
                     "Basic Zml4dHVyZTpzZWNyZXQ="
                 );
                 let authority = request.uri().authority().unwrap().as_str().to_owned();
+                if stall_check && authority == "_check" {
+                    tokio::spawn(async move {
+                        let _request = request;
+                        let _response = response;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
                 let status = if reject { 407 } else { 200 };
                 let reply = http::Response::builder().status(status).body(()).unwrap();
                 let mut send = response
@@ -49,8 +59,8 @@ impl Connector for Mock {
                         return;
                     }
                     if authority == "flood.test:80" {
-                        // More empty frames than the 2 MiB connection window's
-                        // framing budget permits, without any useful payload.
+                        // Exceed h2's DATA-frame flood budget (256 frames
+                        // per useful frame), without useful payload.
                         for _ in 0..8192 {
                             if send.send_data(Bytes::new(), false).is_err() {
                                 break;
@@ -59,9 +69,12 @@ impl Connector for Mock {
                         std::future::pending::<()>().await;
                     }
                     if authority == "_udp2" && malformed {
-                        send.send_data(Bytes::from_static(&[0, 1, 0, 0]), true)
+                        // 36-byte header + 65507-byte payload is the largest
+                        // legal reply. Keep the stream open: EOF must not
+                        // make a missing length guard pass this regression.
+                        send.send_data(Bytes::from_static(&[0, 1, 0, 8]), false)
                             .unwrap();
-                        return;
+                        std::future::pending::<()>().await;
                     }
                     let mut pending = Vec::new();
                     while let Some(Ok(data)) = recv.data().await {
@@ -122,6 +135,7 @@ fn setup(reject: bool, malformed_udp: bool) -> (Client, Arc<Mock>) {
         reject,
         malformed_udp,
         goaway: false,
+        stall_check: false,
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -139,6 +153,7 @@ async fn goaway_retires_new_admission_but_keeps_existing_streams_alive() {
         reject: false,
         malformed_udp: false,
         goaway: true,
+        stall_check: false,
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -271,7 +286,7 @@ async fn oversized_udp_frame_disconnects_bounded_reader() {
     assert!(
         tokio::time::timeout(Duration::from_secs(1), a.recv_from(&mut buffer))
             .await
-            .unwrap()
+            .expect("oversized header must cancel the association without waiting for EOF")
             .is_err()
     );
 }
@@ -309,6 +324,7 @@ async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
         reject: false,
         malformed_udp: false,
         goaway: true,
+        stall_check: false,
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
@@ -325,4 +341,88 @@ async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
             .expect("retired session survived network reset")
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn udp_association_limit_is_local_and_recovers_after_drop() {
+    let (client, _) = setup(false, false);
+    let mut associations = Vec::new();
+    for _ in 0..128 {
+        associations.push(
+            client
+                .udp("192.0.2.1:0".parse().unwrap(), "")
+                .await
+                .unwrap(),
+        );
+    }
+    let error = client
+        .udp("192.0.2.1:0".parse().unwrap(), "")
+        .await
+        .err()
+        .unwrap();
+    assert!(meow_common::MeowError::Io(error).is_local_resource_error());
+    associations.pop();
+    client
+        .udp("192.0.2.1:0".parse().unwrap(), "")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shared_udp_budget_drops_are_counted_and_recover() {
+    let (client, _) = setup(false, false);
+    let association = client
+        .udp("192.0.2.1:1234".parse().unwrap(), "")
+        .await
+        .unwrap();
+    let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
+    let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
+    let budget = Arc::clone(&mux.budget)
+        .try_acquire_many_owned(4 * 1024 * 1024)
+        .unwrap();
+    let target = "192.0.2.2:53".parse().unwrap();
+    association.send_to(b"drop", target).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while mux.dropped_budget.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared-budget pressure must be observable");
+    drop(budget);
+    association.send_to(b"live", target).await.unwrap();
+    let mut buffer = [0; 16];
+    let (length, source) =
+        tokio::time::timeout(Duration::from_secs(1), association.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(source, target);
+    assert_eq!(&buffer[..length], b"live");
+    assert_eq!(mux.dropped_budget.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn stalled_health_check_times_out_without_publishing_a_session() {
+    let mock = Arc::new(Mock {
+        connections: AtomicUsize::new(0),
+        reject: false,
+        malformed_udp: false,
+        goaway: false,
+        stall_check: true,
+    });
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.health_check = true;
+    options.timeout = Duration::from_millis(100);
+    let client = Client::new(mock, options).unwrap();
+    let error = client.tcp("example.test:80").await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(client.session_count(), 0);
+    let next = tokio::time::timeout(Duration::from_secs(1), client.tcp("next.test:80"))
+        .await
+        .expect("creation lock must be released after a failed check")
+        .err()
+        .unwrap();
+    assert_eq!(next.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(client.session_count(), 0);
 }

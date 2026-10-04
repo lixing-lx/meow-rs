@@ -11,6 +11,15 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, StatusCode};
+#[derive(Debug)]
+pub(crate) struct AuthenticationFailed;
+impl std::fmt::Display for AuthenticationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrustTunnel authentication failed")
+    }
+}
+impl std::error::Error for AuthenticationFailed {}
+
 use std::{
     io,
     sync::{
@@ -182,7 +191,7 @@ impl Client {
             .count()
     }
 
-    fn existing(&self, force: bool) -> io::Result<Option<Lease>> {
+    fn existing(&self) -> io::Result<Option<Lease>> {
         let mut pool = lock(&self.0.sessions);
         pool.retain(|session| {
             !session.cancel.is_cancelled() && session.reusable.load(Ordering::Acquire)
@@ -191,12 +200,10 @@ impl Client {
             let active = session.active.load(Ordering::Acquire);
             if active == 0
                 || active < self.0.options.min_streams
-                || force
                 || pool.len() >= self.0.options.max_connections
             {
                 if active >= self.0.options.max_streams {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
+                    return Err(meow_common::error::local_resource_limit(
                         "TrustTunnel stream limit reached",
                     ));
                 }
@@ -208,7 +215,7 @@ impl Client {
     }
 
     async fn session(&self, internal: bool) -> io::Result<Lease> {
-        if let Some(lease) = self.existing(false)? {
+        if let Some(lease) = self.existing()? {
             return Ok(lease);
         }
         let generation = self.0.generation.load(Ordering::Acquire);
@@ -219,7 +226,7 @@ impl Client {
                 "TrustTunnel session was reset",
             ));
         }
-        if let Some(lease) = self.existing(false)? {
+        if let Some(lease) = self.existing()? {
             return Ok(lease);
         }
         let cancel = lock(&self.0.network_cancel).child_token();
@@ -249,6 +256,20 @@ impl Client {
             session: Arc::clone(&session),
             complete: false,
         };
+        if self.0.options.health_check {
+            let check = Lease(Arc::clone(&lease.0));
+            check.0.active.fetch_add(1, Ordering::AcqRel);
+            drop(
+                tokio::time::timeout(self.0.options.timeout, self.open(check, "_check"))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TrustTunnel session health check timed out",
+                        )
+                    })??,
+            );
+        }
         // Publish under the same lock as reset: a late handshake cannot revive
         // a connection belonging to a retired network generation.
         {
@@ -261,11 +282,6 @@ impl Client {
                 ));
             }
             pool.push(session);
-        }
-        if self.0.options.health_check {
-            let check = Lease(Arc::clone(&lease.0));
-            check.0.active.fetch_add(1, Ordering::AcqRel);
-            drop(self.open(check, "_check").await?);
         }
         handshake.complete = true;
         Ok(lease)
@@ -297,7 +313,7 @@ impl Client {
                 lease.0.cancel.cancel();
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "TrustTunnel authentication failed",
+                    AuthenticationFailed,
                 ));
             }
             return Err(io::Error::other(format!(

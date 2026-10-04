@@ -122,7 +122,7 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -
     config
         .get("type")
         .and_then(serde_yaml::Value::as_str)
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("trusttunnel"))
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
 }
 
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
@@ -369,6 +369,8 @@ pub fn parse_proxy_with_dialer(
             let adapter = parse_snell(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(not(feature = "trusttunnel"))]
+        "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
         #[cfg(not(feature = "ss"))]
         "ss" => Err(feature_gated_proxy_type("ss")),
         #[cfg(not(feature = "trojan"))]
@@ -438,9 +440,13 @@ fn reject_unthreaded_dialer(
     feature = "anytls",
     feature = "hysteria2",
     feature = "vmess",
-    feature = "snell"
+    feature = "snell",
+    feature = "trusttunnel"
 )))]
 fn feature_gated_proxy_type(proxy_type: &str) -> String {
+    if proxy_type == "trusttunnel" {
+        return "proxy type 'trusttunnel' is not compiled into this build; rebuild with `--features trusttunnel` (the protocol is opt-in and excluded from full)".into();
+    }
     format!(
         "proxy type '{proxy_type}' is not compiled into this build; \
          use an official release binary or rebuild with `--features full` \
@@ -873,7 +879,7 @@ fn parse_trusttunnel(
     };
     let boolean = |key: &str, default: bool| -> std::result::Result<bool, String> {
         match config.get(key) {
-            None => Ok(default),
+            None | Some(serde_yaml::Value::Null) => Ok(default),
             Some(value) => value
                 .as_bool()
                 .ok_or_else(|| format!("trusttunnel: {key} must be boolean")),
@@ -882,6 +888,15 @@ fn parse_trusttunnel(
     if boolean("quic", false)? {
         return Err("trusttunnel: mihomo supports HTTP/3 with quic: true; this contribution only implements HTTP/2".into());
     }
+    let nonempty = |field: &str| {
+        config.get(field).is_some_and(|value| match value {
+            serde_yaml::Value::Null => false,
+            serde_yaml::Value::String(text) => !text.is_empty(),
+            serde_yaml::Value::Sequence(list) => !list.is_empty(),
+            serde_yaml::Value::Mapping(map) => !map.is_empty(),
+            _ => true,
+        })
+    };
     // These TLS declarations are not wired into this adapter. Reject
     // them before construction instead of silently weakening policy.
     for field in [
@@ -895,25 +910,24 @@ fn parse_trusttunnel(
         "ca",
         "ca-str",
     ] {
-        if config.contains_key(field) {
+        if nonempty(field) {
             return Err(format!(
-                "trusttunnel: mihomo can apply {field}; this H2 candidate rejects the option because its policy is not implemented"
+                "trusttunnel: this H2 candidate does not implement the {field} policy"
             ));
         }
     }
     for field in ["bbr-profile", "bbr-opts", "congestion-controller", "cwnd"] {
-        if config.contains_key(field) {
+        if nonempty(field) {
             return Err(format!(
-                "trusttunnel: mihomo exposes {field} for QUIC; this adapter only implements HTTP/2"
+                "trusttunnel: this H2 candidate does not implement the QUIC option {field}"
             ));
         }
     }
     let expected_alpn = "h2";
-    if let Some(alpn) = config.get("alpn") {
-        if !alpn
-            .as_sequence()
-            .is_some_and(|list| list.len() == 1 && list[0].as_str() == Some(expected_alpn))
-        {
+    if let Some(alpn) = config.get("alpn").filter(|value| !value.is_null()) {
+        if !alpn.as_sequence().is_some_and(|list| {
+            list.is_empty() || (list.len() == 1 && list[0].as_str() == Some(expected_alpn))
+        }) {
             return Err(format!(
                 "trusttunnel: selected transport requires alpn: [{expected_alpn}]"
             ));
@@ -921,7 +935,7 @@ fn parse_trusttunnel(
     }
     let text = |key: &str| -> std::result::Result<Option<&str>, String> {
         match config.get(key) {
-            None => Ok(None),
+            None | Some(serde_yaml::Value::Null) => Ok(None),
             Some(value) => value
                 .as_str()
                 .map(Some)
@@ -945,7 +959,7 @@ fn parse_trusttunnel(
     );
     let number = |key: &str, default: usize| -> std::result::Result<usize, String> {
         match config.get(key) {
-            None => Ok(default),
+            None | Some(serde_yaml::Value::Null) => Ok(default),
             Some(v) => v
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
@@ -964,9 +978,16 @@ fn parse_trusttunnel(
         // explicitly and warn rather than pretending the resource policies match.
         options.max_connections = 16;
         options.min_streams = max_streams;
-        tracing::warn!(name, "trusttunnel: mihomo's legacy pool is unbounded; meow caps it at 16 connections and 512 streams per connection");
     }
     options.max_streams = options.max_streams.max(options.min_streams);
+    if max_connections == 0 && (min_streams != 0 || max_streams != 0) {
+        tracing::warn!(
+            name,
+            max_connections = options.max_connections,
+            max_streams = options.max_streams,
+            "trusttunnel: legacy pool is unbounded upstream; using bounded pool"
+        );
+    }
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
         tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this H2 candidate currently checks only new sessions");

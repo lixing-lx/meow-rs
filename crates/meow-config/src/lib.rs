@@ -1787,9 +1787,9 @@ fn insert_parsed_leaves(
 ///   old filters forever while the committed config claims otherwise
 ///   (issue #533 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`] (no fetch —
-///   this path is sync); the committing caller installs it into the live
-///   registry and spawns the initial refresh, so `use:`/`include-all` wire a
-///   real slot instead of dangling until restart.
+///   this path is sync); the committing caller awaits
+///   [`proxy_provider::prepare_proxy_providers`] before installing the
+///   candidate routing and provider registries.
 /// - A def that fails construction is warn-skipped leniently and a hard
 ///   error under `strict` — the same gate startup's
 ///   [`proxy_provider::load_proxy_providers`] applies, so a committed

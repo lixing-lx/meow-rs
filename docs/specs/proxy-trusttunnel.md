@@ -39,14 +39,20 @@ rules:
 
 Absent or all-zero pool fields use Mihomo's 8 connections / 5 active
 streams threshold. `udp`, `quic`, `health-check` and `skip-cert-verify`
-default to false. `sni` defaults to the server. ALPN defaults to `h2`;
-an explicit incompatible list is rejected. Positive `max-connections`
+default to false. Optional YAML nulls use these defaults; null/empty
+unsupported policy declarations are inert. Nonempty unsupported policies
+still fail explicitly. `sni` defaults to the server. Null or empty ALPN
+lists default to `h2`; an explicit incompatible nonempty list is rejected. Positive `max-connections`
 takes precedence over legacy `max-streams`, matching Mihomo.
 
 An unavailable TT feature, malformed TT node, or unsupported TT policy fails
 the containing configuration even in lenient mode. Runtime rebuilds apply
 the same rule. Provider refreshes reject the complete payload and retain
 the last-good generation; fetched invalid TT nodes also reject initial load.
+New or changed runtime providers are acquired against the candidate route
+registry before DNS, routing, or raw configuration is published. Typed TT
+errors reject the entire mutation even under `force`, retaining the running
+generation. Deferred startup acquisition finishes before listeners start.
 Offline `-t` still validates provider declarations without fetching remote
 payloads, and transient fetch failures retain existing offline-bootstrap
 behavior.
@@ -62,8 +68,18 @@ behavior.
   failure retires its session. Reset invalidates in-flight pool creation.
 - Per-pool connections are capped at 16, per-session stream counts at 512,
   and UDP associations at 128. UDP send queues hold 32 frames; receive
-  queues hold 16 per association with a shared 4 MiB budget. A slow UDP
-  consumer cannot block unrelated associations.
+  queues hold 16 per association with a shared 4 MiB receive-payload budget.
+  Slow consumers can consume the shared budget and cause other associations'
+  packets to drop. Budget drops are counted and logged at powers of two.
+  The outbound queue is separate: at most 32 frames (~2 MiB at maximum
+  payload), plus one writer frame and one bounded reader frame. H2 also
+  send buffers up to 128 KiB per TCP stream (128 MiB at default pool limits,
+  up to 1 GiB at the hard limits); there is no global TCP buffer budget.
+  Explicit pool/association admission pressure is a local resource error,
+  preserving healthy group members while normal socket EAGAIN keeps its
+  existing classification.
+- UDP application-name fields are empty; actual process names are not sent.
+  The fixed HTTP User-Agent `meow/<version>` does identify the client/version.
 - ICMP and H3 are outside this first contribution candidate.
 
 ## Intentional divergences (ADR-0002)
@@ -73,9 +89,10 @@ behavior.
 | `quic: true` and QUIC tuning fields | A | Explicit configuration error; this H2-only contribution cannot apply the requested transport. |
 | Certificate pinning, client certificate/key, ECH, custom CA YAML fields, curve preferences | A | Explicit error naming the requested policy; these fields are not yet wired into this parser. |
 | ALPN containing additional protocols | A | Requires exactly `[h2]` so the adapter cannot negotiate a different transport. |
-| Mihomo's legacy unbounded pool mode | B | Warn and cap at 16 connections, 512 streams per connection; overload returns backpressure instead of unbounded resource growth. |
+| Mihomo's legacy unbounded pool mode | B | Warn with effective limits: 16 connections and `max(128, max-streams)` streams per connection (hard ceiling 512); overload returns a typed local admission error. |
 | Explicit pool limits beyond the above bounds | B | Configuration error explaining invalid pool limits; no silent clamp. |
 | `health-check: true` | B | Warn and check newly opened sessions only; Mihomo additionally checks idle sessions periodically. |
+| Official v1.1.0 UDP `::1` decoding | A | The peer interprets this wire address as `0.0.0.1`; real-peer tests use IPv6-encoded mapped loopback. Global IPv6 interoperability remains unverified. |
 | Empty or overlong credentials, username containing `:` | A | Explicit error; prevents ambiguous Basic authentication or unbounded credential headers. Credentials are never included in diagnostics. |
 
 ## Dependencies and checks
@@ -94,11 +111,16 @@ cargo test -p meow-proxy --no-default-features --features trusttunnel --test tru
 cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e
 cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
 cargo test -p meow-config --no-default-features --test trusttunnel_config_test
+cargo test -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider
 ```
 
 Tests use in-memory H2 peers and self-signed loopback TLS fixtures. The TLS
 fixtures explicitly install their generated CA and include certificate/name
-failure paths; examples retain normal certificate verification. The full
+failure paths asserting actual X509 verification results. Non-TLS/socket
+failures are separately checked not to be classified as certificate failures.
+Tests also cover process-name privacy, pool saturation without dead-marking,
+shared receive-budget drops/recovery, and a length guard independent of EOF;
+examples retain normal certificate verification. The full
 regression bar in `CONTRIBUTING.md` / `CLAUDE.md` is additionally required
 before committing or pushing a contribution.
 

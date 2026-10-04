@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
-use meow_transport::tls::{TlsConfig, TlsLayer};
+use meow_transport::{
+    tls::{ConnectTypedError, TlsConfig, TlsLayer},
+    TransportError,
+};
 pub use protocol::Options;
 use protocol::{Client, Connector, IoStream, UdpAssociation};
 use std::{
@@ -14,6 +17,28 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
+
+/// BoringSSL's certificate verification result. No peer-provided text,
+/// credentials, or transport failure is presented as a certificate error.
+#[derive(Debug)]
+pub struct CertificateVerificationError {
+    code: i32,
+}
+impl CertificateVerificationError {
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+}
+impl std::fmt::Display for CertificateVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TrustTunnel certificate verification failed (X509 code {})",
+            self.code
+        )
+    }
+}
+impl std::error::Error for CertificateVerificationError {}
 
 struct TlsConnector {
     server: String,
@@ -25,9 +50,35 @@ struct TlsConnector {
 impl Connector for TlsConnector {
     async fn connect(&self, internal: bool) -> io::Result<Box<dyn IoStream>> {
         let stream = self.dialer.dial(&self.server, self.port, internal).await?;
-        let tls = self.tls.connect_typed(stream).await.map_err(|_| {
-            io::Error::other("TrustTunnel TLS handshake or certificate verification failed")
-        })?;
+        let tls = self
+            .tls
+            .connect_typed(stream)
+            .await
+            .map_err(|error| match error {
+                ConnectTypedError::Transport(TransportError::Io(error)) => error,
+                ConnectTypedError::Handshake(error) => {
+                    let verification = error
+                        .ssl()
+                        .filter(|ssl| ssl.peer_certificate().is_some())
+                        .and_then(|ssl| ssl.verify_result().err());
+                    if let Some(verification) = verification {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            CertificateVerificationError {
+                                code: verification.as_raw(),
+                            },
+                        )
+                    } else if let Some(io) = error.as_io_error() {
+                        io.raw_os_error().map_or_else(
+                            || io::Error::new(io.kind(), "TrustTunnel TLS handshake failed"),
+                            io::Error::from_raw_os_error,
+                        )
+                    } else {
+                        io::Error::other("TrustTunnel TLS handshake failed")
+                    }
+                }
+                _ => io::Error::other("TrustTunnel TLS setup failed"),
+            })?;
         if tls.ssl().selected_alpn_protocol() != Some(b"h2".as_slice()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -86,8 +137,9 @@ impl TrustTunnelAdapter {
 }
 
 fn protocol_error(error: io::Error) -> MeowError {
-    if error.kind() == io::ErrorKind::PermissionDenied
-        && error.to_string() == "TrustTunnel authentication failed"
+    if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<protocol::AuthenticationFailed>)
     {
         MeowError::ProxyAuthFailed
     } else {
@@ -140,7 +192,7 @@ impl ProxyAdapter for TrustTunnelAdapter {
         );
         Ok(Box::new(PacketConn(
             self.client
-                .udp_with_context(source, &metadata.process, metadata.is_internal())
+                .udp_with_context(source, "", metadata.is_internal())
                 .await
                 .map_err(protocol_error)?,
         )))

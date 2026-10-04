@@ -6,7 +6,7 @@ use bytes::Bytes;
 use meow_common::{MeowError, Metadata, ProxyAdapter};
 use meow_proxy::{
     dialer::{DirectDialer, TcpDialer},
-    trusttunnel::{Options, TrustTunnelAdapter},
+    trusttunnel::{CertificateVerificationError, Options, TrustTunnelAdapter},
 };
 use meow_transport::{tls::TlsConfig, Stream};
 use std::{
@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -24,6 +24,8 @@ struct Endpoint {
     addr: SocketAddr,
     cert: Vec<u8>,
     task: tokio::task::JoinHandle<()>,
+    app_names: Arc<Mutex<Vec<Vec<u8>>>>,
+    checks: Arc<AtomicUsize>,
 }
 
 impl Drop for Endpoint {
@@ -50,9 +52,15 @@ impl Endpoint {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let app_names = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&app_names);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed_checks = Arc::clone(&checks);
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
+                let observed = Arc::clone(&observed);
+                let observed_checks = Arc::clone(&observed_checks);
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
@@ -66,7 +74,12 @@ impl Endpoint {
                             == Some(&http::HeaderValue::from_static(
                                 "Basic Zml4dHVyZTpzZWNyZXQ=",
                             ));
-                        let check = request.uri().authority().unwrap().as_str() == "_check";
+                        let authority = request.uri().authority().unwrap().as_str();
+                        let check = authority == "_check";
+                        let udp = authority == "_udp2";
+                        if check {
+                            observed_checks.fetch_add(1, Ordering::SeqCst);
+                        }
                         let reply = http::Response::builder()
                             .status(if authorized { 200 } else { 407 })
                             .body(())
@@ -79,9 +92,29 @@ impl Endpoint {
                             continue;
                         }
                         let mut recv = request.into_body();
+                        let observed = Arc::clone(&observed);
                         tokio::spawn(async move {
+                            let mut pending = Vec::new();
                             while let Some(Ok(mut data)) = recv.data().await {
                                 recv.flow_control().release_capacity(data.len()).unwrap();
+                                if udp {
+                                    pending.extend_from_slice(&data);
+                                    while pending.len() >= 4 {
+                                        let size =
+                                            u32::from_be_bytes(pending[..4].try_into().unwrap())
+                                                as usize;
+                                        if pending.len() < size + 4 {
+                                            break;
+                                        }
+                                        let app_len = pending[40] as usize;
+                                        observed
+                                            .lock()
+                                            .unwrap()
+                                            .push(pending[41..41 + app_len].to_vec());
+                                        pending.drain(..4 + size);
+                                    }
+                                    continue;
+                                }
                                 while !data.is_empty() {
                                     send.reserve_capacity(data.len());
                                     let Some(Ok(capacity)) =
@@ -107,7 +140,13 @@ impl Endpoint {
                 });
             }
         });
-        Self { addr, cert, task }
+        Self {
+            addr,
+            cert,
+            task,
+            app_names,
+            checks,
+        }
     }
 
     fn tls(&self, trust: bool, name: &str) -> TlsConfig {
@@ -167,13 +206,21 @@ async fn trusted_tls_connect_echo_and_half_close() {
 #[tokio::test]
 async fn untrusted_root_and_wrong_certificate_name_fail() {
     let endpoint = Endpoint::start(true).await;
-    for tls in [
-        endpoint.tls(false, "localhost"),
-        endpoint.tls(true, "wrong.example.test"),
+    for (tls, expected) in [
+        (endpoint.tls(false, "localhost"), 18),
+        (endpoint.tls(true, "wrong.example.test"), 62),
     ] {
         let proxy = endpoint.adapter(tls, "secret", Arc::new(DirectDialer));
         let error = proxy.dial_tcp(&destination()).await.err().unwrap();
-        assert!(error.to_string().contains("certificate"));
+        let MeowError::Io(error) = error else {
+            panic!("expected typed TLS IO failure")
+        };
+        let certificate = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CertificateVerificationError>()
+            .expect("must classify the actual certificate verification failure");
+        assert_eq!(certificate.code(), expected);
     }
 }
 
@@ -230,4 +277,178 @@ async fn internal_dials_preserve_the_usage_accounting_hint() {
     metadata.internal = false;
     let _next = proxy.dial_tcp(&metadata).await.unwrap();
     assert_eq!(observed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn socket_or_protocol_failure_is_not_a_certificate_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let proxy = TrustTunnelAdapter::new(
+        "fixture",
+        "127.0.0.1",
+        addr.port(),
+        TlsConfig::new("localhost"),
+        Options::new("fixture".into(), "secret".into()),
+        false,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+    let MeowError::Io(error) = proxy.dial_tcp(&destination()).await.err().unwrap() else {
+        panic!("expected TLS IO failure")
+    };
+    assert!(!error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<CertificateVerificationError>));
+    assert!(!error.to_string().contains("certificate"));
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_does_not_disclose_process_name() {
+    let endpoint = Endpoint::start(true).await;
+    let proxy = endpoint.adapter(
+        endpoint.tls(true, "localhost"),
+        "secret",
+        Arc::new(DirectDialer),
+    );
+    let metadata = Metadata {
+        process: "private-browser-profile".into(),
+        ..destination()
+    };
+    let udp = proxy.dial_udp(&metadata).await.unwrap();
+    udp.write_packet(b"fixture", &"192.0.2.1:53".parse().unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !endpoint.app_names.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*endpoint.app_names.lock().unwrap(), vec![Vec::<u8>::new()]);
+}
+
+#[tokio::test]
+async fn health_check_runs_on_new_session_and_is_not_repeated_on_reuse() {
+    let endpoint = Endpoint::start(true).await;
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.health_check = true;
+    let proxy = TrustTunnelAdapter::new(
+        "fixture",
+        "127.0.0.1",
+        endpoint.addr.port(),
+        endpoint.tls(true, "localhost"),
+        options,
+        false,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let mut stream = proxy.dial_tcp(&destination()).await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ok");
+    }
+    assert_eq!(endpoint.checks.load(Ordering::SeqCst), 1);
+}
+
+// Proxy groups consume Proxy, while leaf adapters expose ProxyAdapter.
+// Keep a thin fixture wrapper so this exercises the real TT admission path.
+struct GroupMember(TrustTunnelAdapter);
+#[async_trait]
+impl ProxyAdapter for GroupMember {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn addr(&self) -> &str {
+        self.0.addr()
+    }
+    fn adapter_type(&self) -> meow_common::AdapterType {
+        self.0.adapter_type()
+    }
+    fn support_udp(&self) -> bool {
+        self.0.support_udp()
+    }
+    fn health(&self) -> &meow_common::ProxyHealth {
+        self.0.health()
+    }
+    async fn dial_tcp(
+        &self,
+        metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+        self.0.dial_tcp(metadata).await
+    }
+    async fn dial_udp(
+        &self,
+        metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+        self.0.dial_udp(metadata).await
+    }
+}
+impl meow_common::Proxy for GroupMember {
+    fn alive(&self) -> bool {
+        self.health().alive()
+    }
+    fn alive_for_url(&self, _url: &str) -> bool {
+        self.alive()
+    }
+    fn last_delay(&self) -> u16 {
+        self.health().last_delay()
+    }
+    fn last_delay_for_url(&self, _url: &str) -> u16 {
+        self.last_delay()
+    }
+    fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+        self.health().delay_history()
+    }
+}
+
+#[tokio::test]
+async fn stream_pool_pressure_keeps_load_balance_member_alive() {
+    use meow_common::Proxy;
+    use meow_proxy::group::load_balance::{LbStrategy, LoadBalanceGroup};
+    let endpoint = Endpoint::start(true).await;
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    options.min_streams = 0;
+    options.max_streams = 1;
+    let adapter = TrustTunnelAdapter::new(
+        "fixture",
+        "127.0.0.1",
+        endpoint.addr.port(),
+        endpoint.tls(true, "localhost"),
+        options,
+        true,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+    let member: Arc<dyn Proxy> = Arc::new(GroupMember(adapter));
+    let group = LoadBalanceGroup::new(
+        "balanced",
+        vec![Arc::clone(&member)],
+        LbStrategy::RoundRobin,
+    );
+    let held = group.dial_tcp(&destination()).await.unwrap();
+    for _ in 0..10 {
+        let error = group.dial_tcp(&destination()).await.err().unwrap();
+        assert!(error.is_local_resource_error(), "{error}");
+        assert!(member.health().alive());
+    }
+    drop(held);
+    group
+        .dial_tcp(&destination())
+        .await
+        .expect("capacity release must restore admission without a probe");
 }

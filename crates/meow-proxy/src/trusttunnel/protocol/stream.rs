@@ -71,19 +71,20 @@ impl AsyncWrite for H2Stream {
             return Poll::Ready(Ok(0));
         }
         this.send.reserve_capacity(buf.len().min(16 * 1024));
-        if this.send.capacity() == 0 {
+        let mut capacity = this.send.capacity();
+        if capacity == 0 {
             match this.send.poll_capacity(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(0))) => {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Ok(available))) => capacity = available,
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(h2_error(error))),
                 Poll::Ready(None) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             }
         }
-        let n = this.send.capacity().min(buf.len()).min(16 * 1024);
+        let n = capacity.min(buf.len()).min(16 * 1024);
         Poll::Ready(
             this.send
                 .send_data(Bytes::copy_from_slice(&buf[..n]), false)

@@ -217,17 +217,19 @@ jobs:
         env:
           TRUSTTUNNEL_SERVER_BIN: ${{ runner.temp }}/trusttunnel/trusttunnel_endpoint
         run: |
-          cargo test -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel
-          cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration
-          cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e
-          cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
-          cargo test -p meow-config --no-default-features --test trusttunnel_config_test
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --features trusttunnel --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --no-default-features --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider --retries 2 --no-fail-fast
 
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,
-      # so every target reuses the `cargo build --tests` artifacts instead of
-      # re-unifying features (and rebuilding shared deps) per `-p`-scoped
-      # step. `cargo test -p meow-dns --lib` was folded in: `--lib` already
+      # so default targets share artifacts within this invocation instead
+      # of re-unifying features per `-p`-scoped step. The preceding opt-in
+      # TrustTunnel checks deliberately use separate feature scopes.
+      # `cargo test -p meow-dns --lib` was folded in: `--lib` already
       # runs every crate's lib tests, meow-dns included.
       - name: Unit + integration tests (default features)
         env:

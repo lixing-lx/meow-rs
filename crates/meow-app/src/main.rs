@@ -1132,6 +1132,27 @@ async fn run(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    // Resolve deferred startup providers before serving any listener.
+    // A TT parse defect is fatal; ordinary fetch failures retain offline
+    // bootstrap semantics. Never leave an invalid new provider published
+    // merely because its first download required the route map.
+    let deferred: Vec<_> = proxy_providers
+        .iter()
+        .filter(|entry| entry.take_deferred_initial())
+        .map(|entry| Arc::clone(entry.value()))
+        .collect();
+    for entry in deferred {
+        if let Err(error) = entry.acquire_initial().await {
+            if error.is::<meow_config::proxy_provider::TrustTunnelConfigError>() {
+                return Err(error.context(format!("proxy-provider '{}'", entry.name)));
+            }
+            warn!(
+                "proxy-provider '{}': deferred initial fetch failed: {error}",
+                entry.name
+            );
+        }
+    }
+
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -1182,23 +1203,6 @@ async fn run(
     let proxy_provider_refresh =
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
     proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
-
-    // Providers whose `proxy:` name could not resolve during the
-    // pre-publish initial fetch retry once now that `update_routing` has
-    // populated the provider dialer registry (issue #625).
-    for entry in proxy_providers.iter() {
-        if entry.take_deferred_initial() {
-            let provider = Arc::clone(entry.value());
-            tokio::spawn(async move {
-                if let Err(e) = provider.acquire_initial().await {
-                    warn!(
-                        "proxy-provider '{}': deferred initial fetch failed: {e}",
-                        provider.name
-                    );
-                }
-            });
-        }
-    }
 
     // Start subscription background refresh task
     {

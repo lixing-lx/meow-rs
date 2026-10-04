@@ -4889,6 +4889,92 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
     );
 }
 
+/// Initial provider acquisition must reject the candidate before replacing
+/// routing, DNS, the raw document, or a last-good provider. Exercise both
+/// new and changed declarations, including force and strict reloads.
+#[tokio::test]
+async fn put_configs_trusttunnel_provider_rejects_candidate_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let directory = tempfile::tempdir_in(
+        std::path::Path::new(state.config_path.as_deref().unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let good_path = directory.path().join("good.yaml");
+    let bad_path = directory.path().join("bad.yaml");
+    std::fs::write(
+        &good_path,
+        "proxies:\n  - {name: good, type: http, server: 127.0.0.1, port: 8080}\n",
+    )
+    .unwrap();
+    std::fs::write(&bad_path, "proxies:\n  - {name: sibling, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").unwrap();
+    let yaml = |path: &std::path::Path, strict: bool| {
+        format!("mode: rule\nstrict: {strict}\nproxy-providers:\n  p:\n    type: file\n    path: {}\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [p]\nrules: ['MATCH,PROXY']\n", path.display())
+    };
+    let put = |document: String, force: bool| {
+        create_router(Arc::clone(&state)).oneshot(Request::builder()
+            .method("PUT").uri(format!("/configs?force={force}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::json!({"payload": base64::engine::general_purpose::STANDARD.encode(document)}).to_string())).unwrap())
+    };
+    let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
+    let resolver = state.tunnel.resolver();
+    let rejected = put(yaml(&bad_path, false), false).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = rejected.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("trusttunnel"));
+    assert!(state.proxy_providers.is_empty());
+    assert_eq!(
+        serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
+        before
+    );
+    assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
+
+    let response = put(yaml(&good_path, false), false).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let previous = Arc::clone(state.proxy_providers.get("p").unwrap().value());
+    assert_eq!(
+        previous.proxies()[0].name(),
+        "good",
+        "initial fetch must finish before publication"
+    );
+    let committed = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
+    let route = state.tunnel.proxy("PROXY").unwrap();
+    let committed_resolver = state.tunnel.resolver();
+    for strict in [false, true] {
+        for force in [false, true] {
+            let response = put(yaml(&bad_path, strict), force).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "force must not swallow TT policy errors"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!String::from_utf8_lossy(&body).contains("test-only"));
+            assert!(Arc::ptr_eq(
+                state.proxy_providers.get("p").unwrap().value(),
+                &previous
+            ));
+            assert_eq!(previous.proxies()[0].name(), "good");
+            assert!(Arc::ptr_eq(&route, &state.tunnel.proxy("PROXY").unwrap()));
+            assert!(Arc::ptr_eq(&committed_resolver, &state.tunnel.resolver()));
+            assert_eq!(
+                serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
+                committed
+            );
+        }
+    }
+}
+
 /// PUT /configs commits must publish the rebuilt rule-provider map into the
 /// live registry — previously only the DNS reconcile path wrote the
 /// registry, so this PUT left `GET /providers/rules` and

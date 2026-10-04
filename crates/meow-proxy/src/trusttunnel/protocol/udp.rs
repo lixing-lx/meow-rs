@@ -5,7 +5,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -28,7 +28,8 @@ pub(crate) struct Mux {
     send: mpsc::Sender<Bytes>,
     peers: Mutex<HashMap<SocketAddr, mpsc::Sender<Packet>>>,
     next_port: AtomicU16,
-    budget: Arc<Semaphore>,
+    pub(super) budget: Arc<Semaphore>,
+    pub(super) dropped_budget: AtomicUsize,
 }
 
 impl Mux {
@@ -40,6 +41,7 @@ impl Mux {
             peers: Mutex::new(HashMap::new()),
             next_port: AtomicU16::new(1024),
             budget: Arc::new(Semaphore::new(4 * 1024 * 1024)),
+            dropped_budget: AtomicUsize::new(0),
         });
         let (mut reader, mut writer) = tokio::io::split(stream);
         let cancel = mux.cancel.clone();
@@ -82,10 +84,18 @@ impl Mux {
                     continue;
                 };
                 let size = body.len() - HEADER;
-                // A slow association drops its own UDP packets; it cannot
-                // exhaust the process or block every other association.
+                // Bound aggregate queued receive payloads. A slow consumer
+                // can consume this shared budget and cause cross-association
+                // drops; expose pressure with exponentially limited logs.
                 let Ok(budget) = Arc::clone(&mux.budget).try_acquire_many_owned(size.max(1) as u32)
                 else {
+                    let dropped = mux
+                        .dropped_budget
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
+                    if dropped.is_power_of_two() {
+                        tracing::warn!(dropped, "TrustTunnel shared UDP receive budget exhausted");
+                    }
                     continue;
                 };
                 let _ = sender.try_send(Packet {
@@ -121,8 +131,7 @@ impl Mux {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         if peers.len() >= 128 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
+            return Err(meow_common::error::local_resource_limit(
                 "TrustTunnel UDP association limit reached",
             ));
         }
@@ -226,6 +235,7 @@ fn put_address(buffer: &mut BytesMut, address: SocketAddr) {
     }
     buffer.put_u16(address.port());
 }
+// Caller passes an exact 18-byte address slice from the checked header.
 fn address(bytes: &[u8]) -> SocketAddr {
     // The public wire specification explicitly excludes IPv6 loopback
     // from the otherwise zero-padded IPv4 representation (§11.2).

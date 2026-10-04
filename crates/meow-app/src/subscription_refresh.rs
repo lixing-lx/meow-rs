@@ -283,6 +283,29 @@ pub async fn run_loop(
                                 }
                                 continue;
                             }
+                            let live_providers = proxy_providers
+                                .iter()
+                                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+                                .collect();
+                            if let Err(error) =
+                                meow_config::proxy_provider::prepare_proxy_providers(
+                                    &live_providers,
+                                    &new_proxy_providers,
+                                    &new_registry,
+                                )
+                                .await
+                            {
+                                warn!("subscription '{name}': provider validation failed; NOT committing: {error:#}");
+                                let mut live = raw_config.write();
+                                if let Some(sub) = live
+                                    .subscriptions
+                                    .as_mut()
+                                    .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                                {
+                                    sub.last_updated = Some(now);
+                                }
+                                continue;
+                            }
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
                             // references — reconcile BEFORE the raw write so

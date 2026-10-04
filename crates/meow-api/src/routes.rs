@@ -1131,7 +1131,7 @@ async fn apply_raw_to_tunnel(
         meow_config::ech_dns::check_ech_defects(ps, raw.strict.unwrap_or(false))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
     }
-    let providers = state
+    let providers: std::collections::HashMap<_, _> = state
         .proxy_providers
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
@@ -1156,7 +1156,7 @@ async fn apply_raw_to_tunnel(
     let result = rebuild_from_raw_runtime_async(
         raw.clone(),
         resolver_slot,
-        providers,
+        providers.clone(),
         cache_dir,
         state.provider_dialer_registry.clone(),
     )
@@ -1179,6 +1179,13 @@ async fn apply_raw_to_tunnel(
             format!("proxy group '{missing}' failed validation"),
         ));
     }
+    meow_config::proxy_provider::prepare_proxy_providers(
+        &providers,
+        &proxy_providers,
+        &dialer_registry,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Issue #514: a changed `dns:`/`hosts:`/`ipv6:`/`geodata:` section must
     // rebuild the resolver, not just land in the persisted config. Parse
     // against the freshly rebuilt proxy registry so circular
@@ -1266,19 +1273,21 @@ async fn commit_raw_candidate(
 /// Commit a validated candidate proxy-provider set into the live registry.
 /// Call only after the rebuild's commit point — the groups installed by the
 /// routing swap already reference these Arcs (still-declared names reuse the
-/// live objects; new declarations are fresh empty providers).
+/// live objects; new declarations have completed preflight acquisition).
 ///
 /// Insert-before-prune ordering: a concurrent `use:`/refresh lookup never
 /// observes a declared provider missing. Each committed provider adopts the
 /// candidate generation's `strict` flag so reused objects follow the new
-/// config (issue #533 review). Providers whose object is new — newly
-/// declared names, or re-declared names whose definition changed — get a
-/// detached initial fetch so `use:` groups populate without a manual
-/// refresh; acquisition failure is a runtime condition, not a config defect.
+/// config (issue #533 review). New or changed declarations were acquired
+/// before commit; typed TT configuration errors rejected that candidate,
+/// while transient fetch failures retained offline-bootstrap behavior.
 ///
 /// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the
 /// insert/prune ordering below is only meaningful when no sibling commit
-/// can interleave a registry swap.
+/// can interleave a registry swap. Callers must first await
+/// `prepare_proxy_providers` against the candidate route registry and reject
+/// failures BEFORE publishing routing or DNS. This commit never re-fetches
+/// fresh objects, keeping validation and publication on one payload.
 ///
 /// `raws` is the *candidate's* `proxy-providers:` declarations (the same
 /// map `candidate` was materialized from) and `refresh` the shared
@@ -1304,27 +1313,13 @@ pub fn commit_proxy_providers(
         // candidate builds — prune now that the committed groups hold their
         // views alive (issue #533 review).
         provider.prune_dead_derived();
-        // Fetch when the committed object is *not* the one already live —
-        // a newly declared name inserts fresh, and a re-declared name whose
-        // definition changed carries a rebuilt provider that has never
-        // fetched (issue #533 review).
-        let needs_fetch = match registry.insert(name.clone(), Arc::clone(provider)) {
-            Some(prev) => !Arc::ptr_eq(&prev, provider),
-            None => true,
-        };
-        if needs_fetch {
-            let provider = Arc::clone(provider);
-            let name = name.clone();
-            // `acquire_initial`, not `refresh`: a freshly committed
-            // provider has an empty slot, so the on-disk cache fallback
-            // (offline bootstrap) applies — refresh ticks deliberately
-            // skip it to keep the in-memory last-good set.
-            tokio::spawn(async move {
-                if let Err(e) = provider.acquire_initial().await {
-                    tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
-                }
-            });
-        } else if provider.take_deferred_initial() {
+        // Fresh/changed providers were acquired and validated against the
+        // candidate registry before the routing swap. Do not fetch again:
+        // that would reopen the validation/publication race.
+        let reused = registry
+            .insert(name.clone(), Arc::clone(provider))
+            .is_some_and(|previous| Arc::ptr_eq(&previous, provider));
+        if reused && provider.take_deferred_initial() {
             // A reused provider whose `proxy:` could not resolve before
             // this commit's map was published — the name may resolve now,
             // so retry once. `refresh`, not `acquire_initial`: the cache
@@ -2979,7 +2974,7 @@ async fn put_configs(
                 match rebuild_from_raw_runtime_async(
                     lenient.clone(),
                     resolver_slot,
-                    providers,
+                    providers.clone(),
                     cache_dir,
                     state.provider_dialer_registry.clone(),
                 )
@@ -3033,6 +3028,21 @@ async fn put_configs(
         proxy_providers,
         prefetched_payloads,
     } = result;
+
+    // Even force must not commit a provider whose TT nodes were rejected.
+    if let Err(error) = meow_config::proxy_provider::prepare_proxy_providers(
+        &providers,
+        &proxy_providers,
+        &dialer_registry,
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message": format!("{error:#}")})),
+        )
+            .into_response();
+    }
 
     // A `tun:` section the listener cannot parse must be rejected before
     // commit (issue #543): admitted unchecked, the reconcile's restart
