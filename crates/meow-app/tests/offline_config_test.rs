@@ -475,3 +475,60 @@ async fn raw_http_save(port: u16) -> std::io::Result<u16> {
         .unwrap_or(0);
     Ok(status)
 }
+
+/// A provider that needs the newly published route map must be validated
+/// before any listener becomes reachable, including when TT is disabled.
+#[tokio::test]
+async fn deferred_trusttunnel_provider_rejects_startup_before_listening() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&served);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = "proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    let port = free_port();
+    std::fs::write(&config, format!(
+        "mixed-port: {port}\nallow-lan: false\ndns: {{enable: false}}\nproxies: [{{name: front, type: direct}}]\nproxy-providers:\n  p:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\nproxy-groups: [{{name: G, type: select, use: [p]}}]\nrules: ['MATCH,G']\n"
+    )).unwrap();
+    let child = spawn_meow(
+        &["-f".into(), config.to_string_lossy().into_owned()],
+        directory.path(),
+    );
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("an invalid deferred provider must abort startup")
+        .unwrap();
+    server.abort();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("trusttunnel"),
+        "startup must fail for the provider policy: {stderr}"
+    );
+    assert!(
+        served.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "validation must actually fetch through the newly published front"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "no listener may serve an unvalidated provider"
+    );
+}

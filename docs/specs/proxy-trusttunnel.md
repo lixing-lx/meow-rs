@@ -53,6 +53,13 @@ New or changed runtime providers are acquired against the candidate route
 registry before DNS, routing, or raw configuration is published. Typed TT
 errors reject the entire mutation even under `force`, retaining the running
 generation. Deferred startup acquisition finishes before listeners start.
+The new preparation phase uses one 30-second deadline for the entire
+provider batch, including generation-lock waits, fetches and validation.
+Expiry drops pending acquisition and rejects startup/the candidate before
+publication; a reload retains the running generation. It does not add a
+per-provider retry window. Existing config-build/geodata fetches have their
+own pre-existing timeouts; this is a bound on the added preparation phase,
+not a promise that the whole daemon boot or config request ends in 30 seconds.
 Offline `-t` still validates provider declarations without fetching remote
 payloads, and transient fetch failures retain existing offline-bootstrap
 behavior.
@@ -70,19 +77,40 @@ behavior.
 - No application request or payload is automatically replayed. Authentication
   failure retires its session. Reset invalidates in-flight pool creation.
 - Per-pool connections are capped at 16, per-session stream counts at 512,
-  and UDP associations at 128. UDP send queues hold 32 frames; receive
+  and UDP associations at 128. Official v1.1.0 send payloads are limited to
+  65,434 bytes with an empty App Name; receive payloads accept 65,508 bytes
+  (36-byte header plus 65,508 = 65,544 frame bytes, excluding the length prefix).
+  These are different peer bounds, not a common IPv4 packet maximum.
+  UDP send queues hold 32 frames; receive
   queues hold 16 per association with a shared 4 MiB receive-payload budget.
   Slow consumers can consume the shared budget and cause other associations'
-  packets to drop. Budget drops are counted and logged at powers of two.
+  packets to drop. Budget and unmatched-reply drops are counted and logged
+  at powers of two; reader/writer failures are logged before mux teardown.
+  A short caller receive buffer consumes and truncates one datagram,
+  matching the existing packet-connection convention.
   The outbound queue is separate: at most 32 frames (~2 MiB at maximum
   payload), plus one writer frame and one bounded reader frame. H2 also
   send buffers up to 128 KiB per TCP stream (128 MiB at default pool limits,
   up to 1 GiB at the hard limits); there is no global TCP buffer budget.
   Explicit pool/association admission pressure is a local resource error,
   preserving healthy group members while normal socket EAGAIN keeps its
-  existing classification.
+  existing classification. Typed admission markers survive io/context/relay
+  boundaries without being classified as errno-backed: multi-candidate
+  error precedence retains its original errno-versus-context policy.
 - UDP application-name fields are empty; actual process names are not sent.
-  The fixed HTTP User-Agent `meow/<version>` does identify the client/version.
+  The fixed HTTP User-Agent `meow/<version>` identifies the client/version
+  on TCP, `_udp2` and `_check`. This differs from the public spec/Mihomo
+  per-stream OS user agents (`<os> _udp2` and `<os>` for `_check`); no
+  fingerprint parity is claimed. The outer CONNECT deadline covers pool
+  admission, TLS/H2 setup, `_check` and the requested CONNECT, with no
+  second equal-duration health-check timer.
+- Reply dispatch requires the reply Destination tuple to match the virtual
+  source assigned to its association. Official v1.1.0 echoes this tuple.
+  An endpoint that zeroes it cannot multiplex replies unambiguously; such
+  replies are counted/dropped rather than guessed or broadcast. The public
+  wire spec names the field without defining dispatch semantics, so this
+  compatibility requirement is explicit and zero-destination endpoints
+  have no interoperability claim.
 - ICMP and H3 are outside this first contribution candidate.
 
 ## Intentional divergences (ADR-0002)

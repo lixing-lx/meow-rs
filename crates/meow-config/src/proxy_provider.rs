@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 pub struct HealthCheckConfig {
@@ -1042,32 +1042,69 @@ pub async fn load_proxy_providers(
     Ok(result)
 }
 
+/// Maximum duration of the new provider-preparation phase, including locks.
+pub const PROVIDER_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Acquire new/changed providers before publishing a candidate generation.
 /// Reused objects retain their last-good slots and refresh on their normal
 /// schedule. Transient fetch failures keep the established offline-bootstrap
 /// behavior; a parsed TrustTunnel policy/transport defect rejects the whole
 /// candidate, with its typed cause intact. Call before any DNS/routing swap.
+/// The entire preparation batch, including refresh-lock waits, has one
+/// 30-second deadline. Expiry rejects the candidate rather than publishing
+/// provider contents whose validation has not finished.
 pub async fn prepare_proxy_providers(
     live: &HashMap<String, Arc<ProxyProvider>>,
     candidate: &HashMap<String, Arc<ProxyProvider>>,
     registry: &ProxyRegistry,
 ) -> anyhow::Result<()> {
-    for (name, provider) in candidate {
-        if live
-            .get(name)
-            .is_some_and(|previous| Arc::ptr_eq(previous, provider))
-        {
-            continue;
-        }
-        if let Err(error) = provider.acquire_initial_with_registry(registry).await {
-            if error.is::<TrustTunnelConfigError>() {
-                let context = format!("proxy-provider '{name}': {error}");
-                return Err(error.context(context));
+    let pending = candidate
+        .iter()
+        .filter(|(name, provider)| {
+            !live
+                .get(*name)
+                .is_some_and(|previous| Arc::ptr_eq(previous, provider))
+        })
+        .map(|(_, provider)| provider);
+    prepare_initial_providers(pending, Some(registry)).await
+}
+
+/// Finish deferred cold-start acquisition before listeners are served.
+/// This uses the same batch deadline and typed-error policy as reloads.
+pub async fn prepare_deferred_proxy_providers(
+    providers: &[Arc<ProxyProvider>],
+) -> anyhow::Result<()> {
+    prepare_initial_providers(providers.iter(), None).await
+}
+
+async fn prepare_initial_providers<'a>(
+    providers: impl Iterator<Item = &'a Arc<ProxyProvider>>,
+    registry: Option<&ProxyRegistry>,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(PROVIDER_PREPARATION_TIMEOUT, async {
+        for provider in providers {
+            let result = if let Some(registry) = registry {
+                provider.acquire_initial_with_registry(registry).await
+            } else {
+                provider.acquire_initial().await
+            };
+            if let Err(error) = result {
+                if error.is::<TrustTunnelConfigError>() {
+                    let context = format!("proxy-provider '{}': {error}", provider.name);
+                    return Err(error.context(context));
+                }
+                warn_initial_load_failure(provider, &error.to_string());
             }
-            warn_initial_load_failure(provider, &error.to_string());
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "proxy-provider preparation exceeded its {}-second deadline; candidate rejected",
+            PROVIDER_PREPARATION_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 /// Warn for an initial-load failure, distinguishing a not-yet-resolvable
@@ -2549,6 +2586,49 @@ header:
             front,
         )])));
         registry
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_preparation_deadline_bounds_generation_lock_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ProxyRegistry::default();
+        let provider = Arc::new(
+            ProxyProvider::new(
+                "p",
+                &raw_http_provider("http://127.0.0.1:9/proxies.yaml", None),
+                Some(directory.path()),
+                false,
+                false,
+                registry.clone(),
+            )
+            .unwrap(),
+        );
+        let _generation = provider.refresh_lock.lock().await;
+        let candidate = HashMap::from([("p".into(), Arc::clone(&provider))]);
+        let error = tokio::time::timeout(
+            PROVIDER_PREPARATION_TIMEOUT + Duration::from_secs(1),
+            prepare_proxy_providers(&HashMap::new(), &candidate, &registry),
+        )
+        .await
+        .expect("preparation must bound the generation-lock wait")
+        .unwrap_err();
+        assert!(error.to_string().contains("30-second deadline"));
+        assert!(provider.proxies().is_empty());
+
+        // Cold startup shares the same bounded policy, not a separate
+        // unbounded loop. A reused live provider needs no acquisition.
+        let error = tokio::time::timeout(
+            PROVIDER_PREPARATION_TIMEOUT + Duration::from_secs(1),
+            prepare_deferred_proxy_providers(&[Arc::clone(&provider)]),
+        )
+        .await
+        .expect("deferred startup must be bounded")
+        .unwrap_err();
+        assert!(error.to_string().contains("30-second deadline"));
+        prepare_proxy_providers(&candidate, &candidate, &registry)
+            .await
+            .unwrap();
+        assert!(provider.proxies().is_empty());
     }
 
     #[tokio::test]

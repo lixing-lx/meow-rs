@@ -4263,7 +4263,7 @@ mod outbound_flush_tests {
     use super::*;
     use meow_common::ProxyAdapter as _;
 
-    fn test_state() -> Arc<AppState> {
+    pub(super) fn test_state() -> Arc<AppState> {
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec![],
             vec![],
@@ -4698,5 +4698,62 @@ mod global_route_binding_tests {
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
+    }
+}
+
+#[cfg(test)]
+mod provider_preparation_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn raw_candidate_trusttunnel_provider_rejects_before_publication() {
+        let _lane = CONFIG_MUTATION.lock().await;
+        let state = super::outbound_flush_tests::test_state();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = origin.local_addr().unwrap();
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&served);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let body = "proxies:\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = meow_config::parse_raw_yaml(&format!(
+            "mode: rule\nproxy-providers:\n  review-p:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\n    path: {}\nproxy-groups: [{{name: front, type: select, proxies: [DIRECT]}}]\nrules: ['MATCH,DIRECT']\n",
+            directory.path().join("provider.yaml").display()
+        )).unwrap();
+        let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
+        let resolver = state.tunnel.resolver();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            commit_raw_candidate(&state, candidate),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.abort();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("trusttunnel"));
+        assert!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard must fetch through the candidate front"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
+            before
+        );
+        assert!(state.proxy_providers.is_empty());
+        assert!(state.tunnel.proxy("front").is_none());
+        assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
     }
 }

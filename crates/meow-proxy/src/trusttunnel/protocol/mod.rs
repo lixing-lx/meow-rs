@@ -259,16 +259,10 @@ impl Client {
         if self.0.options.health_check {
             let check = Lease(Arc::clone(&lease.0));
             check.0.active.fetch_add(1, Ordering::AcqRel);
-            drop(
-                tokio::time::timeout(self.0.options.timeout, self.open(check, "_check"))
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "TrustTunnel session health check timed out",
-                        )
-                    })??,
-            );
+            // tcp()/udp() own one deadline for pool acquisition, handshake,
+            // health check and CONNECT; a second equal-duration timer cannot
+            // expire before that outer deadline.
+            drop(self.open(check, "_check").await?);
         }
         // Publish under the same lock as reset: a late handshake cannot revive
         // a connection belonging to a retired network generation.
@@ -338,11 +332,7 @@ impl Client {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel CONNECT timed out"))?
     }
 
-    pub async fn udp(
-        &self,
-        source: std::net::SocketAddr,
-        app_name: &str,
-    ) -> io::Result<UdpAssociation> {
+    pub async fn udp(&self, source: std::net::SocketAddr) -> io::Result<UdpAssociation> {
         tokio::time::timeout(self.0.options.timeout, async {
             let lease = self.session().await?;
             let session = Arc::clone(&lease.0);
@@ -355,7 +345,7 @@ impl Client {
                 *slot = Some(Arc::clone(&mux));
                 mux
             };
-            mux.associate(source, app_name)
+            mux.associate(source)
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel UDP CONNECT timed out"))?

@@ -1141,17 +1141,7 @@ async fn run(
         .filter(|entry| entry.take_deferred_initial())
         .map(|entry| Arc::clone(entry.value()))
         .collect();
-    for entry in deferred {
-        if let Err(error) = entry.acquire_initial().await {
-            if error.is::<meow_config::proxy_provider::TrustTunnelConfigError>() {
-                return Err(error.context(format!("proxy-provider '{}'", entry.name)));
-            }
-            warn!(
-                "proxy-provider '{}': deferred initial fetch failed: {error}",
-                entry.name
-            );
-        }
-    }
+    meow_config::proxy_provider::prepare_deferred_proxy_providers(&deferred).await?;
 
     tunnel.spawn_background_tasks();
 

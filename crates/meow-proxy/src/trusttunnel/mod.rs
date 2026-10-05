@@ -191,7 +191,7 @@ impl ProxyAdapter for TrustTunnelAdapter {
             metadata.src_port,
         );
         Ok(Box::new(PacketConn(
-            self.client.udp(source, "").await.map_err(protocol_error)?,
+            self.client.udp(source).await.map_err(protocol_error)?,
         )))
     }
 }

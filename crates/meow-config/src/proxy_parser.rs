@@ -385,6 +385,13 @@ pub fn parse_proxy_with_dialer(
         "vmess" => Err(feature_gated_proxy_type("vmess")),
         #[cfg(not(feature = "snell"))]
         "snell" => Err(feature_gated_proxy_type("snell")),
+        _ if proxy_type != proxy_type.trim()
+            && proxy_type.trim().eq_ignore_ascii_case("trusttunnel") =>
+        {
+            Err(format!(
+                "trusttunnel proxy type contains surrounding whitespace: {proxy_type:?}"
+            ))
+        }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
 }

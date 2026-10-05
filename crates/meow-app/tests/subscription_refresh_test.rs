@@ -760,3 +760,68 @@ async fn refresh_without_backing_file_applies_in_memory_only() {
         "a --config-string refresh must not create ./config.yaml"
     );
 }
+
+/// A changed declaration must retain the last-good provider and routing
+/// when its deferred fetch discovers an unsupported TT policy.
+#[tokio::test]
+async fn refreshed_trusttunnel_provider_failure_keeps_the_running_generation() {
+    let provider_address = spawn_origin("proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").await;
+    let fx = fixture("proxies: []\nproxy-groups:\n  - {name: front, type: select, proxies: [DIRECT]}\n  - {name: rejected-new-group, type: select, use: [prov]}\nrules: ['MATCH,rejected-new-group']\n").await;
+    let original = Arc::clone(fx.proxy_providers.get("prov").unwrap().value());
+    let live: HashMap<_, _> = fx
+        .proxy_providers
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    let initial = meow_config::rebuild_from_raw_runtime(
+        &fx.raw_config.read(),
+        Some(&fx.tunnel.resolver_slot()),
+        &live,
+        Some(fx.dir.path()),
+        &fx.provider_dialer_registry,
+    )
+    .unwrap();
+    fx.tunnel
+        .set_dialer_registry(fx.provider_dialer_registry.clone());
+    fx.tunnel
+        .update_routing(initial.proxies, initial.rules, initial.dialer_registry);
+    let resolver = fx.tunnel.resolver();
+    // Stage a redefined provider while its live slot still holds the
+    // last-good generation. The new front only exists in the fetched
+    // subscription, so validation must use the unpublished route map.
+    let declaration = serde_yaml::from_str(&format!(
+        "type: http\nurl: http://{provider_address}/provider\nproxy: front\npath: redefined.yaml\n"
+    ))
+    .unwrap();
+    fx.raw_config
+        .write()
+        .proxy_providers
+        .as_mut()
+        .unwrap()
+        .insert("prov".into(), declaration);
+    let rules = fx.raw_config.read().rules.clone();
+    spawn_loop(&fx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if fx.raw_config.read().subscriptions.as_ref().unwrap()[0]
+                .last_updated
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the attempted refresh must finish");
+    assert!(fx.tunnel.proxy("rejected-new-group").is_none());
+    assert!(fx.tunnel.proxy("front").is_none());
+    assert_eq!(fx.raw_config.read().rules, rules);
+    assert!(fx.raw_config.read().proxy_groups.is_none());
+    assert!(Arc::ptr_eq(
+        fx.proxy_providers.get("prov").unwrap().value(),
+        &original
+    ));
+    assert_eq!(original.proxies().len(), 2);
+    assert!(Arc::ptr_eq(&resolver, &fx.tunnel.resolver()));
+}

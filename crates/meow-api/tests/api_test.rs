@@ -5789,3 +5789,105 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
 }
+
+/// A stalled preflight must close its HTTP flow and release CONFIG_MUTATION,
+/// retaining routing/DNS/raw state for the next queued update.
+#[tokio::test]
+async fn put_configs_provider_preparation_timeout_keeps_the_running_generation() {
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt as _;
+    let state = test_state(test_raw_config());
+    let directory = tempfile::tempdir_in(
+        std::path::Path::new(state.config_path.as_deref().unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::clone(&started);
+    let ended = Arc::clone(&closed);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0; 2048];
+        loop {
+            let n = stream.read(&mut buffer).await.unwrap();
+            assert!(n > 0);
+            head.extend_from_slice(&buffer[..n]);
+            if head.windows(4).any(|part| part == b"\r\n\r\n") {
+                break;
+            }
+        }
+        observed.notify_one();
+        assert_eq!(
+            stream.read(&mut buffer).await.unwrap(),
+            0,
+            "deadline cancellation must close the preflight stream"
+        );
+        ended.notify_one();
+    });
+    let yaml = format!(
+        "mode: rule\nproxy-providers:\n  pending:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\n    path: {}\nproxy-groups: [{{name: front, type: select, proxies: [DIRECT]}}]\nrules: ['MATCH,DIRECT']\n",
+        directory.path().join("pending.yaml").display()
+    );
+    let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
+    let resolver = state.tunnel.resolver();
+    let router = create_router(Arc::clone(&state));
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/configs")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "payload": base64::engine::general_purpose::STANDARD.encode(yaml)
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let pending = tokio::spawn(router.oneshot(request));
+    tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+        .await
+        .expect("preparation must reach the local origin");
+    tokio::time::pause();
+    tokio::time::advance(
+        meow_config::proxy_provider::PROVIDER_PREPARATION_TIMEOUT
+            + std::time::Duration::from_secs(1),
+    )
+    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+        .await
+        .expect("the batch must stop at its deadline")
+        .unwrap()
+        .unwrap();
+    tokio::time::resume();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("30-second deadline"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), closed.notified())
+        .await
+        .expect("cancelled preparation leaked its HTTP connection");
+    server.abort();
+    assert_eq!(
+        serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
+        before
+    );
+    assert!(state.proxy_providers.is_empty());
+    assert!(state.tunnel.proxy("front").is_none());
+    assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
+    let update = create_router(state).oneshot(
+        Request::builder()
+            .method("PATCH")
+            .uri("/configs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"mode":"direct"}"#))
+            .unwrap(),
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), update)
+        .await
+        .expect("CONFIG_MUTATION remained locked")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}

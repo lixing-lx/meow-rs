@@ -15,7 +15,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const MAX_PAYLOAD: usize = 65507;
+// v1.1.0 uses different decoder and encoder bounds. With an empty App
+// Name, its decoder accepts at most 65434 payload bytes; its encoder can
+// reply with 65508 bytes received from an IPv6 socket.
+const MAX_SEND_PAYLOAD: usize = 65434;
+const MAX_RECV_PAYLOAD: usize = 65508;
 const HEADER: usize = 36;
 struct Packet {
     data: Bytes,
@@ -30,6 +34,7 @@ pub(crate) struct Mux {
     next_port: AtomicU16,
     pub(super) budget: Arc<Semaphore>,
     pub(super) dropped_budget: AtomicUsize,
+    pub(super) dropped_unmatched: AtomicUsize,
 }
 
 impl Mux {
@@ -42,6 +47,7 @@ impl Mux {
             next_port: AtomicU16::new(1024),
             budget: Arc::new(Semaphore::new(4 * 1024 * 1024)),
             dropped_budget: AtomicUsize::new(0),
+            dropped_unmatched: AtomicUsize::new(0),
         });
         let (mut reader, mut writer) = tokio::io::split(stream);
         let cancel = mux.cancel.clone();
@@ -52,7 +58,8 @@ impl Mux {
                     break;
                 };
                 let result = tokio::select! { _ = cancel.cancelled() => break, result = writer.write_all(&frame) => result };
-                if result.is_err() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "TrustTunnel UDP writer stopped");
                     break;
                 }
             }
@@ -66,14 +73,18 @@ impl Mux {
                     _ = cancel.cancelled() => break,
                     result = async {
                         let length = reader.read_u32().await? as usize;
-                        if !(HEADER..=HEADER + MAX_PAYLOAD).contains(&length) { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid TrustTunnel UDP frame length")); }
+                        if !(HEADER..=HEADER + MAX_RECV_PAYLOAD).contains(&length) { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid TrustTunnel UDP frame length")); }
                         let mut body = vec![0; length];
                         reader.read_exact(&mut body).await?;
                         Ok::<_, io::Error>(body)
                     } => result,
                 };
-                let Ok(body) = result else {
-                    break;
+                let body = match result {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::warn!(%error, "TrustTunnel UDP reader stopped");
+                        break;
+                    }
                 };
                 let Some(mux) = weak.upgrade() else {
                     break;
@@ -81,6 +92,16 @@ impl Mux {
                 let source = address(&body[..18]);
                 let destination = address(&body[18..36]);
                 let Some(sender) = lock(&mux.peers).get(&destination).cloned() else {
+                    let dropped = mux
+                        .dropped_unmatched
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
+                    if dropped.is_power_of_two() {
+                        tracing::warn!(
+                            dropped,
+                            "TrustTunnel UDP reply has no matching association"
+                        );
+                    }
                     continue;
                 };
                 let size = body.len() - HEADER;
@@ -118,14 +139,7 @@ impl Mux {
     pub(crate) fn associate(
         self: &Arc<Self>,
         mut source: SocketAddr,
-        app: &str,
     ) -> io::Result<UdpAssociation> {
-        if app.len() > 255 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP app name exceeds 255 bytes",
-            ));
-        }
         let mut peers = lock(&self.peers);
         if self.is_closed() {
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -148,7 +162,6 @@ impl Mux {
         Ok(UdpAssociation {
             mux: Arc::clone(self),
             source,
-            app: app.to_owned(),
             receiver: AsyncMutex::new(receiver),
             cancel: self.cancel.child_token(),
         })
@@ -164,7 +177,6 @@ impl Drop for Mux {
 pub struct UdpAssociation {
     mux: Arc<Mux>,
     source: SocketAddr,
-    app: String,
     receiver: AsyncMutex<mpsc::Receiver<Packet>>,
     cancel: CancellationToken,
 }
@@ -174,10 +186,10 @@ impl UdpAssociation {
         self.source
     }
     pub async fn send_to(&self, payload: &[u8], destination: SocketAddr) -> io::Result<usize> {
-        if payload.len() > MAX_PAYLOAD {
+        if payload.len() > MAX_SEND_PAYLOAD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "UDP payload exceeds 65507 bytes",
+                "UDP payload exceeds the endpoint's 65434-byte send limit",
             ));
         }
         if self.cancel.is_cancelled() {
@@ -189,12 +201,13 @@ impl UdpAssociation {
             _ = self.cancel.cancelled() => return Err(io::ErrorKind::BrokenPipe.into()),
             result = self.mux.send.reserve() => result.map_err(|_| io::ErrorKind::BrokenPipe)?,
         };
-        let mut frame = BytesMut::with_capacity(4 + HEADER + 1 + self.app.len() + payload.len());
-        frame.put_u32((HEADER + 1 + self.app.len() + payload.len()) as u32);
+        let mut frame = BytesMut::with_capacity(4 + HEADER + 1 + payload.len());
+        frame.put_u32((HEADER + 1 + payload.len()) as u32);
         put_address(&mut frame, self.source);
         put_address(&mut frame, destination);
-        frame.put_u8(self.app.len() as u8);
-        frame.extend_from_slice(self.app.as_bytes());
+        // App Name is structurally empty, so a future call site cannot
+        // accidentally disclose the local process name.
+        frame.put_u8(0);
         frame.extend_from_slice(payload);
         permit.send(frame.freeze());
         Ok(payload.len())
@@ -205,14 +218,9 @@ impl UdpAssociation {
         let Some(packet) = packet else {
             return Err(io::ErrorKind::BrokenPipe.into());
         };
-        if packet.data.len() > buffer.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP receive buffer is too small",
-            ));
-        }
-        buffer[..packet.data.len()].copy_from_slice(&packet.data);
-        Ok((packet.data.len(), packet.source))
+        let length = packet.data.len().min(buffer.len());
+        buffer[..length].copy_from_slice(&packet.data[..length]);
+        Ok((length, packet.source))
     }
     pub fn close(&self) {
         self.cancel.cancel();

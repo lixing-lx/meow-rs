@@ -84,12 +84,11 @@ impl MeowError {
         }
     }
 
-    /// Whether an `io::Error` carries a preservable payload — a raw
-    /// errno, an explicit admission limit, or an errno-less `OutOfMemory`
-    /// allocation failure — that
+    /// Whether an `io::Error` carries a raw errno or an errno-less
+    /// `OutOfMemory` allocation failure — a concrete socket failure that
     /// classification must not lose to a later context-only error.
     pub fn io_errno_backed(e: &io::Error) -> bool {
-        e.raw_os_error().is_some() || e.kind() == io::ErrorKind::OutOfMemory || is_local_limit(e)
+        e.raw_os_error().is_some() || e.kind() == io::ErrorKind::OutOfMemory
     }
 
     /// True when the error still carries a preservable io payload (a
@@ -167,7 +166,8 @@ impl MeowError {
     /// synthesized io errors keep the historical `{context}: {e}`
     /// `Proxy` shape.
     pub fn io_with(context: &str, e: io::Error) -> Self {
-        if Self::io_errno_backed(&e) || e.kind() == io::ErrorKind::Unsupported {
+        if Self::io_errno_backed(&e) || is_local_limit(&e) || e.kind() == io::ErrorKind::Unsupported
+        {
             Self::Io(e)
         } else {
             Self::Proxy(format!("{context}: {e}"))
@@ -235,6 +235,7 @@ mod tests {
     fn explicit_admission_limit_survives_context_and_relay_hops() {
         let error = MeowError::io_with("outer", local_resource_limit("pool full"));
         assert!(error.is_local_resource_error());
+        assert!(!error.is_errno_backed());
         let nested = MeowError::RelayHopFailed {
             hop: 1,
             source: Box::new(error),
@@ -247,6 +248,42 @@ mod tests {
         assert!(
             !MeowError::Io(io::Error::from_raw_os_error(libc::EAGAIN)).is_local_resource_error()
         );
+    }
+
+    #[test]
+    fn admission_limits_keep_context_error_precedence() {
+        let limit = || MeowError::io_with("front", local_resource_limit("pool full"));
+        let timeout = || MeowError::Io(io::ErrorKind::TimedOut.into());
+        let chosen = MeowError::prefer_errno(Some(limit()), timeout()).unwrap();
+        assert!(matches!(chosen, MeowError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut));
+        let chosen = MeowError::prefer_errno(Some(timeout()), limit()).unwrap();
+        assert!(chosen.is_local_resource_error());
+        assert!(!chosen.is_errno_backed());
+
+        let chosen = MeowError::prefer_errno_io(
+            Some(local_resource_limit("pool full")),
+            io::ErrorKind::TimedOut.into(),
+        )
+        .unwrap();
+        assert_eq!(chosen.kind(), io::ErrorKind::TimedOut);
+        let chosen = MeowError::prefer_errno_io(
+            Some(io::ErrorKind::TimedOut.into()),
+            local_resource_limit("pool full"),
+        )
+        .unwrap();
+        assert!(is_local_limit(&chosen));
+        assert!(!MeowError::io_errno_backed(&chosen));
+        #[cfg(unix)]
+        {
+            let chosen = MeowError::prefer_errno(
+                Some(MeowError::Io(io::Error::from_raw_os_error(libc::EMFILE))),
+                limit(),
+            )
+            .unwrap();
+            assert!(
+                matches!(chosen, MeowError::Io(ref e) if e.raw_os_error() == Some(libc::EMFILE))
+            );
+        }
     }
 
     #[test]

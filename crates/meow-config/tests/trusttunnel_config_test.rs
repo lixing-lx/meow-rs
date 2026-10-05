@@ -16,6 +16,8 @@ fn disabled_protocol_fails_node_parsing() {
         .err()
         .unwrap();
     assert!(error.contains("trusttunnel"));
+    assert!(error.contains("not compiled into this build"));
+    assert!(error.contains("--features trusttunnel"));
 }
 
 fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
@@ -310,4 +312,18 @@ mod enabled {
             assert!(!error.contains("test-only"));
         }
     }
+}
+
+#[test]
+fn padded_trusttunnel_type_names_explain_the_whitespace_defect() {
+    let mut raw = node("");
+    raw.insert(
+        "type".into(),
+        serde_yaml::Value::String(" TrustTunnel ".into()),
+    );
+    let error = meow_config::proxy_parser::parse_proxy(&raw, false)
+        .err()
+        .unwrap();
+    assert!(error.contains("surrounding whitespace"));
+    assert!(error.contains("trusttunnel"));
 }
