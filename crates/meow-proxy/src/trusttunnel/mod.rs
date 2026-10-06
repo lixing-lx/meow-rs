@@ -14,7 +14,7 @@ pub use protocol::Options;
 use protocol::{Client, Connector, IoStream, UdpAssociation};
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
@@ -186,12 +186,10 @@ impl ProxyAdapter for TrustTunnelAdapter {
                 "TrustTunnel UDP requires a resolved destination".into(),
             ));
         }
-        let source = SocketAddr::new(
-            metadata.src_ip.unwrap_or(Ipv4Addr::UNSPECIFIED.into()),
-            metadata.src_port,
-        );
+        // No source tuple is passed down on purpose: the association mints
+        // its own, so the client's real address never reaches the endpoint.
         Ok(Box::new(PacketConn(
-            self.client.udp(source).await.map_err(protocol_error)?,
+            self.client.udp().await.map_err(protocol_error)?,
         )))
     }
 }

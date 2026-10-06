@@ -35,6 +35,7 @@ pub(crate) struct Mux {
     pub(super) budget: Arc<Semaphore>,
     pub(super) dropped_budget: AtomicUsize,
     pub(super) dropped_unmatched: AtomicUsize,
+    pub(super) dropped_oversized: AtomicUsize,
 }
 
 impl Mux {
@@ -48,6 +49,7 @@ impl Mux {
             budget: Arc::new(Semaphore::new(4 * 1024 * 1024)),
             dropped_budget: AtomicUsize::new(0),
             dropped_unmatched: AtomicUsize::new(0),
+            dropped_oversized: AtomicUsize::new(0),
         });
         let (mut reader, mut writer) = tokio::io::split(stream);
         let cancel = mux.cancel.clone();
@@ -68,15 +70,26 @@ impl Mux {
         let weak = Arc::downgrade(&mux);
         let cancel = mux.cancel.clone();
         super::spawn_scoped(async move {
+            // One reusable frame buffer for the whole mux. `split_to().freeze()`
+            // hands the payload to the consumer without a second copy, and
+            // `reserve()` reclaims the detached head once that consumer drops
+            // it — so a forwarded datagram costs no allocation at steady state
+            // (the old `vec![0; length]` + `Bytes::copy_from_slice` pair cost
+            // two per datagram, on the hot path of every UDP flow).
+            let mut frame = BytesMut::with_capacity(8 * (HEADER + 1500));
             loop {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => break,
                     result = async {
                         let length = reader.read_u32().await? as usize;
                         if !(HEADER..=HEADER + MAX_RECV_PAYLOAD).contains(&length) { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid TrustTunnel UDP frame length")); }
-                        let mut body = vec![0; length];
-                        reader.read_exact(&mut body).await?;
-                        Ok::<_, io::Error>(body)
+                        frame.clear();
+                        frame.reserve(length);
+                        // `resize` only zeroes the bytes `read_exact` is about
+                        // to overwrite; no uninitialised memory is exposed.
+                        frame.resize(length, 0);
+                        reader.read_exact(&mut frame[..]).await?;
+                        Ok::<_, io::Error>(frame.split_to(length).freeze())
                     } => result,
                 };
                 let body = match result {
@@ -120,7 +133,7 @@ impl Mux {
                     continue;
                 };
                 let _ = sender.try_send(Packet {
-                    data: Bytes::copy_from_slice(&body[HEADER..]),
+                    data: body.slice(HEADER..),
                     source,
                     _budget: budget,
                 });
@@ -136,10 +149,18 @@ impl Mux {
     pub(crate) fn is_closed(&self) -> bool {
         self.cancel.is_cancelled()
     }
-    pub(crate) fn associate(
-        self: &Arc<Self>,
-        mut source: SocketAddr,
-    ) -> io::Result<UdpAssociation> {
+    /// Open an association, minting its own wire source tuple.
+    ///
+    /// The source address in an outbound frame is echoed back by the endpoint
+    /// as the destination of each reply, and that round trip is the only use
+    /// it has: `peers` is keyed on it, nothing else reads it. So it is ours to
+    /// choose — and it must be, because putting the *client's* real address
+    /// there would hand the endpoint operator the LAN source IP and port
+    /// behind every datagram, which no part of the protocol needs in order to
+    /// route a reply. The address stays unspecified (matching the
+    /// `local_addr()` convention of the other stream-tunnelled UDP adapters);
+    /// only the port carries the per-association identity.
+    pub(crate) fn associate(self: &Arc<Self>) -> io::Result<UdpAssociation> {
         let mut peers = lock(&self.peers);
         if self.is_closed() {
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -151,6 +172,7 @@ impl Mux {
         }
         // Independent associations may share the same inbound tuple. Give
         // each one a distinct virtual source port for unambiguous dispatch.
+        let mut source = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         while source.port() == 0 || peers.contains_key(&source) {
             let port = self.next_port.fetch_add(1, Ordering::Relaxed);
             if port >= 1024 {
@@ -187,10 +209,26 @@ impl UdpAssociation {
     }
     pub async fn send_to(&self, payload: &[u8], destination: SocketAddr) -> io::Result<usize> {
         if payload.len() > MAX_SEND_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP payload exceeds the endpoint's 65434-byte send limit",
-            ));
+            // Drop it, do not fail the write. `handle_udp` evicts the NAT
+            // entry on *any* `write_packet` error, so reporting this one
+            // would let a single jumbo datagram from one application tear
+            // down the whole (client, destination) flow and force a redial
+            // for the well-behaved traffic sharing it. An endpoint that
+            // cannot carry the datagram is indistinguishable from a path
+            // that drops it, which is a thing UDP callers already handle.
+            let dropped = self
+                .mux
+                .dropped_oversized
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped,
+                    length = payload.len(),
+                    "UDP payload exceeds the endpoint's 65434-byte send limit"
+                );
+            }
+            return Ok(payload.len());
         }
         if self.cancel.is_cancelled() {
             return Err(io::ErrorKind::BrokenPipe.into());

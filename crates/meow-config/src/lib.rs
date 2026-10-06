@@ -1706,6 +1706,22 @@ fn has_unresolved_group_dependency(
     })
 }
 
+/// Bind a node that failed to parse to a permanently-dead stand-in instead of
+/// dropping it from the registry (see [`meow_proxy::UnavailableAdapter`]).
+///
+/// Used for the protocols where a *missing* member is worse than a broken one:
+/// a group that lists the name can neither quietly shift that traffic onto a
+/// sibling member nor, once no member survives, degrade to a direct dial.
+/// Rejecting the enclosing `proxies:` block or provider payload closes the
+/// same hole, but it also fires for a protocol the running binary simply does
+/// not contain — which the operator cannot repair by editing anything — and on
+/// a provider payload it hands a third party a daemon-wide kill switch.
+pub(crate) fn unavailable_placeholder(name: &str, reason: &str) -> Arc<dyn Proxy> {
+    Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+        meow_proxy::UnavailableAdapter::new(name, reason),
+    )))
+}
+
 /// Parse every `proxies:` leaf entry into `proxies`, keyed by its YAML `name:`
 /// (`proxy.name()` only as fallback — `DirectAdapter::name()` is hardcoded to
 /// "DIRECT" and would overwrite the built-in, hiding a user-named direct proxy
@@ -1721,57 +1737,65 @@ fn insert_parsed_leaves(
     strict: bool,
 ) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
-        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-            Ok(proxy) => {
-                // Prefer the YAML `name:` as the registry key. `proxy.name()`
-                // is fine for SS/Trojan/VLESS (their parsers thread the name
-                // into the adapter) but `DirectAdapter::name()` is hardcoded
-                // to "DIRECT" and would overwrite the built-in, hiding any
-                // user-named direct proxy (e.g. `name: "直连"`) from groups.
-                let key: SmolStr = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| proxy.name())
-                    .into();
-                if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
-                    if strict {
-                        return Err(anyhow::anyhow!(
-                            "proxies: '{key}' shadows a built-in adapter (strict mode)"
-                        ));
-                    }
-                    warn!(
-                        "Proxy named '{key}' shadows a built-in adapter; the \
-                         entry is dropped and the built-in stays"
-                    );
-                    continue;
-                }
-                // A repeated leaf name last-wins here — a deliberate
-                // divergence from upstream's `proxy %s is the duplicate
-                // name` hard error. Leaf duplicates are safe to keep: all
-                // leaves settle before any group captures members, so they
-                // cannot split the registry the way group duplicates did
-                // (#561). Warn so a typo doesn't silently rebind (#625).
-                if !static_proxy_names.insert(key.clone()) {
-                    warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
-                }
-                proxies.insert(key, proxy);
-            }
-            Err(e) if strict || proxy_parser::node_is_trusttunnel(raw_proxy) => {
+        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+            Ok(proxy) => proxy,
+            Err(e) if strict => {
                 let name = raw_proxy
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("<unnamed>");
-                let policy = if strict {
-                    "strict mode"
-                } else {
-                    "trusttunnel must not be skipped"
-                };
                 return Err(anyhow::anyhow!(
-                    "proxies: failed to parse '{name}' ({policy}): {e}"
+                    "proxies: failed to parse '{name}' (strict mode): {e}"
                 ));
             }
-            Err(e) => warn!("Failed to parse proxy: {}", e),
+            Err(e) if proxy_parser::node_is_trusttunnel(raw_proxy) => {
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                warn!(
+                    "proxies: '{name}' failed to parse ({e}); keeping the name bound \
+                     to an unavailable node so no dial can fall back past it"
+                );
+                unavailable_placeholder(name, &e)
+            }
+            Err(e) => {
+                warn!("Failed to parse proxy: {}", e);
+                continue;
+            }
+        };
+        // Prefer the YAML `name:` as the registry key. `proxy.name()`
+        // is fine for SS/Trojan/VLESS (their parsers thread the name
+        // into the adapter) but `DirectAdapter::name()` is hardcoded
+        // to "DIRECT" and would overwrite the built-in, hiding any
+        // user-named direct proxy (e.g. `name: "直连"`) from groups.
+        let key: SmolStr = raw_proxy
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| proxy.name())
+            .into();
+        if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "proxies: '{key}' shadows a built-in adapter (strict mode)"
+                ));
+            }
+            warn!(
+                "Proxy named '{key}' shadows a built-in adapter; the \
+                 entry is dropped and the built-in stays"
+            );
+            continue;
         }
+        // A repeated leaf name last-wins here — a deliberate
+        // divergence from upstream's `proxy %s is the duplicate
+        // name` hard error. Leaf duplicates are safe to keep: all
+        // leaves settle before any group captures members, so they
+        // cannot split the registry the way group duplicates did
+        // (#561). Warn so a typo doesn't silently rebind (#625).
+        if !static_proxy_names.insert(key.clone()) {
+            warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
+        }
+        proxies.insert(key, proxy);
     }
     Ok(())
 }
@@ -1787,9 +1811,9 @@ fn insert_parsed_leaves(
 ///   old filters forever while the committed config claims otherwise
 ///   (issue #533 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`] (no fetch —
-///   this path is sync); the committing caller awaits
-///   [`proxy_provider::prepare_proxy_providers`] before installing the
-///   candidate routing and provider registries.
+///   this path is sync); the committing caller spawns the first acquisition
+///   detached, so a slow or blackholed provider URL cannot hold the config
+///   mutation lane.
 /// - A def that fails construction is warn-skipped leniently and a hard
 ///   error under `strict` — the same gate startup's
 ///   [`proxy_provider::load_proxy_providers`] applies, so a committed

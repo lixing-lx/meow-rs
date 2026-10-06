@@ -38,31 +38,46 @@ rules:
 ```
 
 Absent or all-zero pool fields use Mihomo's 8 connections / 5 active
-streams threshold. `udp`, `quic`, `health-check` and `skip-cert-verify`
+streams threshold. Each pool field is applied independently: a positive
+`max-connections` no longer zeroes the `min-streams` default, and a positive
+`max-streams` is honoured as the per-connection ceiling rather than being
+discarded. `max-streams` alone still selects Mihomo's legacy mode (below);
+alongside either other field it is just the ceiling, and it is always raised
+to at least `min-streams` so the two cannot contradict each other. `udp`,
+`quic`, `health-check` and `skip-cert-verify`
 default to false. Optional YAML nulls use these defaults; null/empty
 unsupported policy declarations are inert. Nonempty unsupported policies
 still fail explicitly. `sni` defaults to the server. Null or empty ALPN
-lists default to `h2`; an explicit incompatible nonempty list is rejected. Positive `max-connections`
-takes precedence over legacy `max-streams`, matching Mihomo.
+lists default to `h2`; an explicit incompatible nonempty list is rejected.
 
-An unavailable TT feature, malformed TT node, or unsupported TT policy fails
-the containing configuration even in lenient mode. Runtime rebuilds apply
-the same rule. Provider refreshes reject the complete payload and retain
-the last-good generation; fetched invalid TT nodes also reject initial load.
-New or changed runtime providers are acquired against the candidate route
-registry before DNS, routing, or raw configuration is published. Typed TT
-errors reject the entire mutation even under `force`, retaining the running
-generation. Deferred startup acquisition finishes before listeners start.
-The new preparation phase uses one 30-second deadline for the entire
-provider batch, including generation-lock waits, fetches and validation.
-Expiry drops pending acquisition and rejects startup/the candidate before
-publication; a reload retains the running generation. It does not add a
-per-provider retry window. Existing config-build/geodata fetches have their
-own pre-existing timeouts; this is a bound on the added preparation phase,
-not a promise that the whole daemon boot or config request ends in 30 seconds.
-Offline `-t` still validates provider declarations without fetching remote
-payloads, and transient fetch failures retain existing offline-bootstrap
-behavior.
+An unavailable TT feature, malformed TT node, or unsupported TT policy must
+not be silently dropped: a group that lists the name would otherwise shift
+that traffic onto a sibling member, or — once no member survives — degrade
+to a direct dial, which is the plaintext leak this closes. So the name stays
+bound, to a permanently dead placeholder
+([`UnavailableAdapter`](../../crates/meow-proxy/src/unavailable.rs)) whose
+every dial fails naming the node and the reason. Runtime rebuilds and
+provider payloads apply the same rule.
+
+The damage is deliberately scoped to the node rather than the enclosing
+`proxies:` block or provider payload. Rejecting the payload closes the same
+hole, but it also fires for a protocol the running binary simply does not
+contain — every official `full` release is built without
+`--features trusttunnel`, and no edit the operator can make to their config
+repairs that — and on a third-party provider payload, refetched on a timer,
+it would hand that payload's operator a daemon-wide kill switch. This
+follows the existing `MALFORMED_DIALER_PREFIX` precedent in `meow-config`:
+the node loads, the dial fails. `strict` remains the opt-in that *does*
+reject the payload, because there the operator has asked for every defect to
+be fatal.
+
+Because no payload-level gate remains, provider acquisition keeps its
+pre-existing shape: the first fetch is spawned detached, both at startup
+(after the listeners are up) and on an API commit, where an awaited download
+would serialize every other commit behind one slow or blackholed provider
+URL inside the `CONFIG_MUTATION` lane (issue #533). Offline `-t` still
+validates provider declarations without fetching remote payloads, and
+transient fetch failures retain existing offline-bootstrap behavior.
 
 ## Runtime boundaries
 
@@ -73,11 +88,22 @@ behavior.
   This records front-group use so lazy probing remains active during reuse.
 - Authenticated CONNECT multiplexes TCP, `_check`, and `_udp2` over H2.
   TCP writes respect flow control, support half-close, and reset unfinished
-  streams on drop. A GOAWAY retires admission while successful streams drain.
+  streams on drop. A GOAWAY retires admission while successful streams drain;
+  the dial then re-elects another pooled connection or dials a fresh one, so
+  a routine server-side recycle is not a user-visible failure. That retry is
+  safe because nothing had been written — the "no automatic replay" rule
+  below covers a request that reached the peer, not one that never left.
 - No application request or payload is automatically replayed. Authentication
   failure retires its session. Reset invalidates in-flight pool creation.
 - Per-pool connections are capped at 16, per-session stream counts at 512,
-  and UDP associations at 128. Official v1.1.0 send payloads are limited to
+  and UDP associations at 128. The effective per-connection ceiling is the
+  lesser of the configured one and the peer's acknowledged
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, sampled from the connection driver:
+  h2 reports that value only on the connection handle, and `poll_ready` on a
+  fresh `SendRequest` answers `Ready` whatever the limit says, so without the
+  sample a dial onto a connection already at the peer's limit would queue a
+  pending-open stream and park until its whole deadline expired instead of
+  taking a sibling connection. Official v1.1.0 send payloads are limited to
   65,434 bytes with an empty App Name; receive payloads accept 65,508 bytes
   (36-byte header plus 65,508 = 65,544 frame bytes, excluding the length prefix).
   These are different peer bounds, not a common IPv4 packet maximum.
@@ -97,13 +123,23 @@ behavior.
   existing classification. Typed admission markers survive io/context/relay
   boundaries without being classified as errno-backed: multi-candidate
   error precedence retains its original errno-versus-context policy.
-- UDP application-name fields are empty; actual process names are not sent.
+- UDP application-name fields are empty; actual process names are not sent,
+  and neither is the client's own address: each association mints its own
+  wire source tuple (unspecified address, per-association virtual port), so
+  a LAN client's source IP and port are never disclosed to the endpoint
+  operator. The tuple's only job is reply demultiplexing, which uniqueness
+  alone satisfies.
   The fixed HTTP User-Agent `meow/<version>` identifies the client/version
   on TCP, `_udp2` and `_check`. This differs from the public spec/Mihomo
   per-stream OS user agents (`<os> _udp2` and `<os>` for `_check`); no
   fingerprint parity is claimed. The outer CONNECT deadline covers pool
   admission, TLS/H2 setup, `_check` and the requested CONNECT, with no
   second equal-duration health-check timer.
+- A send larger than the endpoint's 65,434-byte limit is counted, logged at
+  powers of two, and dropped — not reported as a write error, because
+  `handle_udp` evicts the NAT entry on any `write_packet` failure and one
+  jumbo datagram from one application must not tear down every flow sharing
+  the association.
 - Reply dispatch requires the reply Destination tuple to match the virtual
   source assigned to its association. Official v1.1.0 echoes this tuple.
   An endpoint that zeroes it cannot multiplex replies unambiguously; such
@@ -120,7 +156,7 @@ behavior.
 | `quic: true` and QUIC tuning fields | A | Explicit configuration error; this H2-only contribution cannot apply the requested transport. |
 | Certificate pinning, client certificate/key, ECH, custom CA YAML fields, curve preferences | A | Explicit error naming the requested policy; these fields are not yet wired into this parser. |
 | ALPN containing additional protocols | A | Requires exactly `[h2]` so the adapter cannot negotiate a different transport. |
-| Mihomo's legacy unbounded pool mode | B | Warn with effective limits: 16 connections and `max(128, max-streams)` streams per connection (hard ceiling 512); overload returns a typed local admission error. |
+| Mihomo's legacy unbounded pool mode (`max-streams` alone) | B | Warn with effective limits: 16 connections and `max-streams` as the spread threshold (`min-streams`), per-connection ceiling `max(128, max-streams)`, hard ceiling 512; overload returns a typed local admission error. |
 | Explicit pool limits beyond the above bounds | B | Configuration error explaining invalid pool limits; no silent clamp. |
 | `health-check: true` | B | Warn and check newly opened sessions only; Mihomo additionally checks idle sessions periodically. |
 | Official v1.1.0 UDP `::1` decoding | A | The peer interprets this wire address as `0.0.0.1`; real-peer tests use IPv6-encoded mapped loopback. Global IPv6 interoperability remains unverified. |

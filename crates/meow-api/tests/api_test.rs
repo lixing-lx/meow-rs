@@ -4889,11 +4889,13 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
     );
 }
 
-/// Initial provider acquisition must reject the candidate before replacing
-/// routing, DNS, the raw document, or a last-good provider. Exercise both
-/// new and changed declarations, including force and strict reloads.
+/// A provider payload entry this build cannot parse must not reject the
+/// candidate. The node binds a dead placeholder instead — which is what
+/// closes the fall-through-to-DIRECT hole — so one unsupported entry in a
+/// third-party feed, refetched on a timer, is not a daemon-wide kill switch
+/// in that feed operator's hands. Credentials never reach a response.
 #[tokio::test]
-async fn put_configs_trusttunnel_provider_rejects_candidate_before_commit() {
+async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecting() {
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let directory = tempfile::tempdir_in(
@@ -4902,77 +4904,54 @@ async fn put_configs_trusttunnel_provider_rejects_candidate_before_commit() {
             .unwrap(),
     )
     .unwrap();
-    let good_path = directory.path().join("good.yaml");
     let bad_path = directory.path().join("bad.yaml");
-    std::fs::write(
-        &good_path,
-        "proxies:\n  - {name: good, type: http, server: 127.0.0.1, port: 8080}\n",
-    )
-    .unwrap();
     std::fs::write(&bad_path, "proxies:\n  - {name: sibling, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").unwrap();
-    let yaml = |path: &std::path::Path, strict: bool| {
-        format!("mode: rule\nstrict: {strict}\nproxy-providers:\n  p:\n    type: file\n    path: {}\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [p]\nrules: ['MATCH,PROXY']\n", path.display())
-    };
-    let put = |document: String, force: bool| {
-        create_router(Arc::clone(&state)).oneshot(Request::builder()
-            .method("PUT").uri(format!("/configs?force={force}"))
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::json!({"payload": base64::engine::general_purpose::STANDARD.encode(document)}).to_string())).unwrap())
-    };
-    let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
-    let resolver = state.tunnel.resolver();
-    let rejected = put(yaml(&bad_path, false), false).await.unwrap();
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-    let body = rejected.into_body().collect().await.unwrap().to_bytes();
-    assert!(String::from_utf8_lossy(&body).contains("trusttunnel"));
-    assert!(state.proxy_providers.is_empty());
-    assert_eq!(
-        serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
-        before
-    );
-    assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
-
-    let response = put(yaml(&good_path, false), false).await.unwrap();
+    let document = format!("mode: rule\nproxy-providers:\n  p:\n    type: file\n    path: {}\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [p]\nrules: ['MATCH,PROXY']\n", bad_path.display());
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": base64::engine::general_purpose::STANDARD.encode(&document)})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        status,
-        StatusCode::NO_CONTENT,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    let previous = Arc::clone(state.proxy_providers.get("p").unwrap().value());
-    assert_eq!(
-        previous.proxies()[0].name(),
-        "good",
-        "initial fetch must finish before publication"
-    );
-    let committed = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
-    let route = state.tunnel.proxy("PROXY").unwrap();
-    let committed_resolver = state.tunnel.resolver();
-    for strict in [false, true] {
-        for force in [false, true] {
-            let response = put(yaml(&bad_path, strict), force).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "force must not swallow TT policy errors"
-            );
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert!(!String::from_utf8_lossy(&body).contains("test-only"));
-            assert!(Arc::ptr_eq(
-                state.proxy_providers.get("p").unwrap().value(),
-                &previous
-            ));
-            assert_eq!(previous.proxies()[0].name(), "good");
-            assert!(Arc::ptr_eq(&route, &state.tunnel.proxy("PROXY").unwrap()));
-            assert!(Arc::ptr_eq(&committed_resolver, &state.tunnel.resolver()));
-            assert_eq!(
-                serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
-                committed
-            );
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!body.contains("test-only"), "{body}");
+    assert!(state.tunnel.proxy("PROXY").is_some());
+
+    // The first acquisition is detached (an awaited download would stall the
+    // `CONFIG_MUTATION` lane), so wait for the payload to land.
+    let provider = Arc::clone(state.proxy_providers.get("p").unwrap().value());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while provider.proxies().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-    }
+    })
+    .await
+    .expect("the detached acquisition must publish the fetched payload");
+    let nodes = provider.proxies();
+    let bad = nodes
+        .iter()
+        .find(|proxy| proxy.name() == "bad")
+        .expect("the unparseable node keeps its slot");
+    assert!(!bad.alive(), "a placeholder must never look usable");
+    let error = bad
+        .dial_tcp(&meow_common::Metadata::default())
+        .await
+        .err()
+        .expect("a placeholder must fail the dial instead of leaking it direct")
+        .to_string();
+    assert!(error.contains("bad"), "{error}");
+    assert!(!error.contains("test-only"), "{error}");
 }
 
 /// PUT /configs commits must publish the rebuilt rule-provider map into the
@@ -5789,11 +5768,13 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
 }
-
-/// A stalled preflight must close its HTTP flow and release CONFIG_MUTATION,
-/// retaining routing/DNS/raw state for the next queued update.
+/// A newly declared provider whose origin never answers must not hold the
+/// `CONFIG_MUTATION` lane. The commit lands on its own, the initial fetch
+/// runs detached, and the next writer is not queued behind a blackholed
+/// subscription URL — the same rule that keeps ECH preresolution out of
+/// `apply_raw_to_tunnel` (issue #533 review).
 #[tokio::test]
-async fn put_configs_provider_preparation_timeout_keeps_the_running_generation() {
+async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
     use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     let state = test_state(test_raw_config());
@@ -5805,37 +5786,18 @@ async fn put_configs_provider_preparation_timeout_keeps_the_running_generation()
     .unwrap();
     let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = origin.local_addr().unwrap();
-    let started = Arc::new(tokio::sync::Notify::new());
-    let closed = Arc::new(tokio::sync::Notify::new());
-    let observed = Arc::clone(&started);
-    let ended = Arc::clone(&closed);
+    // Accept the request and then stall forever. An awaited fetch would
+    // pin the lane until the internal HTTP read timeout (60 s).
     let server = tokio::spawn(async move {
         let (mut stream, _) = origin.accept().await.unwrap();
-        let mut head = Vec::new();
         let mut buffer = [0; 2048];
-        loop {
-            let n = stream.read(&mut buffer).await.unwrap();
-            assert!(n > 0);
-            head.extend_from_slice(&buffer[..n]);
-            if head.windows(4).any(|part| part == b"\r\n\r\n") {
-                break;
-            }
-        }
-        observed.notify_one();
-        assert_eq!(
-            stream.read(&mut buffer).await.unwrap(),
-            0,
-            "deadline cancellation must close the preflight stream"
-        );
-        ended.notify_one();
+        let _ = stream.read(&mut buffer).await;
+        std::future::pending::<()>().await;
     });
     let yaml = format!(
         "mode: rule\nproxy-providers:\n  pending:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\n    path: {}\nproxy-groups: [{{name: front, type: select, proxies: [DIRECT]}}]\nrules: ['MATCH,DIRECT']\n",
         directory.path().join("pending.yaml").display()
     );
-    let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
-    let resolver = state.tunnel.resolver();
-    let router = create_router(Arc::clone(&state));
     let request = Request::builder()
         .method("PUT")
         .uri("/configs")
@@ -5847,37 +5809,19 @@ async fn put_configs_provider_preparation_timeout_keeps_the_running_generation()
             .to_string(),
         ))
         .unwrap();
-    let pending = tokio::spawn(router.oneshot(request));
-    tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
-        .await
-        .expect("preparation must reach the local origin");
-    tokio::time::pause();
-    tokio::time::advance(
-        meow_config::proxy_provider::PROVIDER_PREPARATION_TIMEOUT
-            + std::time::Duration::from_secs(1),
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        create_router(Arc::clone(&state)).oneshot(request),
     )
-    .await;
-    let response = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
-        .await
-        .expect("the batch must stop at its deadline")
-        .unwrap()
-        .unwrap();
-    tokio::time::resume();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert!(String::from_utf8_lossy(&body).contains("30-second deadline"));
-    tokio::time::timeout(std::time::Duration::from_secs(1), closed.notified())
-        .await
-        .expect("cancelled preparation leaked its HTTP connection");
-    server.abort();
-    assert_eq!(
-        serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
-        before
-    );
-    assert!(state.proxy_providers.is_empty());
-    assert!(state.tunnel.proxy("front").is_none());
-    assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
-    let update = create_router(state).oneshot(
+    .await
+    .expect("the commit must not wait on the provider download")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(state.proxy_providers.contains_key("pending"));
+    assert!(state.tunnel.proxy("front").is_some());
+
+    // The lane is free immediately, while that fetch is still outstanding.
+    let update = create_router(Arc::clone(&state)).oneshot(
         Request::builder()
             .method("PATCH")
             .uri("/configs")
@@ -5890,4 +5834,5 @@ async fn put_configs_provider_preparation_timeout_keeps_the_running_generation()
         .expect("CONFIG_MUTATION remained locked")
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    server.abort();
 }

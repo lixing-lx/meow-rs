@@ -1132,17 +1132,6 @@ async fn run(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
-    // Resolve deferred startup providers before serving any listener.
-    // A TT parse defect is fatal; ordinary fetch failures retain offline
-    // bootstrap semantics. Never leave an invalid new provider published
-    // merely because its first download required the route map.
-    let deferred: Vec<_> = proxy_providers
-        .iter()
-        .filter(|entry| entry.take_deferred_initial())
-        .map(|entry| Arc::clone(entry.value()))
-        .collect();
-    meow_config::proxy_provider::prepare_deferred_proxy_providers(&deferred).await?;
-
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -1193,6 +1182,29 @@ async fn run(
     let proxy_provider_refresh =
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
     proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
+
+    // Providers whose `proxy:` name could not resolve during the
+    // pre-publish initial fetch retry once now that `update_routing` has
+    // populated the provider dialer registry (issue #625).
+    //
+    // Detached, and after the listeners are up: a provider reached through
+    // a proxy front is the flakiest thing at cold start, and awaiting it
+    // here would leave the box with no listener, no DNS and no API for as
+    // long as the fetch takes — or, if it is treated as fatal, refuse to
+    // start at all over a third-party feed being down.
+    for entry in proxy_providers.iter() {
+        if entry.take_deferred_initial() {
+            let provider = Arc::clone(entry.value());
+            tokio::spawn(async move {
+                if let Err(e) = provider.acquire_initial().await {
+                    warn!(
+                        "proxy-provider '{}': deferred initial fetch failed: {e}",
+                        provider.name
+                    );
+                }
+            });
+        }
+    }
 
     // Start subscription background refresh task
     {

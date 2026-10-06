@@ -80,9 +80,24 @@ struct Inner {
 struct Session {
     sender: h2::client::SendRequest<Bytes>,
     cancel: CancellationToken,
-    reusable: Arc<AtomicBool>,
+    reusable: AtomicBool,
     active: AtomicUsize,
+    /// The peer's acknowledged `SETTINGS_MAX_CONCURRENT_STREAMS`, sampled by
+    /// the connection driver. `usize::MAX` until the peer advertises a limit,
+    /// which is also HTTP/2's own default — so a dial racing the first
+    /// SETTINGS frame is never throttled by a stale zero.
+    peer_limit: Arc<AtomicUsize>,
     udp: AsyncMutex<Option<Arc<udp::Mux>>>,
+}
+
+impl Session {
+    /// How many streams this connection may carry: our own configured
+    /// ceiling, capped by the peer's.
+    fn ceiling(&self, options: &Options) -> usize {
+        options
+            .max_streams
+            .min(self.peer_limit.load(Ordering::Relaxed))
+    }
 }
 
 impl Drop for Session {
@@ -191,31 +206,51 @@ impl Client {
             .count()
     }
 
-    fn existing(&self) -> io::Result<Option<Lease>> {
+    /// Lease a pooled session that can carry one more stream, skipping
+    /// `avoid` — the session a caller was just refused admission on.
+    ///
+    /// `Ok(None)` means "dial a new connection"; the error means the pool is
+    /// out of room on both axes at once.
+    fn existing(&self, avoid: Option<&Arc<Session>>) -> io::Result<Option<Lease>> {
         let mut pool = lock(&self.0.sessions);
         pool.retain(|session| {
             !session.cancel.is_cancelled() && session.reusable.load(Ordering::Acquire)
         });
-        if let Some(session) = pool.iter().min_by_key(|s| s.active.load(Ordering::Acquire)) {
-            let active = session.active.load(Ordering::Acquire);
-            if active == 0
-                || active < self.0.options.min_streams
-                || pool.len() >= self.0.options.max_connections
-            {
-                if active >= self.0.options.max_streams {
-                    return Err(meow_common::error::local_resource_limit(
-                        "TrustTunnel stream limit reached",
-                    ));
-                }
-                session.active.fetch_add(1, Ordering::AcqRel);
-                return Ok(Some(Lease(Arc::clone(session))));
+        // Measured over the whole pool, not the filtered candidates: a
+        // skipped or full session still occupies a connection slot.
+        let at_capacity = pool.len() >= self.0.options.max_connections;
+        let candidate = pool
+            .iter()
+            .filter(|session| !avoid.is_some_and(|busy| Arc::ptr_eq(session, busy)))
+            .filter(|session| {
+                session.active.load(Ordering::Acquire) < session.ceiling(&self.0.options)
+            })
+            .min_by_key(|session| session.active.load(Ordering::Acquire));
+        let Some(session) = candidate else {
+            // Nothing in the pool can take the stream. Below the connection
+            // cap that is routine — the caller dials another one. At the cap
+            // there is nowhere left to go, and a local-resource error says so
+            // without letting `DialFailureTracker` dead-mark a healthy node
+            // over our own pool ceiling.
+            if at_capacity {
+                return Err(meow_common::error::local_resource_limit(
+                    "TrustTunnel stream limit reached",
+                ));
             }
+            return Ok(None);
+        };
+        // Spread load until every connection carries `min_streams`, then
+        // pack — unless the pool cannot grow, where packing is all there is.
+        let active = session.active.load(Ordering::Acquire);
+        if active == 0 || active < self.0.options.min_streams || at_capacity {
+            session.active.fetch_add(1, Ordering::AcqRel);
+            return Ok(Some(Lease(Arc::clone(session))));
         }
         Ok(None)
     }
 
-    async fn session(&self) -> io::Result<Lease> {
-        if let Some(lease) = self.existing()? {
+    async fn session(&self, avoid: Option<&Arc<Session>>) -> io::Result<Lease> {
+        if let Some(lease) = self.existing(avoid)? {
             return Ok(lease);
         }
         let generation = self.0.generation.load(Ordering::Acquire);
@@ -226,11 +261,10 @@ impl Client {
                 "TrustTunnel session was reset",
             ));
         }
-        if let Some(lease) = self.existing()? {
+        if let Some(lease) = self.existing(avoid)? {
             return Ok(lease);
         }
         let cancel = lock(&self.0.network_cancel).child_token();
-        let reusable = Arc::new(AtomicBool::new(true));
         let io = self.0.connector.connect().await?;
         let (sender, connection) = h2::client::Builder::new()
             .initial_window_size(131072)
@@ -240,15 +274,34 @@ impl Client {
             .await
             .map_err(h2_error)?;
         let canceled = cancel.clone();
+        let peer_limit = Arc::new(AtomicUsize::new(usize::MAX));
+        let sampler = Arc::clone(&peer_limit);
         spawn_scoped(async move {
-            tokio::select! { _ = canceled.cancelled() => {}, _ = connection => {} }
+            // h2 exposes the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` only on
+            // the connection handle, and the handle is consumed by this task
+            // — so sample it here, after every poll, into a slot the pool can
+            // read. Without it a connection sitting at the peer's limit is
+            // indistinguishable from an idle one: `poll_ready` answers
+            // `Ready` whatever the limit says (it only tracks *this* handle's
+            // own pending stream), so `send_request` would queue the stream
+            // as pending-open and the dial would park in `response.await`
+            // until its whole deadline expired — while a sibling connection,
+            // or a new one, could have carried it immediately.
+            let mut connection = connection;
+            let driver = std::future::poll_fn(move |cx| {
+                let polled = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
+                sampler.store(connection.max_concurrent_send_streams(), Ordering::Relaxed);
+                polled
+            });
+            tokio::select! { _ = canceled.cancelled() => {}, _ = driver => {} }
             canceled.cancel();
         });
         let session = Arc::new(Session {
             sender,
             cancel,
-            reusable,
+            reusable: AtomicBool::new(true),
             active: AtomicUsize::new(1),
+            peer_limit,
             udp: AsyncMutex::new(None),
         });
         let lease = Lease(Arc::clone(&session));
@@ -261,8 +314,13 @@ impl Client {
             check.0.active.fetch_add(1, Ordering::AcqRel);
             // tcp()/udp() own one deadline for pool acquisition, handshake,
             // health check and CONNECT; a second equal-duration timer cannot
-            // expire before that outer deadline.
-            drop(self.open(check, "_check").await?);
+            // expire before that outer deadline. No retry here: this session
+            // was just handshaked, so a refusal is the connection itself
+            // failing, not the recycle `connect` covers.
+            let sender = Self::admit(&check)
+                .await
+                .ok_or_else(Self::admission_refused)?;
+            drop(self.open(sender, check, "_check").await?);
         }
         // Publish under the same lock as reset: a late handshake cannot revive
         // a connection belonging to a retired network generation.
@@ -281,7 +339,72 @@ impl Client {
         Ok(lease)
     }
 
-    async fn open(&self, lease: Lease, authority: &str) -> io::Result<TunnelStream> {
+    /// Reserve capacity for one new stream on `lease`'s connection.
+    ///
+    /// `None` means the peer refused admission — a GOAWAY, or a connection
+    /// on its way out — *before* any byte of the request was written. GOAWAY
+    /// is unobservable until this point, so `existing()` will have handed
+    /// out a session that already stopped accepting streams; the session is
+    /// retired here so the caller's retry picks a different one.
+    ///
+    /// This cannot park on stream capacity: `poll_ready` only waits on a
+    /// pending stream belonging to the same `SendRequest` handle, and each
+    /// call clones a fresh one. The peer's concurrency limit is handled
+    /// where it is observable instead — see `Session::ceiling`.
+    async fn admit(lease: &Lease) -> Option<h2::client::SendRequest<Bytes>> {
+        match lease.0.sender.clone().ready().await {
+            Ok(sender) => Some(sender),
+            Err(_) => {
+                lease.0.reusable.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    /// Error for a peer that refused admission on two successive sessions.
+    fn admission_refused() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "TrustTunnel peer refused to admit a new stream",
+        )
+    }
+
+    /// Open one CONNECT stream, retrying once when the pooled session will
+    /// not admit it.
+    ///
+    /// Retrying is safe precisely because nothing was sent: the "requests
+    /// are not replayed" rule covers a request that reached the peer, not
+    /// one that never left. Without the retry every routine server-side
+    /// connection recycle costs one user-visible dial failure — and since
+    /// the error is neither a capability nor a local-resource error, it also
+    /// feeds `DialFailureTracker` toward dead-marking a healthy member.
+    async fn connect(&self, authority: &str) -> io::Result<TunnelStream> {
+        let lease = self.session(None).await?;
+        if let Some(sender) = Self::admit(&lease).await {
+            return self.open(sender, lease, authority).await;
+        }
+        // Release the slot before re-electing, so a session that was only
+        // full is not counted as one stream busier than it is. `admit`
+        // either retired that session (`existing()` drops it) or left it
+        // pooled and full (`avoid` skips it) — so `session()` now reuses
+        // another pooled connection, dials a fresh one, or reports the
+        // stream limit. One retry, not a loop: a peer that declines twice
+        // is at its limit, not recycling.
+        let declined = Arc::clone(&lease.0);
+        drop(lease);
+        let lease = self.session(Some(&declined)).await?;
+        let sender = Self::admit(&lease)
+            .await
+            .ok_or_else(Self::admission_refused)?;
+        self.open(sender, lease, authority).await
+    }
+
+    async fn open(
+        &self,
+        mut sender: h2::client::SendRequest<Bytes>,
+        lease: Lease,
+        authority: &str,
+    ) -> io::Result<TunnelStream> {
         let uri: http::Uri = authority.parse().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid CONNECT authority")
         })?;
@@ -292,12 +415,6 @@ impl Client {
             .header("user-agent", concat!("meow/", env!("CARGO_PKG_VERSION")))
             .body(())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid CONNECT request"))?;
-        let mut sender = lease.0.sender.clone().ready().await.map_err(|error| {
-            // GOAWAY retires admission without canceling successful streams.
-            // This operation is not replayed; a later dial uses a new session.
-            lease.0.reusable.store(false, Ordering::Release);
-            h2_error(error)
-        })?;
         let end = authority == "_check";
         let (response, mut send) = sender.send_request(request, end).map_err(h2_error)?;
         let result = response.await.map_err(h2_error)?;
@@ -325,27 +442,39 @@ impl Client {
                 "invalid TCP destination",
             ));
         }
-        tokio::time::timeout(self.0.options.timeout, async {
-            self.open(self.session().await?, authority).await
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel CONNECT timed out"))?
+        tokio::time::timeout(self.0.options.timeout, self.connect(authority))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel CONNECT timed out"))?
     }
 
-    pub async fn udp(&self, source: std::net::SocketAddr) -> io::Result<UdpAssociation> {
+    pub async fn udp(&self) -> io::Result<UdpAssociation> {
         tokio::time::timeout(self.0.options.timeout, async {
-            let lease = self.session().await?;
-            let session = Arc::clone(&lease.0);
-            let mut slot = session.udp.lock().await;
-            let mux = if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
-                Arc::clone(mux)
-            } else {
-                let stream = self.open(lease, "_udp2").await?;
+            // The same single retry `connect` does, inlined because the
+            // `_udp2` mux is cached on the very session this lease names —
+            // `connect` could hand back a stream on a different one.
+            let mut declined: Option<Arc<Session>> = None;
+            for attempt in 0..2 {
+                let lease = self.session(declined.as_ref()).await?;
+                let session = Arc::clone(&lease.0);
+                let mut slot = session.udp.lock().await;
+                if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
+                    return mux.associate();
+                }
+                let Some(sender) = Self::admit(&lease).await else {
+                    drop(slot);
+                    drop(lease);
+                    if attempt == 0 {
+                        declined = Some(session);
+                        continue;
+                    }
+                    break;
+                };
+                let stream = self.open(sender, lease, "_udp2").await?;
                 let mux = udp::Mux::new(stream, &session.cancel);
                 *slot = Some(Arc::clone(&mux));
-                mux
-            };
-            mux.associate(source)
+                return mux.associate();
+            }
+            Err(Self::admission_refused())
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel UDP CONNECT timed out"))?

@@ -115,8 +115,9 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
-/// TT errors must reject the containing config/provider even in lenient
-/// mode. Dropping the requested transport can make a group select DIRECT.
+/// A TT node that fails to parse must stay *bound* even in lenient mode —
+/// to a dead placeholder, never dropped. Dropping the requested transport
+/// can make a group select DIRECT, i.e. send the flow out in plaintext.
 /// This check deliberately remains available when the feature is disabled.
 pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -> bool {
     config
@@ -385,11 +386,17 @@ pub fn parse_proxy_with_dialer(
         "vmess" => Err(feature_gated_proxy_type("vmess")),
         #[cfg(not(feature = "snell"))]
         "snell" => Err(feature_gated_proxy_type("snell")),
-        _ if proxy_type != proxy_type.trim()
+        // `node_is_trusttunnel` trims and ignores case; this dispatch is
+        // exact, like mihomo's. Without this arm a ` trusttunnel ` or
+        // `TrustTunnel` node reports a generic "unsupported proxy type"
+        // while still being *treated* as a TT node by that gate — name the
+        // actual defect instead of leaving two strings to diff by eye.
+        _ if proxy_type != "trusttunnel"
             && proxy_type.trim().eq_ignore_ascii_case("trusttunnel") =>
         {
             Err(format!(
-                "trusttunnel proxy type contains surrounding whitespace: {proxy_type:?}"
+                "proxy type {proxy_type:?} must be spelled exactly \"trusttunnel\" \
+                 — lowercase, with no surrounding whitespace"
             ))
         }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
@@ -976,25 +983,40 @@ fn parse_trusttunnel(
     let max_connections = number("max-connections", 0)?;
     let min_streams = number("min-streams", 0)?;
     let max_streams = number("max-streams", 0)?;
+    // Each field is independently optional: an absent or zero one keeps its
+    // `Options::new` default (8 connections / 5 active streams / 128 hard
+    // per-session ceiling) instead of zeroing it. A `min_streams` of 0 means
+    // "only ever reuse a fully idle session", i.e. one physical TLS + H2
+    // handshake per concurrent dial — so writing a field explicitly must
+    // never perform worse than leaving it out.
     if max_connections != 0 {
-        // Mihomo prioritizes max-connections/min-streams over legacy max-streams.
         options.max_connections = max_connections;
+    }
+    if min_streams != 0 {
         options.min_streams = min_streams;
-    } else if min_streams != 0 || max_streams != 0 {
-        // Mihomo's legacy mode grows without a connection cap. Bound this mode
-        // explicitly and warn rather than pretending the resource policies match.
-        options.max_connections = 16;
-        options.min_streams = max_streams;
+    }
+    if max_streams != 0 {
+        if max_connections == 0 && min_streams == 0 {
+            // Mihomo's legacy mode: `max-streams` is the count past which it
+            // opens another connection, and the pool then grows without a
+            // cap. Map it onto the reuse threshold and bound the pool
+            // explicitly, warning rather than pretending the policies match.
+            options.max_connections = 16;
+            options.min_streams = max_streams;
+            tracing::warn!(
+                name,
+                max_connections = options.max_connections,
+                min_streams = options.min_streams,
+                "trusttunnel: legacy pool is unbounded upstream; using bounded pool"
+            );
+        } else {
+            // Beside the modern fields there is no upstream meaning to
+            // mirror, so honor it as this client's hard per-session ceiling
+            // rather than dropping it on the floor.
+            options.max_streams = max_streams;
+        }
     }
     options.max_streams = options.max_streams.max(options.min_streams);
-    if max_connections == 0 && (min_streams != 0 || max_streams != 0) {
-        tracing::warn!(
-            name,
-            max_connections = options.max_connections,
-            max_streams = options.max_streams,
-            "trusttunnel: legacy pool is unbounded upstream; using bounded pool"
-        );
-    }
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
         tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this H2 candidate currently checks only new sessions");

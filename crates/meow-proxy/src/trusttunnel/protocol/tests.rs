@@ -22,6 +22,7 @@ struct Mock {
     check_started: Arc<tokio::sync::Notify>,
     maximum_udp_reply: bool,
     zero_udp_destination: bool,
+    peer_stream_limit: Option<u32>,
 }
 #[async_trait]
 impl Connector for Mock {
@@ -35,8 +36,13 @@ impl Connector for Mock {
         let check_started = Arc::clone(&self.check_started);
         let maximum_udp_reply = self.maximum_udp_reply;
         let zero_udp_destination = self.zero_udp_destination;
+        let peer_stream_limit = self.peer_stream_limit;
         tokio::spawn(async move {
-            let mut server = h2::server::handshake(peer).await.unwrap();
+            let mut builder = h2::server::Builder::new();
+            if let Some(limit) = peer_stream_limit {
+                builder.max_concurrent_streams(limit);
+            }
+            let mut server = builder.handshake(peer).await.unwrap();
             while let Some(Ok((request, mut response))) = server.accept().await {
                 assert_eq!(request.method(), http::Method::CONNECT);
                 assert_eq!(
@@ -64,6 +70,14 @@ impl Connector for Mock {
                 }
                 tokio::spawn(async move {
                     if reject || authority == "_check" {
+                        return;
+                    }
+                    if authority == "hold.test:443" {
+                        // Hold the peer's stream slot for the whole test:
+                        // dropping either half would reset the stream and
+                        // hand the slot back.
+                        let _held = (recv, send);
+                        std::future::pending::<()>().await;
                         return;
                     }
                     if authority == "flood.test:80" {
@@ -170,8 +184,15 @@ fn setup(reject: bool, malformed_udp: bool) -> (Client, Arc<Mock>) {
     )
 }
 
+/// A server-side connection recycle must cost nothing user-visible. The
+/// GOAWAY'd connection stops admitting streams, the dial transparently lands
+/// on a fresh one, and the draining stream finishes its work.
+///
+/// Reading the `live` echo first is the barrier that makes this
+/// deterministic: the mock queues the GOAWAY frame before the echo task's
+/// DATA, so a client that has read the echo has already processed the GOAWAY.
 #[tokio::test]
-async fn goaway_retires_new_admission_but_keeps_existing_streams_alive() {
+async fn goaway_recycle_moves_the_dial_to_a_fresh_connection() {
     let mock = Arc::new(Mock {
         connections: AtomicUsize::new(0),
         reject: false,
@@ -189,11 +210,20 @@ async fn goaway_retires_new_admission_but_keeps_existing_streams_alive() {
     let mut bytes = [0; 4];
     stream.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"live");
-    assert!(client.tcp("new.test:80").await.is_err());
+    // Nothing had been written when admission was refused, so re-electing a
+    // session is not a request replay — and without it every routine recycle
+    // would surface as a dial failure that also feeds `DialFailureTracker`
+    // toward dead-marking a healthy member.
+    let _next = client
+        .tcp("new.test:80")
+        .await
+        .expect("a recycle must not be a user-visible dial failure");
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
     stream.write_all(b"safe").await.unwrap();
     stream.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"safe");
-    let _next = client.tcp("new.test:80").await.unwrap();
+    // The second dial reuses the fresh connection rather than growing again.
+    let _reused = client.tcp("new.test:80").await.unwrap();
     assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
 }
 
@@ -228,8 +258,8 @@ async fn tcp_large_transfer_half_close_reuse_and_stream_drop_isolation() {
 #[tokio::test]
 async fn udp_multiplex_ipv4_ipv6_empty_max_payload_and_duplicate_source() {
     let (client, mock) = setup(false, false);
-    let a = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
-    let b = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let a = client.udp().await.unwrap();
+    let b = client.udp().await.unwrap();
     assert_ne!(a.local_addr(), b.local_addr());
     let destinations: [SocketAddr; 3] = [
         "127.0.0.1:53".parse().unwrap(),
@@ -272,7 +302,7 @@ async fn authentication_failure_retires_session_without_replaying() {
 #[tokio::test]
 async fn reset_closes_pending_reads_and_next_dial_creates_new_session() {
     let (client, mock) = setup(false, false);
-    let a = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let a = client.udp().await.unwrap();
     let mut tcp = client.tcp("example.test:80").await.unwrap();
     client.reset();
     let mut buffer = [0; 64];
@@ -299,8 +329,8 @@ async fn maximum_legal_udp_reply_keeps_other_associations_alive() {
         ..Mock::default()
     });
     let client = Client::new(mock, Options::new("fixture".into(), "secret".into())).unwrap();
-    let a = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
-    let b = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let a = client.udp().await.unwrap();
+    let b = client.udp().await.unwrap();
     let target = "[2001:db8::1]:53".parse().unwrap();
     a.send_to(b"maximum reply", target).await.unwrap();
     let mut buffer = vec![0; 65508];
@@ -322,18 +352,23 @@ async fn maximum_legal_udp_reply_keeps_other_associations_alive() {
 }
 
 #[tokio::test]
-async fn oversized_udp_send_is_rejected_before_queueing() {
+async fn oversized_udp_send_is_dropped_without_failing_the_flow() {
     let (client, _) = setup(false, false);
-    let association = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let association = client.udp().await.unwrap();
+    let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
+    let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
     let target = "192.0.2.2:53".parse().unwrap();
     for length in [65435, 65507, 65508] {
-        let error = association
+        // Reported as sent, on purpose: `handle_udp` tears the NAT entry
+        // down on any `write_packet` error, so one jumbo datagram must not
+        // cost every other flow sharing the association.
+        let sent = association
             .send_to(&vec![42; length], target)
             .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("65434"));
+            .expect("an undersizable datagram must not fail the association");
+        assert_eq!(sent, length);
     }
+    assert_eq!(mux.dropped_oversized.load(Ordering::Relaxed), 3);
     association.send_to(b"valid", target).await.unwrap();
     let mut buffer = [0; 16];
     let (length, _) =
@@ -344,14 +379,14 @@ async fn oversized_udp_send_is_rejected_before_queueing() {
     assert_eq!(
         &buffer[..length],
         b"valid",
-        "rejected payload must never enter the send queue"
+        "dropped payload must never enter the send queue"
     );
 }
 
 #[tokio::test]
 async fn short_udp_buffers_truncate_and_consume_the_whole_datagram() {
     let (client, _) = setup(false, false);
-    let association = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let association = client.udp().await.unwrap();
     let target = "192.0.2.2:53".parse().unwrap();
     association.send_to(b"abcdefgh", target).await.unwrap();
     let mut buffer = [0; 3];
@@ -372,7 +407,7 @@ async fn unmatched_udp_reply_is_counted_without_guessing_an_association() {
         ..Mock::default()
     });
     let client = Client::new(mock, Options::new("fixture".into(), "secret".into())).unwrap();
-    let association = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let association = client.udp().await.unwrap();
     let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
     let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
     let target = "192.0.2.2:53".parse().unwrap();
@@ -399,7 +434,7 @@ async fn unmatched_udp_reply_is_counted_without_guessing_an_association() {
 #[tokio::test]
 async fn oversized_udp_frame_disconnects_bounded_reader() {
     let (client, _) = setup(false, true);
-    let a = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let a = client.udp().await.unwrap();
     let mut buffer = [0; 64];
     assert!(
         tokio::time::timeout(Duration::from_secs(1), a.recv_from(&mut buffer))
@@ -452,7 +487,7 @@ async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
     let mut stream = client.tcp("drain.test:443").await.unwrap();
     stream.write_all(b"live").await.unwrap();
     stream.read_exact(&mut [0; 4]).await.unwrap();
-    assert!(client.tcp("retire.test:80").await.is_err());
+    let _retired = client.tcp("retire.test:80").await.unwrap();
     let _new = client.tcp("new.test:80").await.unwrap();
     client.reset();
     assert!(
@@ -468,22 +503,18 @@ async fn udp_association_limit_is_local_and_recovers_after_drop() {
     let (client, _) = setup(false, false);
     let mut associations = Vec::new();
     for _ in 0..128 {
-        associations.push(client.udp("192.0.2.1:0".parse().unwrap()).await.unwrap());
+        associations.push(client.udp().await.unwrap());
     }
-    let error = client
-        .udp("192.0.2.1:0".parse().unwrap())
-        .await
-        .err()
-        .unwrap();
+    let error = client.udp().await.err().unwrap();
     assert!(meow_common::MeowError::Io(error).is_local_resource_error());
     associations.pop();
-    client.udp("192.0.2.1:0".parse().unwrap()).await.unwrap();
+    client.udp().await.unwrap();
 }
 
 #[tokio::test]
 async fn shared_udp_budget_drops_are_counted_and_recover() {
     let (client, _) = setup(false, false);
-    let association = client.udp("192.0.2.1:1234".parse().unwrap()).await.unwrap();
+    let association = client.udp().await.unwrap();
     let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
     let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
     let budget = Arc::clone(&mux.budget)
@@ -564,14 +595,66 @@ async fn stalled_udp_health_check_uses_the_outer_connect_deadline() {
     options.timeout = Duration::from_millis(100);
     let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
     for _ in 0..2 {
-        let error = client
-            .udp("192.0.2.1:1234".parse().unwrap())
-            .await
-            .err()
-            .unwrap();
+        let error = client.udp().await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "TrustTunnel UDP CONNECT timed out");
         assert_eq!(client.session_count(), 0);
     }
     assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
+}
+
+/// A connection sitting at the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` is
+/// indistinguishable from an idle one in our own accounting, so admission is
+/// where the limit shows up. Parking there would spend the caller's entire
+/// dial deadline on a connection that cannot serve it while a sibling could:
+/// the dial has to move on instead.
+#[tokio::test]
+async fn peer_stream_limit_moves_the_dial_to_another_connection() {
+    let mock = Arc::new(Mock {
+        peer_stream_limit: Some(1),
+        check_started: Arc::new(tokio::sync::Notify::new()),
+        ..Mock::default()
+    });
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 2;
+    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    // Occupy the peer's only stream slot and never release it.
+    let _held = client.tcp("hold.test:443").await.unwrap();
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), client.tcp("next.test:80"))
+        .await
+        .expect("a full connection must not burn the whole dial deadline")
+        .expect("a sibling connection must carry the dial");
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
+    stream.write_all(b"second").await.unwrap();
+    let mut bytes = [0; 6];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"second");
+}
+
+/// Same situation at the connection cap: there is nowhere left to go, and
+/// saying so beats a timeout. The distinction matters because
+/// `DialFailureTracker` dead-marks a member on an ordinary dial error but
+/// not on a local-resource one — a local pool ceiling is not the node being
+/// broken.
+#[tokio::test]
+async fn peer_stream_limit_at_the_connection_cap_is_a_local_resource_error() {
+    let mock = Arc::new(Mock {
+        peer_stream_limit: Some(1),
+        check_started: Arc::new(tokio::sync::Notify::new()),
+        ..Mock::default()
+    });
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let _held = client.tcp("hold.test:443").await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(3), client.tcp("next.test:80"))
+        .await
+        .expect("the dial must give up long before its own deadline")
+        .err()
+        .unwrap();
+    assert!(
+        meow_common::MeowError::Io(error).is_local_resource_error(),
+        "a pool ceiling must not dead-mark the node"
+    );
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 1);
 }

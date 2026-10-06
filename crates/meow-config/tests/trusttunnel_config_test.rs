@@ -22,8 +22,25 @@ fn disabled_protocol_fails_node_parsing() {
 
 fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
     // Enabled H2 builds must reject an H3 request; disabled builds must
-    // reject the protocol itself. Both must fail the containing config.
+    // reject the protocol itself. Either way the name has to stay bound to
+    // something that cannot dial, rather than disappearing.
     node("quic: true\n")
+}
+
+/// Every assertion below is the same contract: the node's own slot survives
+/// as a permanently dead entry, so a group listing it can neither shift the
+/// traffic to a sibling nor fall through to a direct dial, and the dial error
+/// names the node without quoting its credentials.
+async fn assert_unavailable(proxy: &std::sync::Arc<dyn meow_common::Proxy>) {
+    assert!(!proxy.alive(), "a placeholder must never look usable");
+    let error = proxy
+        .dial_tcp(&meow_common::Metadata::default())
+        .await
+        .err()
+        .expect("a placeholder must fail the dial, not leak it direct")
+        .to_string();
+    assert!(error.contains(proxy.name()), "{error}");
+    assert!(!error.contains("test-only"), "{error}");
 }
 
 #[cfg(feature = "trusttunnel")]
@@ -35,39 +52,62 @@ fn optional_null_and_empty_policy_fields_use_defaults() {
 }
 
 #[tokio::test]
-async fn initial_acquisition_retains_typed_trusttunnel_error() {
-    use meow_config::proxy_provider::{ProxyProvider, TrustTunnelConfigError};
+async fn initial_acquisition_binds_an_unavailable_node_instead_of_rejecting_the_feed() {
+    use meow_config::proxy_provider::ProxyProvider;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("bad.yaml");
     std::fs::write(&path, provider_document()).unwrap();
-    for strict in [false, true] {
-        let provider = ProxyProvider::new(
-            "p",
-            &file_provider(&path),
-            Some(directory.path()),
-            false,
-            strict,
-            Default::default(),
-        )
-        .unwrap();
-        let error = provider
-            .acquire_initial()
-            .await
-            .expect_err("invalid TT must fail acquisition");
-        assert!(error.is::<TrustTunnelConfigError>(), "{error:#}");
-        assert!(provider.proxies().is_empty());
-    }
+    let provider = ProxyProvider::new(
+        "p",
+        &file_provider(&path),
+        Some(directory.path()),
+        false,
+        false,
+        Default::default(),
+    )
+    .unwrap();
+    provider
+        .acquire_initial()
+        .await
+        .expect("one unusable node must not empty a third-party feed");
+    let proxies = provider.proxies();
+    assert_eq!(proxies.len(), 2, "the slot entry has to survive");
+    let bad = proxies
+        .iter()
+        .find(|proxy| proxy.name() == "fixture")
+        .expect("the TT name stays addressable");
+    assert_unavailable(bad).await;
+
+    // Strict mode is the opt-in that *does* reject the payload: there the
+    // operator has asked for every defect to be fatal.
+    let strict = ProxyProvider::new(
+        "p-strict",
+        &file_provider(&path),
+        Some(directory.path()),
+        false,
+        true,
+        Default::default(),
+    )
+    .unwrap();
+    let error = strict
+        .acquire_initial()
+        .await
+        .expect_err("strict mode must still reject an unparseable node");
+    assert!(error.to_string().contains("strict mode"), "{error:#}");
 }
 
 #[tokio::test]
-async fn whitespace_type_cannot_bypass_fail_closed_gate() {
+async fn whitespace_type_still_lands_on_the_fail_closed_path() {
     let mut config = unsupported_node();
     config.insert("type".into(), "trusttunnel ".into());
     let raw = meow_config::raw::RawConfig {
         proxies: Some(vec![config]),
         ..Default::default()
     };
-    assert!(meow_config::rebuild_from_raw(&raw).is_err());
+    // A padded type name is treated as TT by the gate, so it must get the
+    // same dead placeholder rather than silently vanishing from `proxies:`.
+    let rebuilt = meow_config::rebuild_from_raw(&raw).unwrap();
+    assert_unavailable(&rebuilt.proxies["fixture"]).await;
 }
 
 fn provider_document() -> String {
@@ -101,27 +141,29 @@ fn file_provider(path: &std::path::Path) -> meow_config::raw::RawProxyProvider {
 }
 
 #[tokio::test]
-async fn unsupported_node_rejects_load_and_rebuild_even_in_lenient_mode() {
+async fn unsupported_node_stays_bound_so_its_group_cannot_select_direct() {
     let document = format!(
         "{}proxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [fixture, DIRECT]\nrules: ['MATCH,PROXY']\n",
         serde_yaml::to_string(&HashMap::from([("proxies", vec![unsupported_node()])])).unwrap()
     );
-    let error = meow_config::load_config_from_str(&document)
+    // The hole this closes is the group falling back to DIRECT — which
+    // needs the name bound to a dead node, not the whole file rejected.
+    // Rejecting the file would make an official build that ships without
+    // `--features trusttunnel` refuse to start on a config its operator
+    // cannot repair by editing anything.
+    let config = meow_config::load_config_from_str(&document)
         .await
-        .err()
-        .expect("dropping TT must not let the group select DIRECT");
-    assert!(error.to_string().contains("trusttunnel"), "{error}");
-    assert!(!error.to_string().contains("test-only"));
+        .expect("one unusable node must not reject the config");
+    assert_unavailable(&config.proxies["fixture"]).await;
 
     let raw = meow_config::parse_raw_yaml(&document).unwrap();
-    let error = meow_config::rebuild_from_raw(&raw)
-        .err()
-        .expect("runtime rebuild must reject the same node");
-    assert!(error.to_string().contains("trusttunnel"), "{error}");
+    let rebuilt =
+        meow_config::rebuild_from_raw(&raw).expect("runtime rebuild must behave the same way");
+    assert_unavailable(&rebuilt.proxies["fixture"]).await;
 }
 
 #[tokio::test]
-async fn unsupported_provider_node_preserves_last_good_generation() {
+async fn unsupported_provider_node_refreshes_into_a_dead_placeholder() {
     use meow_config::proxy_provider::ProxyProvider;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("provider.yaml");
@@ -144,35 +186,52 @@ async fn unsupported_provider_node_preserves_last_good_generation() {
     let updated_at = provider.updated_at_secs();
     std::fs::write(&path, provider_document()).unwrap();
 
-    let error = provider
+    provider
         .refresh()
         .await
-        .expect_err("a valid sibling must not mask a rejected TT node");
-    assert!(error.contains("trusttunnel"), "{error}");
+        .expect("one unusable node must not freeze the whole feed");
     let current = provider.proxies();
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0].name(), "last-good");
-    assert!(std::sync::Arc::ptr_eq(&previous[0], &current[0]));
-    assert_eq!(provider.updated_at_secs(), updated_at);
+    assert_eq!(
+        current.len(),
+        2,
+        "the refreshed payload replaces the old one"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&previous[0], &current[0]),
+        "a successful refresh must publish the new generation"
+    );
+    assert!(provider.updated_at_secs() >= updated_at);
+    let bad = current
+        .iter()
+        .find(|proxy| proxy.name() == "fixture")
+        .expect("the TT name stays addressable after a refresh");
+    assert_unavailable(bad).await;
 }
 
 #[tokio::test]
-async fn unsupported_provider_node_rejects_initial_config_load() {
+async fn unsupported_provider_node_does_not_block_the_initial_config_load() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("provider.yaml");
     std::fs::write(&path, provider_document()).unwrap();
-    let result = meow_config::proxy_provider::load_proxy_providers(
+    // A third-party payload is refetched on a timer, so a payload-level
+    // rejection here would be a daemon-wide kill switch in its operator's
+    // hands. Scope the damage to the node instead.
+    let providers = meow_config::proxy_provider::load_proxy_providers(
         &HashMap::from([("fixture".into(), file_provider(&path))]),
         Some(directory.path()),
         false,
         false,
         &meow_proxy::dialer::ProxyRegistry::default(),
     )
-    .await;
-    let error = result
-        .err()
-        .expect("initial TT parse errors must propagate");
-    assert!(error.to_string().contains("trusttunnel"), "{error}");
+    .await
+    .expect("one unusable node must not stop the daemon from starting");
+    let nodes = providers["fixture"].proxies();
+    assert_eq!(nodes.len(), 2);
+    let bad = nodes
+        .iter()
+        .find(|proxy| proxy.name() == "fixture")
+        .expect("the TT name stays addressable");
+    assert_unavailable(bad).await;
 }
 
 #[tokio::test]

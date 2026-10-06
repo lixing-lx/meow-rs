@@ -70,7 +70,8 @@ impl MeowError {
     /// True when the failure is *local* resource exhaustion — this process,
     /// not the remote member, ran out: fd-table, socket-buffer, or memory
     /// pressure (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`, or the WSA
-    /// equivalents), or an explicit adapter admission limit, at any [`RelayHopFailed`] depth. Dead-marking the
+    /// equivalents), or an explicit adapter admission limit, at any
+    /// [`RelayHopFailed`] depth. Dead-marking the
     /// member punishes a healthy node for a local condition; for a
     /// load-balance group it escalates to `NoProxyAvailable` until the
     /// next probe sweep (issue #668).
@@ -157,8 +158,8 @@ impl MeowError {
     /// Wrap a transport-layer `io::Error` at an adapter boundary (e.g.
     /// `ss tcp connect: {e}`). An error carrying a preservable io
     /// payload (raw errno, explicit admission limit, or errno-less
-    /// `OutOfMemory`), or one
-    /// carrying the `Unsupported` capability class, passes through as
+    /// `OutOfMemory`), or one carrying the `Unsupported` capability
+    /// class, passes through as
     /// `Io` verbatim — `Proxy`/`Other` stringification would erase the
     /// classification dead-marking reads to tell local resource
     /// exhaustion and capability refusals from member health (issues

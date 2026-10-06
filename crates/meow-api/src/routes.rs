@@ -1131,7 +1131,7 @@ async fn apply_raw_to_tunnel(
         meow_config::ech_dns::check_ech_defects(ps, raw.strict.unwrap_or(false))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
     }
-    let providers: std::collections::HashMap<_, _> = state
+    let providers = state
         .proxy_providers
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
@@ -1156,7 +1156,7 @@ async fn apply_raw_to_tunnel(
     let result = rebuild_from_raw_runtime_async(
         raw.clone(),
         resolver_slot,
-        providers.clone(),
+        providers,
         cache_dir,
         state.provider_dialer_registry.clone(),
     )
@@ -1179,13 +1179,6 @@ async fn apply_raw_to_tunnel(
             format!("proxy group '{missing}' failed validation"),
         ));
     }
-    meow_config::proxy_provider::prepare_proxy_providers(
-        &providers,
-        &proxy_providers,
-        &dialer_registry,
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Issue #514: a changed `dns:`/`hosts:`/`ipv6:`/`geodata:` section must
     // rebuild the resolver, not just land in the persisted config. Parse
     // against the freshly rebuilt proxy registry so circular
@@ -1273,21 +1266,19 @@ async fn commit_raw_candidate(
 /// Commit a validated candidate proxy-provider set into the live registry.
 /// Call only after the rebuild's commit point — the groups installed by the
 /// routing swap already reference these Arcs (still-declared names reuse the
-/// live objects; new declarations have completed preflight acquisition).
+/// live objects; new declarations are fresh empty providers).
 ///
 /// Insert-before-prune ordering: a concurrent `use:`/refresh lookup never
 /// observes a declared provider missing. Each committed provider adopts the
 /// candidate generation's `strict` flag so reused objects follow the new
-/// config (issue #533 review). New or changed declarations were acquired
-/// before commit; typed TT configuration errors rejected that candidate,
-/// while transient fetch failures retained offline-bootstrap behavior.
+/// config (issue #533 review). Providers whose object is new — newly
+/// declared names, or re-declared names whose definition changed — get a
+/// detached initial fetch so `use:` groups populate without a manual
+/// refresh; acquisition failure is a runtime condition, not a config defect.
 ///
 /// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the
 /// insert/prune ordering below is only meaningful when no sibling commit
-/// can interleave a registry swap. Callers must first await
-/// `prepare_proxy_providers` against the candidate route registry and reject
-/// failures BEFORE publishing routing or DNS. This commit never re-fetches
-/// fresh objects, keeping validation and publication on one payload.
+/// can interleave a registry swap.
 ///
 /// `raws` is the *candidate's* `proxy-providers:` declarations (the same
 /// map `candidate` was materialized from) and `refresh` the shared
@@ -1313,13 +1304,34 @@ pub fn commit_proxy_providers(
         // candidate builds — prune now that the committed groups hold their
         // views alive (issue #533 review).
         provider.prune_dead_derived();
-        // Fresh/changed providers were acquired and validated against the
-        // candidate registry before the routing swap. Do not fetch again:
-        // that would reopen the validation/publication race.
+        // Fetch when the committed object is *not* the one already live —
+        // a newly declared name inserts fresh, and a re-declared name whose
+        // definition changed carries a rebuilt provider that has never
+        // fetched (issue #533 review).
+        //
+        // Detached on purpose: this runs inside the `CONFIG_MUTATION` lane,
+        // where an awaited download would serialize every other commit
+        // behind one slow or blackholed provider URL — the same reason ECH
+        // preresolution is kept out of `apply_raw_to_tunnel` (issue #533
+        // review). A node this build cannot parse can no longer reject the
+        // payload (it binds an unavailable placeholder instead), so there
+        // is nothing here for a pre-commit await to gate.
         let reused = registry
             .insert(name.clone(), Arc::clone(provider))
             .is_some_and(|previous| Arc::ptr_eq(&previous, provider));
-        if reused && provider.take_deferred_initial() {
+        if !reused {
+            let provider = Arc::clone(provider);
+            let name = name.clone();
+            // `acquire_initial`, not `refresh`: a freshly committed
+            // provider has an empty slot, so the on-disk cache fallback
+            // (offline bootstrap) applies — refresh ticks deliberately
+            // skip it to keep the in-memory last-good set.
+            tokio::spawn(async move {
+                if let Err(e) = provider.acquire_initial().await {
+                    tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
+                }
+            });
+        } else if provider.take_deferred_initial() {
             // A reused provider whose `proxy:` could not resolve before
             // this commit's map was published — the name may resolve now,
             // so retry once. `refresh`, not `acquire_initial`: the cache
@@ -2974,7 +2986,7 @@ async fn put_configs(
                 match rebuild_from_raw_runtime_async(
                     lenient.clone(),
                     resolver_slot,
-                    providers.clone(),
+                    providers,
                     cache_dir,
                     state.provider_dialer_registry.clone(),
                 )
@@ -3028,21 +3040,6 @@ async fn put_configs(
         proxy_providers,
         prefetched_payloads,
     } = result;
-
-    // Even force must not commit a provider whose TT nodes were rejected.
-    if let Err(error) = meow_config::proxy_provider::prepare_proxy_providers(
-        &providers,
-        &proxy_providers,
-        &dialer_registry,
-    )
-    .await
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"message": format!("{error:#}")})),
-        )
-            .into_response();
-    }
 
     // A `tun:` section the listener cannot parse must be rejected before
     // commit (issue #543): admitted unchecked, the reconcile's restart
@@ -4263,7 +4260,7 @@ mod outbound_flush_tests {
     use super::*;
     use meow_common::ProxyAdapter as _;
 
-    pub(super) fn test_state() -> Arc<AppState> {
+    fn test_state() -> Arc<AppState> {
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec![],
             vec![],
@@ -4698,62 +4695,5 @@ mod global_route_binding_tests {
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
-    }
-}
-
-#[cfg(test)]
-mod provider_preparation_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn raw_candidate_trusttunnel_provider_rejects_before_publication() {
-        let _lane = CONFIG_MUTATION.lock().await;
-        let state = super::outbound_flush_tests::test_state();
-        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = origin.local_addr().unwrap();
-        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed = Arc::clone(&served);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = origin.accept().await.unwrap();
-            let mut request = [0; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
-            observed.store(true, std::sync::atomic::Ordering::SeqCst);
-            let body = "proxies:\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let candidate = meow_config::parse_raw_yaml(&format!(
-            "mode: rule\nproxy-providers:\n  review-p:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\n    path: {}\nproxy-groups: [{{name: front, type: select, proxies: [DIRECT]}}]\nrules: ['MATCH,DIRECT']\n",
-            directory.path().join("provider.yaml").display()
-        )).unwrap();
-        let before = serde_yaml::to_string(&*state.raw_config.read()).unwrap();
-        let resolver = state.tunnel.resolver();
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            commit_raw_candidate(&state, candidate),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        server.abort();
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(error.1.contains("trusttunnel"));
-        assert!(
-            served.load(std::sync::atomic::Ordering::SeqCst),
-            "the guard must fetch through the candidate front"
-        );
-        assert_eq!(
-            serde_yaml::to_string(&*state.raw_config.read()).unwrap(),
-            before
-        );
-        assert!(state.proxy_providers.is_empty());
-        assert!(state.tunnel.proxy("front").is_none());
-        assert!(Arc::ptr_eq(&resolver, &state.tunnel.resolver()));
     }
 }
