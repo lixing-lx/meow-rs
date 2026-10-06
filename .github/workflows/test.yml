@@ -223,6 +223,13 @@ jobs:
           cargo nextest run -p meow-config --features trusttunnel --test trusttunnel_config_test --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --no-default-features --test trusttunnel_config_test --retries 2 --no-fail-fast
           cargo nextest run -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider --retries 2 --no-fail-fast
+          # The HTTP/3 transport is a second opt-in feature on top of it, so
+          # the quiche driver, its in-tree HTTP/3 peer tests, the official
+          # endpoint's `[listen_protocols.quic]` interop leg and the `quic:`
+          # parser contract are invisible to every run above.
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test --retries 2 --no-fail-fast
 
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,

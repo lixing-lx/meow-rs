@@ -7,7 +7,7 @@ use meow_common::{MeowError, Metadata, Proxy, ProxyAdapter};
 use meow_proxy::{
     dialer::{DirectDialer, ProxyDialer, TcpDialer},
     group::load_balance::{LbStrategy, LoadBalanceGroup},
-    trusttunnel::{CertificateVerificationError, Options, TrustTunnelAdapter},
+    trusttunnel::{CertificateVerificationError, Options, Transport, TrustTunnelAdapter},
     DirectAdapter,
 };
 use meow_transport::{tls::TlsConfig, Stream};
@@ -172,6 +172,7 @@ impl Endpoint {
             tls,
             Options::new("fixture".into(), password.into()),
             true,
+            Transport::H2,
             dialer,
         )
         .unwrap()
@@ -338,6 +339,7 @@ async fn socket_or_protocol_failure_is_not_a_certificate_failure() {
         TlsConfig::new("localhost"),
         Options::new("fixture".into(), "secret".into()),
         false,
+        Transport::H2,
         Arc::new(DirectDialer),
     )
     .unwrap();
@@ -392,6 +394,7 @@ async fn health_check_runs_on_new_session_and_is_not_repeated_on_reuse() {
         endpoint.tls(true, "localhost"),
         options,
         false,
+        Transport::H2,
         Arc::new(DirectDialer),
     )
     .unwrap();
@@ -470,6 +473,7 @@ async fn stream_pool_pressure_keeps_load_balance_member_alive() {
         endpoint.tls(true, "localhost"),
         options,
         true,
+        Transport::H2,
         Arc::new(DirectDialer),
     )
     .unwrap();

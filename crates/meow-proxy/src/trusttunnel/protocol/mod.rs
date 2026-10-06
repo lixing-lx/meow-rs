@@ -1,16 +1,30 @@
-//! TrustTunnel HTTP/2 wire protocol. The adapter supplies verified TLS through
-//! the workspace dialer; this module never creates an outbound socket itself.
+//! TrustTunnel wire protocol: one CONNECT per proxied flow over a pool of
+//! multiplexed connections. The pool policy here is transport-agnostic; the
+//! transports are [`http2`] (always) and [`http3`] (opt-in `trusttunnel-h3`).
+//!
+//! HTTP/2 connections are TLS streams the adapter supplies through the
+//! workspace dialer, so that path never creates an outbound socket itself.
+//! HTTP/3 has no such seam — QUIC owns its UDP socket — and binds through
+//! `meow_common::bind_udp` instead.
 
+mod headers;
+mod http2;
+#[cfg(feature = "trusttunnel-h3")]
+mod http3;
 mod stream;
 mod udp;
 
+pub use headers::ExtraHeaders;
+pub use http2::{H2Connector, IoStream, StreamConnector};
+#[cfg(feature = "trusttunnel-h3")]
+pub use http3::QuicConnector;
 pub use stream::TunnelStream;
 pub use udp::UdpAssociation;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bytes::Bytes;
 use http::{HeaderValue, Method, Request, StatusCode};
+use stream::StreamKind;
 #[derive(Debug)]
 pub(crate) struct AuthenticationFailed;
 impl std::fmt::Display for AuthenticationFailed {
@@ -28,18 +42,64 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::Mutex as AsyncMutex,
-};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> IoStream for T {}
-
+/// Establishes one new multiplexed connection for the pool.
 #[async_trait]
 pub trait Connector: Send + Sync {
-    async fn connect(&self) -> io::Result<Box<dyn IoStream>>;
+    /// Dial, handshake, and start driving a connection. Every task the
+    /// connection owns must stop when `cancel` fires — that token is how the
+    /// pool, and `reset_sessions`, retire it.
+    async fn connect(&self, cancel: CancellationToken) -> io::Result<Box<dyn Connection>>;
+}
+
+/// One live multiplexed connection to the endpoint.
+#[async_trait]
+pub trait Connection: Send + Sync {
+    /// Reserve room for exactly one more CONNECT stream, before any byte of
+    /// the request is written.
+    async fn admit(&self) -> Admission;
+    /// The peer's advertised concurrent-stream ceiling, or `usize::MAX`
+    /// while it is unknown. Transports whose refusal is observable up front
+    /// report it through [`Admission::Full`] instead and keep this at the
+    /// default.
+    fn stream_ceiling(&self) -> usize {
+        usize::MAX
+    }
+}
+
+/// The outcome of asking a connection for stream room.
+pub enum Admission {
+    /// Granted: the [`Opener`] may send exactly one CONNECT.
+    Granted(Box<dyn Opener>),
+    /// The peer will not take another stream right now, but the connection
+    /// is healthy — it stays pooled and the caller tries a different one.
+    #[cfg_attr(
+        not(feature = "trusttunnel-h3"),
+        allow(
+            dead_code,
+            reason = "only the HTTP/3 transport can observe a full connection up front"
+        )
+    )]
+    Full,
+    /// The connection is going away. Retire it from the pool.
+    Closed,
+}
+
+/// Admission granted for exactly one CONNECT stream.
+#[async_trait]
+pub trait Opener: Send {
+    /// Send the CONNECT and await its response headers.
+    ///
+    /// Returns the status with the stream, rather than interpreting it: the
+    /// policy for a refusal (and for the credential error in particular) is
+    /// the pool's, in [`Client::open`].
+    async fn open(
+        self: Box<Self>,
+        request: Request<()>,
+        end: bool,
+    ) -> io::Result<(StatusCode, StreamKind)>;
 }
 
 /// Credentials intentionally have no Debug implementation.
@@ -51,6 +111,12 @@ pub struct Options {
     pub max_streams: usize,
     pub timeout: Duration,
     pub health_check: bool,
+    /// First field of every `user-agent` (`<platform>` in the spec).
+    pub platform: String,
+    /// Second field on a TCP CONNECT (`<app_name>` in the spec).
+    pub app_name: String,
+    /// Operator-supplied CONNECT headers, re-rendered per request.
+    pub headers: ExtraHeaders,
 }
 
 impl Options {
@@ -63,6 +129,13 @@ impl Options {
             max_streams: 128,
             timeout: Duration::from_secs(10),
             health_check: false,
+            platform: headers::default_platform().to_owned(),
+            // Deliberately unversioned: `meow/0.22.0` narrowed every session
+            // to one build of one client, which is the opposite of what a
+            // protocol designed to look like ordinary HTTPS wants. Operators
+            // who need to match a specific client set `platform`/`app-name`.
+            app_name: "meow".to_owned(),
+            headers: ExtraHeaders::default(),
         }
     }
 }
@@ -70,6 +143,10 @@ impl Options {
 struct Inner {
     connector: Arc<dyn Connector>,
     auth: HeaderValue,
+    /// The three spec-shaped user-agents this client can send, resolved once:
+    /// a TCP CONNECT, the `_udp2` multiplexer, and `_check`. Empty when the
+    /// config supplies its own `user-agent`.
+    agents: Option<Agents>,
     options: Options,
     sessions: Mutex<Vec<Arc<Session>>>,
     creating: AsyncMutex<()>,
@@ -77,16 +154,45 @@ struct Inner {
     network_cancel: Mutex<CancellationToken>,
 }
 
+/// Resolved `user-agent` values, one per CONNECT target shape.
+struct Agents {
+    tcp: HeaderValue,
+    udp2: HeaderValue,
+    check: HeaderValue,
+}
+
+impl Agents {
+    fn build(options: &Options) -> io::Result<Self> {
+        let value = |authority: &str| {
+            HeaderValue::from_str(&headers::user_agent(
+                &options.platform,
+                &options.app_name,
+                authority,
+            ))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid user-agent"))
+        };
+        Ok(Self {
+            // Any authority that is not a pseudo-host takes the TCP shape.
+            tcp: value("")?,
+            udp2: value("_udp2")?,
+            check: value("_check")?,
+        })
+    }
+
+    fn select(&self, authority: &str) -> HeaderValue {
+        match authority {
+            "_check" => self.check.clone(),
+            "_udp2" => self.udp2.clone(),
+            _ => self.tcp.clone(),
+        }
+    }
+}
+
 struct Session {
-    sender: h2::client::SendRequest<Bytes>,
+    link: Box<dyn Connection>,
     cancel: CancellationToken,
     reusable: AtomicBool,
     active: AtomicUsize,
-    /// The peer's acknowledged `SETTINGS_MAX_CONCURRENT_STREAMS`, sampled by
-    /// the connection driver. `usize::MAX` until the peer advertises a limit,
-    /// which is also HTTP/2's own default — so a dial racing the first
-    /// SETTINGS frame is never throttled by a stale zero.
-    peer_limit: Arc<AtomicUsize>,
     udp: AsyncMutex<Option<Arc<udp::Mux>>>,
 }
 
@@ -94,9 +200,7 @@ impl Session {
     /// How many streams this connection may carry: our own configured
     /// ceiling, capped by the peer's.
     fn ceiling(&self, options: &Options) -> usize {
-        options
-            .max_streams
-            .min(self.peer_limit.load(Ordering::Relaxed))
+        options.max_streams.min(self.link.stream_ceiling())
     }
 }
 
@@ -118,7 +222,7 @@ impl Drop for HandshakeGuard {
     }
 }
 
-pub(crate) struct Lease(Arc<Session>);
+pub struct Lease(Arc<Session>);
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::AcqRel);
@@ -132,16 +236,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-pub(crate) fn h2_error(error: h2::Error) -> io::Error {
-    if error.is_io() {
-        error
-            .into_io()
-            .unwrap_or_else(|| io::Error::other("HTTP/2 transport failed"))
-    } else {
-        io::Error::other(error)
-    }
 }
 
 impl Client {
@@ -167,15 +261,28 @@ impl Client {
                 "invalid TrustTunnel pool limits",
             ));
         }
+        for (label, token, spaces) in [
+            ("platform", &options.platform, false),
+            ("app-name", &options.app_name, true),
+        ] {
+            headers::validate_token(label, token, spaces)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
         let mut auth = HeaderValue::from_str(&format!(
             "Basic {}",
             STANDARD.encode(format!("{}:{}", options.username, options.password))
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid credentials"))?;
         auth.set_sensitive(true);
+        let agents = if options.headers.overrides_user_agent() {
+            None
+        } else {
+            Some(Agents::build(&options)?)
+        };
         Ok(Self(Arc::new(Inner {
             connector,
             auth,
+            agents,
             options,
             sessions: Mutex::new(Vec::new()),
             creating: AsyncMutex::new(()),
@@ -265,43 +372,20 @@ impl Client {
             return Ok(lease);
         }
         let cancel = lock(&self.0.network_cancel).child_token();
-        let io = self.0.connector.connect().await?;
-        let (sender, connection) = h2::client::Builder::new()
-            .initial_window_size(131072)
-            .initial_connection_window_size(2 * 1024 * 1024)
-            .max_send_buffer_size(128 * 1024)
-            .handshake(io)
-            .await
-            .map_err(h2_error)?;
-        let canceled = cancel.clone();
-        let peer_limit = Arc::new(AtomicUsize::new(usize::MAX));
-        let sampler = Arc::clone(&peer_limit);
-        spawn_scoped(async move {
-            // h2 exposes the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` only on
-            // the connection handle, and the handle is consumed by this task
-            // — so sample it here, after every poll, into a slot the pool can
-            // read. Without it a connection sitting at the peer's limit is
-            // indistinguishable from an idle one: `poll_ready` answers
-            // `Ready` whatever the limit says (it only tracks *this* handle's
-            // own pending stream), so `send_request` would queue the stream
-            // as pending-open and the dial would park in `response.await`
-            // until its whole deadline expired — while a sibling connection,
-            // or a new one, could have carried it immediately.
-            let mut connection = connection;
-            let driver = std::future::poll_fn(move |cx| {
-                let polled = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
-                sampler.store(connection.max_concurrent_send_streams(), Ordering::Relaxed);
-                polled
-            });
-            tokio::select! { _ = canceled.cancelled() => {}, _ = driver => {} }
-            canceled.cancel();
-        });
+        let link = match self.0.connector.connect(cancel.clone()).await {
+            Ok(link) => link,
+            Err(error) => {
+                // A half-established connection owns tasks keyed on this
+                // token; nothing else will ever retire them.
+                cancel.cancel();
+                return Err(error);
+            }
+        };
         let session = Arc::new(Session {
-            sender,
+            link,
             cancel,
             reusable: AtomicBool::new(true),
             active: AtomicUsize::new(1),
-            peer_limit,
             udp: AsyncMutex::new(None),
         });
         let lease = Lease(Arc::clone(&session));
@@ -317,10 +401,10 @@ impl Client {
             // expire before that outer deadline. No retry here: this session
             // was just handshaked, so a refusal is the connection itself
             // failing, not the recycle `connect` covers.
-            let sender = Self::admit(&check)
-                .await
-                .ok_or_else(Self::admission_refused)?;
-            drop(self.open(sender, check, "_check").await?);
+            let Admission::Granted(opener) = Self::admit(&check).await else {
+                return Err(Self::admission_refused());
+            };
+            drop(self.open(opener, check, "_check").await?);
         }
         // Publish under the same lock as reset: a late handshake cannot revive
         // a connection belonging to a retired network generation.
@@ -339,26 +423,16 @@ impl Client {
         Ok(lease)
     }
 
-    /// Reserve capacity for one new stream on `lease`'s connection.
-    ///
-    /// `None` means the peer refused admission — a GOAWAY, or a connection
-    /// on its way out — *before* any byte of the request was written. GOAWAY
-    /// is unobservable until this point, so `existing()` will have handed
-    /// out a session that already stopped accepting streams; the session is
-    /// retired here so the caller's retry picks a different one.
-    ///
-    /// This cannot park on stream capacity: `poll_ready` only waits on a
-    /// pending stream belonging to the same `SendRequest` handle, and each
-    /// call clones a fresh one. The peer's concurrency limit is handled
-    /// where it is observable instead — see `Session::ceiling`.
-    async fn admit(lease: &Lease) -> Option<h2::client::SendRequest<Bytes>> {
-        match lease.0.sender.clone().ready().await {
-            Ok(sender) => Some(sender),
-            Err(_) => {
-                lease.0.reusable.store(false, Ordering::Release);
-                None
-            }
+    /// Reserve capacity for one new stream on `lease`'s connection, applying
+    /// the pool-side consequence of a refusal: a connection that reports
+    /// itself gone leaves the admission pool, so the caller's retry picks a
+    /// different one.
+    async fn admit(lease: &Lease) -> Admission {
+        let admission = lease.0.link.admit().await;
+        if matches!(admission, Admission::Closed) {
+            lease.0.reusable.store(false, Ordering::Release);
         }
+        admission
     }
 
     /// Error for a peer that refused admission on two successive sessions.
@@ -367,6 +441,20 @@ impl Client {
             io::ErrorKind::ConnectionAborted,
             "TrustTunnel peer refused to admit a new stream",
         )
+    }
+
+    /// Error for a refusal that survived the retry.
+    ///
+    /// A peer that is merely out of stream credit is not an unhealthy one:
+    /// report it as a local resource limit so `DialFailureTracker` cannot
+    /// dead-mark a working member over a concurrency ceiling.
+    fn refused(admission: &Admission) -> io::Error {
+        match admission {
+            Admission::Full => {
+                meow_common::error::local_resource_limit("TrustTunnel stream limit reached")
+            }
+            _ => Self::admission_refused(),
+        }
     }
 
     /// Open one CONNECT stream, retrying once when the pooled session will
@@ -380,8 +468,8 @@ impl Client {
     /// feeds `DialFailureTracker` toward dead-marking a healthy member.
     async fn connect(&self, authority: &str) -> io::Result<TunnelStream> {
         let lease = self.session(None).await?;
-        if let Some(sender) = Self::admit(&lease).await {
-            return self.open(sender, lease, authority).await;
+        if let Admission::Granted(opener) = Self::admit(&lease).await {
+            return self.open(opener, lease, authority).await;
         }
         // Release the slot before re-electing, so a session that was only
         // full is not counted as one stream busier than it is. `admit`
@@ -393,34 +481,43 @@ impl Client {
         let declined = Arc::clone(&lease.0);
         drop(lease);
         let lease = self.session(Some(&declined)).await?;
-        let sender = Self::admit(&lease)
-            .await
-            .ok_or_else(Self::admission_refused)?;
-        self.open(sender, lease, authority).await
+        match Self::admit(&lease).await {
+            Admission::Granted(opener) => self.open(opener, lease, authority).await,
+            refusal => Err(Self::refused(&refusal)),
+        }
     }
 
     async fn open(
         &self,
-        mut sender: h2::client::SendRequest<Bytes>,
+        opener: Box<dyn Opener>,
         lease: Lease,
         authority: &str,
     ) -> io::Result<TunnelStream> {
         let uri: http::Uri = authority.parse().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid CONNECT authority")
         })?;
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(Method::CONNECT)
             .uri(uri)
-            .header("proxy-authorization", self.0.auth.clone())
-            .header("user-agent", concat!("meow/", env!("CARGO_PKG_VERSION")))
+            .header("proxy-authorization", self.0.auth.clone());
+        if let Some(agents) = &self.0.agents {
+            request = request.header(http::header::USER_AGENT, agents.select(authority));
+        }
+        // Rendered per request, not per session: a `<random-string(…)>`
+        // padding header whose value were fixed for the connection's life
+        // would be exactly the constant it exists to avoid.
+        for (name, template) in self.0.options.headers.iter() {
+            request = request.header(name.clone(), template.render());
+        }
+        let request = request
             .body(())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid CONNECT request"))?;
         let end = authority == "_check";
-        let (response, mut send) = sender.send_request(request, end).map_err(h2_error)?;
-        let result = response.await.map_err(h2_error)?;
-        if result.status() != StatusCode::OK {
-            send.send_reset(h2::Reason::CANCEL);
-            if result.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        let (status, stream) = opener.open(request, end).await?;
+        if status != StatusCode::OK {
+            // Dropping the stream resets it, on either transport.
+            drop(stream);
+            if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
                 lease.0.cancel.cancel();
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -429,10 +526,10 @@ impl Client {
             }
             return Err(io::Error::other(format!(
                 "TrustTunnel CONNECT returned {}",
-                result.status().as_u16()
+                status.as_u16()
             )));
         }
-        Ok(TunnelStream::new(send, result.into_body(), lease, end))
+        Ok(TunnelStream::new(stream, lease))
     }
 
     pub async fn tcp(&self, authority: &str) -> io::Result<TunnelStream> {
@@ -453,6 +550,7 @@ impl Client {
             // `_udp2` mux is cached on the very session this lease names —
             // `connect` could hand back a stream on a different one.
             let mut declined: Option<Arc<Session>> = None;
+            let mut refusal = Admission::Closed;
             for attempt in 0..2 {
                 let lease = self.session(declined.as_ref()).await?;
                 let session = Arc::clone(&lease.0);
@@ -460,21 +558,26 @@ impl Client {
                 if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
                     return mux.associate();
                 }
-                let Some(sender) = Self::admit(&lease).await else {
-                    drop(slot);
-                    drop(lease);
-                    if attempt == 0 {
-                        declined = Some(session);
-                        continue;
+                match Self::admit(&lease).await {
+                    Admission::Granted(opener) => {
+                        let stream = self.open(opener, lease, "_udp2").await?;
+                        let mux = udp::Mux::new(stream, &session.cancel);
+                        *slot = Some(Arc::clone(&mux));
+                        return mux.associate();
                     }
-                    break;
-                };
-                let stream = self.open(sender, lease, "_udp2").await?;
-                let mux = udp::Mux::new(stream, &session.cancel);
-                *slot = Some(Arc::clone(&mux));
-                return mux.associate();
+                    other => {
+                        refusal = other;
+                        drop(slot);
+                        drop(lease);
+                        if attempt == 0 {
+                            declined = Some(session);
+                            continue;
+                        }
+                        break;
+                    }
+                }
             }
-            Err(Self::admission_refused())
+            Err(Self::refused(&refusal))
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TrustTunnel UDP CONNECT timed out"))?

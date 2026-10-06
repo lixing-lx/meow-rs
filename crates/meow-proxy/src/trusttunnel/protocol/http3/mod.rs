@@ -1,0 +1,193 @@
+//! The HTTP/3 transport (`quic: true`, PROTOCOL.md §3.2): the same
+//! CONNECT-per-flow protocol over QUIC instead of TLS-over-TCP.
+//!
+//! Unlike the HTTP/2 transport this one owns its socket — QUIC has no stream
+//! seam a dialer could sit in — so it binds through `meow_common::bind_udp`,
+//! which applies the TUN interface binding and the Android `protect()` hook
+//! (issue #695). That is also why `dialer-proxy` is refused for a `quic`
+//! node at config load: there is no TCP connection to route through it.
+
+mod driver;
+mod stream;
+#[cfg(test)]
+mod tests;
+mod tls;
+
+pub(super) use stream::H3Stream;
+
+use super::{Admission, Connection, Opener, StreamKind};
+use async_trait::async_trait;
+use driver::{Cmd, Shared};
+use http::{Request, StatusCode};
+use quiche::h3;
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+/// Dials QUIC connections to one TrustTunnel endpoint.
+pub struct QuicConnector {
+    host: String,
+    port: u16,
+    /// SNI, and the name the certificate is verified against: quiche binds
+    /// the two together, which is why `name-cert-verify` is refused here.
+    server_name: String,
+    insecure: bool,
+    idle: Duration,
+}
+
+impl QuicConnector {
+    /// `timeout` is the per-dial deadline the pool enforces; the spec derives
+    /// the QUIC idle timeout from it as
+    /// `2 × (connection_timeout + health_check_timeout)` (§3.2), and this
+    /// client uses the one configured timeout for both of those.
+    pub fn new(
+        host: &str,
+        port: u16,
+        server_name: &str,
+        insecure: bool,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+            server_name: server_name.to_owned(),
+            insecure,
+            idle: timeout.saturating_mul(4),
+        }
+    }
+
+    async fn dial(
+        &self,
+        peer: SocketAddr,
+        cancel: CancellationToken,
+    ) -> io::Result<Box<dyn Connection>> {
+        let bind = if peer.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        };
+        let socket = meow_common::bind_udp(bind).await?;
+        let local = socket.local_addr()?;
+        let mut config = tls::build(self.insecure, self.idle)?;
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        for byte in &mut scid {
+            *byte = rand::random();
+        }
+        let conn = quiche::connect(
+            Some(&self.server_name),
+            &quiche::ConnectionId::from_ref(&scid),
+            local,
+            peer,
+            &mut config,
+        )
+        .map_err(|e| io::Error::other(format!("TrustTunnel QUIC setup: {e}")))?;
+        let (cmd_tx, shared) = driver::spawn(socket, local, conn, cancel).await?;
+        Ok(Box::new(H3Connection { cmd_tx, shared }))
+    }
+}
+
+#[async_trait]
+impl super::Connector for QuicConnector {
+    async fn connect(&self, cancel: CancellationToken) -> io::Result<Box<dyn Connection>> {
+        let peers = meow_common::resolve_host_all(&self.host, self.port).await?;
+        let mut last = None;
+        for peer in peers {
+            match self.dial(peer, cancel.clone()).await {
+                Ok(connection) => return Ok(connection),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "TrustTunnel endpoint resolved to no address",
+            )
+        }))
+    }
+}
+
+struct H3Connection {
+    cmd_tx: mpsc::Sender<Cmd>,
+    shared: Arc<Shared>,
+}
+
+#[async_trait]
+impl Connection for H3Connection {
+    async fn admit(&self) -> Admission {
+        if self.shared.closed.load(Ordering::Relaxed) || self.cmd_tx.is_closed() {
+            return Admission::Closed;
+        }
+        // Out of stream credit: the connection is healthy, so it stays
+        // pooled and the caller tries another one. The driver still queues
+        // an open that loses the race against a concurrent dial, so this
+        // only has to be right often enough to keep the pool spreading.
+        if self.shared.credit.load(Ordering::Relaxed) == 0 {
+            return Admission::Full;
+        }
+        Admission::Granted(Box::new(H3Opener(self.cmd_tx.clone())))
+    }
+
+    fn stream_ceiling(&self) -> usize {
+        self.shared.ceiling.load(Ordering::Relaxed)
+    }
+}
+
+struct H3Opener(mpsc::Sender<Cmd>);
+
+#[async_trait]
+impl Opener for H3Opener {
+    async fn open(
+        self: Box<Self>,
+        request: Request<()>,
+        end: bool,
+    ) -> io::Result<(StatusCode, StreamKind)> {
+        let headers = encode(&request)?;
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(Cmd::Open {
+                headers,
+                fin: end,
+                reply,
+            })
+            .await
+            .map_err(|_| closed())?;
+        let (status, stream) = response.await.map_err(|_| closed())??;
+        Ok((status, StreamKind::H3(stream)))
+    }
+}
+
+fn closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "TrustTunnel H3 connection closed",
+    )
+}
+
+/// Turn the shared CONNECT request into an HTTP/3 field section.
+///
+/// A CONNECT request carries `:method` and `:authority` and no `:scheme` or
+/// `:path` (RFC 9114 §4.4) — the one structural difference from the HTTP/2
+/// request the same [`super::Client`] builds.
+fn encode(request: &Request<()>) -> io::Result<Vec<h3::Header>> {
+    let authority = request.uri().authority().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TrustTunnel CONNECT has no authority",
+        )
+    })?;
+    let mut headers = Vec::with_capacity(2 + request.headers().len());
+    headers.push(h3::Header::new(b":method", b"CONNECT"));
+    headers.push(h3::Header::new(
+        b":authority",
+        authority.as_str().as_bytes(),
+    ));
+    for (name, value) in request.headers() {
+        headers.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
+    }
+    Ok(headers)
+}

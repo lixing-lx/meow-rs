@@ -876,8 +876,9 @@ fn parse_direct(
     Ok(adapter)
 }
 
-/// Parse the H2-only TrustTunnel schema shared by static and provider nodes.
+/// Parse the TrustTunnel schema shared by static and provider nodes.
 /// Unsupported transport and TLS policies fail before adapter construction.
+/// `quic: true` selects HTTP/3 and needs the `trusttunnel-h3` feature.
 #[cfg(feature = "trusttunnel")]
 fn parse_trusttunnel(
     name: &str,
@@ -899,8 +900,15 @@ fn parse_trusttunnel(
                 .ok_or_else(|| format!("trusttunnel: {key} must be boolean")),
         }
     };
-    if boolean("quic", false)? {
-        return Err("trusttunnel: mihomo supports HTTP/3 with quic: true; this contribution only implements HTTP/2".into());
+    let quic = boolean("quic", false)?;
+    #[cfg(not(feature = "trusttunnel-h3"))]
+    if quic {
+        return Err("trusttunnel: `quic: true` selects the HTTP/3 transport, which is not compiled into this build; rebuild with `--features trusttunnel-h3`".into());
+    }
+    if quic {
+        // QUIC carries its own UDP socket, so there is no TCP connection for
+        // a `dialer-proxy` chain to carry (same reason hysteria2 refuses it).
+        reject_unthreaded_dialer(name, "trusttunnel", dialer)?;
     }
     let nonempty = |field: &str| {
         config.get(field).is_some_and(|value| match value {
@@ -926,18 +934,32 @@ fn parse_trusttunnel(
     ] {
         if nonempty(field) {
             return Err(format!(
-                "trusttunnel: this H2 candidate does not implement the {field} policy"
+                "trusttunnel: this client does not implement the {field} policy"
             ));
         }
     }
     for field in ["bbr-profile", "bbr-opts", "congestion-controller", "cwnd"] {
         if nonempty(field) {
             return Err(format!(
-                "trusttunnel: this H2 candidate does not implement the QUIC option {field}"
+                "trusttunnel: this client does not implement the QUIC option {field}"
             ));
         }
     }
-    let expected_alpn = "h2";
+    if quic {
+        // Both are TLS policies the QUIC path structurally cannot honor:
+        // there is no uTLS ClientHello shaping over quiche, and quiche
+        // installs one name as *both* the SNI and the certificate's verify
+        // hostname, so they cannot differ. Refusing beats silently dropping
+        // a policy the operator asked for.
+        for field in ["client-fingerprint", "name-cert-verify"] {
+            if nonempty(field) {
+                return Err(format!(
+                    "trusttunnel: the HTTP/3 transport cannot honor {field}"
+                ));
+            }
+        }
+    }
+    let expected_alpn = if quic { "h3" } else { "h2" };
     if let Some(alpn) = config.get("alpn").filter(|value| !value.is_null()) {
         if !alpn.as_sequence().is_some_and(|list| {
             list.is_empty() || (list.len() == 1 && list[0].as_str() == Some(expected_alpn))
@@ -1017,10 +1039,49 @@ fn parse_trusttunnel(
         }
     }
     options.max_streams = options.max_streams.max(options.min_streams);
+    // `platform` / `app-name` are the two fields of the spec's per-stream
+    // `user-agent`; `headers` can replace it outright, and anything else it
+    // declares rides along on every CONNECT. Values may carry
+    // `<random-string(N)>` / `<random-string(MIN-MAX)>`, re-rolled per
+    // request — the padding idiom Surge spells the same way.
+    if let Some(platform) = text("platform")? {
+        options.platform = platform.to_owned();
+    }
+    if let Some(app_name) = text("app-name")? {
+        options.app_name = app_name.to_owned();
+    }
+    let declared: Vec<(String, String)> = match config.get("headers") {
+        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_mapping()
+            .ok_or("trusttunnel: headers must be a map of name to value")?
+            .iter()
+            .map(|(key, value)| {
+                let name = key
+                    .as_str()
+                    .ok_or("trusttunnel: header names must be strings")?;
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("trusttunnel: header '{name}' must be a string"))?;
+                Ok((name.to_owned(), text.to_owned()))
+            })
+            .collect::<std::result::Result<_, String>>()?,
+    };
+    options.headers =
+        meow_proxy::trusttunnel::ExtraHeaders::new(&declared, meow_transport::MAX_EXTRA_HEADERS)
+            .map_err(|e| format!("trusttunnel: {e}"))?;
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
-        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this H2 candidate currently checks only new sessions");
+        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions");
     }
+    #[cfg(feature = "trusttunnel-h3")]
+    let transport = if quic {
+        meow_proxy::trusttunnel::Transport::H3
+    } else {
+        meow_proxy::trusttunnel::Transport::H2
+    };
+    #[cfg(not(feature = "trusttunnel-h3"))]
+    let transport = meow_proxy::trusttunnel::Transport::H2;
     let adapter = meow_proxy::trusttunnel::TrustTunnelAdapter::new(
         name,
         server,
@@ -1028,6 +1089,7 @@ fn parse_trusttunnel(
         tls,
         options,
         boolean("udp", false)?,
+        transport,
         Arc::clone(dialer),
     )
     .map_err(|error| error.to_string())?;

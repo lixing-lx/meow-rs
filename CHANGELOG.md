@@ -10,10 +10,14 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
-- Opt-in TrustTunnel HTTP/2 client outbound (`--features trusttunnel`):
+- Opt-in TrustTunnel client outbound (`--features trusttunnel`):
   authenticated CONNECT, TCP half-close, bounded pooling and IPv4/IPv6 UDP
-  multiplexing. See `docs/specs/proxy-trusttunnel.md` for configuration and
-  explicit compatibility limits (proposal #727).
+  multiplexing over HTTP/2, plus the specification's per-stream `user-agent`
+  (`platform` / `app-name`) and operator-declared `headers` with re-rolled
+  `<random-string(N)>` padding. `--features trusttunnel-h3` adds the HTTP/3
+  transport (`quic: true`) on the same vendored BoringSSL as hysteria2, with
+  no second crypto library. See `docs/specs/proxy-trusttunnel.md` for
+  configuration and explicit compatibility limits (proposal #727).
 
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
   now ship `meow` `.ipk` and `.apk` packages for OpenWrt's x86/64 target

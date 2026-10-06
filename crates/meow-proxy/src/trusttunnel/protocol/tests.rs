@@ -1,4 +1,4 @@
-use super::{Client, Connector, IoStream, Options};
+use super::{Client, H2Connector, IoStream, Options, StreamConnector};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
@@ -12,8 +12,17 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Build a client whose pooled connections are mock HTTP/2 peers.
+fn client(mock: Arc<Mock>, options: Options) -> io::Result<Client> {
+    Client::new(Arc::new(H2Connector::new(mock)), options)
+}
+
+/// Every CONNECT the mock accepted, as `(authority, headers)`.
+type Captured = Arc<std::sync::Mutex<Vec<(String, http::HeaderMap)>>>;
+
 #[derive(Default)]
 struct Mock {
+    captured: Captured,
     connections: AtomicUsize,
     reject: bool,
     malformed_udp: bool,
@@ -25,7 +34,7 @@ struct Mock {
     peer_stream_limit: Option<u32>,
 }
 #[async_trait]
-impl Connector for Mock {
+impl StreamConnector for Mock {
     async fn connect(&self) -> io::Result<Box<dyn IoStream>> {
         self.connections.fetch_add(1, Ordering::SeqCst);
         let (client, peer) = tokio::io::duplex(8192);
@@ -37,6 +46,7 @@ impl Connector for Mock {
         let maximum_udp_reply = self.maximum_udp_reply;
         let zero_udp_destination = self.zero_udp_destination;
         let peer_stream_limit = self.peer_stream_limit;
+        let captured = Arc::clone(&self.captured);
         tokio::spawn(async move {
             let mut builder = h2::server::Builder::new();
             if let Some(limit) = peer_stream_limit {
@@ -50,6 +60,10 @@ impl Connector for Mock {
                     "Basic Zml4dHVyZTpzZWNyZXQ="
                 );
                 let authority = request.uri().authority().unwrap().as_str().to_owned();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((authority.clone(), request.headers().clone()));
                 if stall_check && authority == "_check" {
                     check_started.notify_one();
                     tokio::spawn(async move {
@@ -178,10 +192,7 @@ fn setup(reject: bool, malformed_udp: bool) -> (Client, Arc<Mock>) {
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
     options.timeout = Duration::from_secs(2);
-    (
-        Client::new(Arc::<Mock>::clone(&mock), options).unwrap(),
-        mock,
-    )
+    (client(Arc::<Mock>::clone(&mock), options).unwrap(), mock)
 }
 
 /// A server-side connection recycle must cost nothing user-visible. The
@@ -204,7 +215,7 @@ async fn goaway_recycle_moves_the_dial_to_a_fresh_connection() {
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
-    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let client = client(Arc::<Mock>::clone(&mock), options).unwrap();
     let mut stream = client.tcp("drain.test:443").await.unwrap();
     stream.write_all(b"live").await.unwrap();
     let mut bytes = [0; 4];
@@ -328,7 +339,7 @@ async fn maximum_legal_udp_reply_keeps_other_associations_alive() {
         maximum_udp_reply: true,
         ..Mock::default()
     });
-    let client = Client::new(mock, Options::new("fixture".into(), "secret".into())).unwrap();
+    let client = client(mock, Options::new("fixture".into(), "secret".into())).unwrap();
     let a = client.udp().await.unwrap();
     let b = client.udp().await.unwrap();
     let target = "[2001:db8::1]:53".parse().unwrap();
@@ -406,7 +417,7 @@ async fn unmatched_udp_reply_is_counted_without_guessing_an_association() {
         zero_udp_destination: true,
         ..Mock::default()
     });
-    let client = Client::new(mock, Options::new("fixture".into(), "secret".into())).unwrap();
+    let client = client(mock, Options::new("fixture".into(), "secret".into())).unwrap();
     let association = client.udp().await.unwrap();
     let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
     let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
@@ -483,7 +494,7 @@ async fn reset_also_closes_goaway_streams_removed_from_the_admission_pool() {
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
-    let client = Client::new(mock, options).unwrap();
+    let client = client(mock, options).unwrap();
     let mut stream = client.tcp("drain.test:443").await.unwrap();
     stream.write_all(b"live").await.unwrap();
     stream.read_exact(&mut [0; 4]).await.unwrap();
@@ -556,7 +567,7 @@ async fn stalled_health_check_times_out_without_publishing_a_session() {
     let mut options = Options::new("fixture".into(), "secret".into());
     options.health_check = true;
     options.timeout = Duration::from_millis(500);
-    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let client = client(Arc::<Mock>::clone(&mock), options).unwrap();
     let first = client.tcp("example.test:80");
     tokio::pin!(first);
     tokio::select! {
@@ -593,7 +604,7 @@ async fn stalled_udp_health_check_uses_the_outer_connect_deadline() {
     let mut options = Options::new("fixture".into(), "secret".into());
     options.health_check = true;
     options.timeout = Duration::from_millis(100);
-    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let client = client(Arc::<Mock>::clone(&mock), options).unwrap();
     for _ in 0..2 {
         let error = client.udp().await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -617,7 +628,7 @@ async fn peer_stream_limit_moves_the_dial_to_another_connection() {
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 2;
-    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let client = client(Arc::<Mock>::clone(&mock), options).unwrap();
     // Occupy the peer's only stream slot and never release it.
     let _held = client.tcp("hold.test:443").await.unwrap();
     let mut stream = tokio::time::timeout(Duration::from_secs(3), client.tcp("next.test:80"))
@@ -645,7 +656,7 @@ async fn peer_stream_limit_at_the_connection_cap_is_a_local_resource_error() {
     });
     let mut options = Options::new("fixture".into(), "secret".into());
     options.max_connections = 1;
-    let client = Client::new(Arc::<Mock>::clone(&mock), options).unwrap();
+    let client = client(Arc::<Mock>::clone(&mock), options).unwrap();
     let _held = client.tcp("hold.test:443").await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(3), client.tcp("next.test:80"))
         .await
@@ -657,4 +668,140 @@ async fn peer_stream_limit_at_the_connection_cap_is_a_local_resource_error() {
         "a pool ceiling must not dead-mark the node"
     );
     assert_eq!(mock.connections.load(Ordering::SeqCst), 1);
+}
+
+/// Build a client over a fresh mock with caller-chosen options.
+fn with_options(options: Options) -> (Client, Arc<Mock>) {
+    let mock = Arc::new(Mock {
+        check_started: Arc::new(tokio::sync::Notify::new()),
+        ..Mock::default()
+    });
+    (client(Arc::<Mock>::clone(&mock), options).unwrap(), mock)
+}
+
+/// The one `user-agent` the peer saw for `authority`.
+fn agent(mock: &Mock, authority: &str) -> String {
+    let captured = mock.captured.lock().unwrap();
+    let (_, headers) = captured
+        .iter()
+        .find(|(seen, _)| seen == authority)
+        .unwrap_or_else(|| panic!("no CONNECT for {authority} in {captured:?}"));
+    assert_eq!(
+        headers.get_all(http::header::USER_AGENT).iter().count(),
+        1,
+        "exactly one user-agent per request"
+    );
+    headers[http::header::USER_AGENT]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The specification varies the user-agent by CONNECT target: `<platform>`
+/// alone on `_check` (§8.2), `<platform> _udp2` on the datagram multiplexer
+/// (§6.1), and `<platform> <app_name>` on a tunnel (§5.1). Sending one fixed
+/// string for all three is itself something to match on, so assert the shape
+/// rather than just "a user-agent is present".
+#[tokio::test]
+async fn the_user_agent_follows_the_specs_per_stream_shape() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    options.health_check = true;
+    options.platform = "ios".into();
+    options.app_name = "AdGuard".into();
+    let (client, mock) = with_options(options);
+    let _tunnel = client.tcp("example.test:443").await.unwrap();
+    let _datagrams = client.udp().await.unwrap();
+    assert_eq!(agent(&mock, "_check"), "ios");
+    assert_eq!(agent(&mock, "_udp2"), "ios _udp2");
+    assert_eq!(agent(&mock, "example.test:443"), "ios AdGuard");
+}
+
+/// The default platform is this host's, and the application name carries no
+/// version: `meow/0.22.0` pinned every session to one build of one client.
+#[tokio::test]
+async fn the_default_user_agent_names_the_platform_without_a_version() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    let (client, mock) = with_options(options);
+    let _tunnel = client.tcp("example.test:443").await.unwrap();
+    let agent = agent(&mock, "example.test:443");
+    let (platform, app) = agent.split_once(' ').expect(&agent);
+    assert!(!platform.is_empty() && !platform.contains(' '));
+    assert_eq!(app, "meow");
+    assert!(!agent.contains(env!("CARGO_PKG_VERSION")), "{agent}");
+}
+
+/// Padding headers exist to stop the handshake from being a constant. A value
+/// fixed for the session's life would be exactly that constant, so the
+/// placeholder has to be re-rolled per CONNECT — the two dials below share
+/// one connection precisely so a per-session render would show up here.
+#[tokio::test]
+async fn configured_headers_ride_along_and_reroll_each_request() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    options.headers = super::ExtraHeaders::new(
+        &[
+            ("x-padding".into(), "<random-string(16-32)>".into()),
+            ("x-fixed".into(), "constant".into()),
+        ],
+        8,
+    )
+    .unwrap();
+    let (client, mock) = with_options(options);
+    let _first = client.tcp("first.test:443").await.unwrap();
+    let _second = client.tcp("second.test:443").await.unwrap();
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 1);
+    let captured = mock.captured.lock().unwrap().clone();
+    let mut paddings = Vec::new();
+    for (authority, headers) in &captured {
+        let padding = headers["x-padding"].to_str().unwrap();
+        assert!(
+            (16..=32).contains(&padding.len()),
+            "{authority}: {padding:?}"
+        );
+        assert_eq!(headers["x-fixed"], "constant");
+        paddings.push(padding.to_owned());
+    }
+    assert_eq!(paddings.len(), 2);
+    assert_ne!(
+        paddings[0], paddings[1],
+        "the padding must be re-rolled per request, not per session"
+    );
+}
+
+/// An operator matching a specific client needs the whole header, not just
+/// its two fields — and must not end up sending two of them.
+#[tokio::test]
+async fn a_configured_user_agent_replaces_the_spec_shaped_one() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    options.health_check = true;
+    options.headers =
+        super::ExtraHeaders::new(&[("User-Agent".into(), "ios AdGuard/2.1".into())], 8).unwrap();
+    let (client, mock) = with_options(options);
+    let _tunnel = client.tcp("example.test:443").await.unwrap();
+    assert_eq!(agent(&mock, "_check"), "ios AdGuard/2.1");
+    assert_eq!(agent(&mock, "example.test:443"), "ios AdGuard/2.1");
+}
+
+/// The credential header is the adapter's own; a config that could overwrite
+/// it would either break authentication or put the credential in a header of
+/// the operator's choosing.
+#[test]
+fn the_credential_header_cannot_be_overridden() {
+    let error = super::ExtraHeaders::new(&[("proxy-authorization".into(), "Basic x".into())], 8)
+        .unwrap_err();
+    assert!(error.contains("set by the adapter itself"), "{error}");
+}
+
+/// A platform token with a space would make the endpoint read the next field
+/// as the application name, so it is refused at construction.
+#[test]
+fn an_unsendable_platform_token_is_refused() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.platform = "i os".into();
+    let mock = Arc::new(Mock::default());
+    let error = client(mock, options).err().unwrap();
+    assert!(error.to_string().contains("platform"), "{error}");
 }

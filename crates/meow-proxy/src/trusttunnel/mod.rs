@@ -1,5 +1,6 @@
-//! TrustTunnel HTTP/2 client outbound. TLS and outbound sockets use the
-//! workspace transport and dialer; the wire protocol is kept private.
+//! TrustTunnel client outbound, over HTTP/2 or (opt-in, `quic: true`)
+//! HTTP/3. The H2 transport's TLS and outbound sockets use the workspace
+//! transport and dialer; the wire protocol is kept private.
 
 mod protocol;
 use async_trait::async_trait;
@@ -10,13 +11,23 @@ use meow_transport::{
     tls::{ConnectTypedError, TlsConfig, TlsLayer},
     TransportError,
 };
-pub use protocol::Options;
-use protocol::{Client, Connector, IoStream, UdpAssociation};
+use protocol::{Client, H2Connector, IoStream, StreamConnector, UdpAssociation};
+pub use protocol::{ExtraHeaders, Options};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
+
+/// Which transport carries the CONNECTs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// HTTP/2 over TLS (PROTOCOL.md §3.1).
+    H2,
+    /// HTTP/3 over QUIC (PROTOCOL.md §3.2).
+    #[cfg(feature = "trusttunnel-h3")]
+    H3,
+}
 
 /// BoringSSL's certificate verification result. No peer-provided text,
 /// credentials, or transport failure is presented as a certificate error.
@@ -47,7 +58,7 @@ struct TlsConnector {
     dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
 #[async_trait]
-impl Connector for TlsConnector {
+impl StreamConnector for TlsConnector {
     async fn connect(&self) -> io::Result<Box<dyn IoStream>> {
         // Shared sessions serve user streams even when housekeeping opens
         // them first. Mark the physical dial as user use, like other mux
@@ -108,23 +119,24 @@ impl TrustTunnelAdapter {
         name: &str,
         server: &str,
         port: u16,
-        mut tls: TlsConfig,
+        tls: TlsConfig,
         options: Options,
         udp: bool,
+        transport: Transport,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
-        tls.alpn = vec!["h2".into()];
-        tls.min_version = Some(meow_transport::tls::TlsVersion::Tls12);
-        let tls = TlsLayer::new(&tls).map_err(|e| MeowError::Config(e.to_string()))?;
-        let client = Client::new(
-            Arc::new(TlsConnector {
-                server: server.into(),
+        let connector = match transport {
+            Transport::H2 => Self::h2_connector(server, port, tls, dialer)?,
+            #[cfg(feature = "trusttunnel-h3")]
+            Transport::H3 => Arc::new(protocol::QuicConnector::new(
+                server,
                 port,
-                tls,
-                dialer,
-            }),
-            options,
-        )?;
+                tls.sni.as_deref().unwrap_or(server),
+                tls.skip_cert_verify,
+                options.timeout,
+            )) as Arc<dyn protocol::Connector>,
+        };
+        let client = Client::new(connector, options)?;
         Ok(Self {
             name: name.into(),
             addr: if matches!(server.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
@@ -136,6 +148,23 @@ impl TrustTunnelAdapter {
             udp,
             health: ProxyHealth::new(),
         })
+    }
+
+    fn h2_connector(
+        server: &str,
+        port: u16,
+        mut tls: TlsConfig,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
+    ) -> Result<Arc<dyn protocol::Connector>> {
+        tls.alpn = vec!["h2".into()];
+        tls.min_version = Some(meow_transport::tls::TlsVersion::Tls12);
+        let tls = TlsLayer::new(&tls).map_err(|e| MeowError::Config(e.to_string()))?;
+        Ok(Arc::new(H2Connector::new(Arc::new(TlsConnector {
+            server: server.into(),
+            port,
+            tls,
+            dialer,
+        }))))
     }
 }
 

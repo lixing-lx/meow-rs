@@ -21,10 +21,11 @@ fn disabled_protocol_fails_node_parsing() {
 }
 
 fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
-    // Enabled H2 builds must reject an H3 request; disabled builds must
-    // reject the protocol itself. Either way the name has to stay bound to
-    // something that cannot dial, rather than disappearing.
-    node("quic: true\n")
+    // Enabled builds must reject a TLS policy they do not implement;
+    // disabled builds must reject the protocol itself. Either way the name
+    // has to stay bound to something that cannot dial, rather than
+    // disappearing.
+    node("fingerprint: 00\n")
 }
 
 /// Every assertion below is the same contract: the node's own slot survives
@@ -41,6 +42,53 @@ async fn assert_unavailable(proxy: &std::sync::Arc<dyn meow_common::Proxy>) {
         .to_string();
     assert!(error.contains(proxy.name()), "{error}");
     assert!(!error.contains("test-only"), "{error}");
+}
+
+#[cfg(feature = "trusttunnel")]
+#[test]
+fn user_agent_and_header_fields_are_accepted() {
+    // `platform` / `app-name` are the spec's two user-agent fields, and
+    // `headers:` rides on every CONNECT with Surge's own padding syntax.
+    meow_config::proxy_parser::parse_proxy(
+        &node(
+            "platform: ios\napp-name: AdGuard VPN\nheaders:\n  X-Padding: \"<random-string(16-32)>\"\n  X-Fixed: constant\n",
+        ),
+        false,
+    )
+    .expect("the fingerprint knobs must parse");
+    // Absent, null and empty-map declarations keep the defaults.
+    meow_config::proxy_parser::parse_proxy(
+        &node("platform: null\napp-name: null\nheaders: null\n"),
+        false,
+    )
+    .expect("nulls must stay inert, as every other optional field is");
+}
+
+#[cfg(feature = "trusttunnel")]
+#[test]
+fn malformed_user_agent_and_header_fields_name_the_defect() {
+    for (extra, needle) in [
+        ("platform: \"i os\"\n", "platform cannot contain whitespace"),
+        ("app-name: \"\"\n", "app-name is empty"),
+        ("headers: [one, two]\n", "headers must be a map"),
+        ("headers:\n  X-Pad: 7\n", "header 'X-Pad' must be a string"),
+        (
+            "headers:\n  X-Pad: \"<random-string(32>\"\n",
+            "unterminated",
+        ),
+        ("headers:\n  X-Pad: \"<random-string(9-4)>\"\n", "inverted"),
+        (
+            "headers:\n  proxy-authorization: \"Basic x\"\n",
+            "set by the adapter itself",
+        ),
+        ("headers:\n  \"bad name\": ok\n", "is not a header name"),
+    ] {
+        let error = meow_config::proxy_parser::parse_proxy(&node(extra), false)
+            .err()
+            .unwrap_or_else(|| panic!("{extra} must not parse"));
+        assert!(error.contains(needle), "{extra} -> {error}");
+        assert!(!error.contains("test-only"), "{error}");
+    }
 }
 
 #[cfg(feature = "trusttunnel")]
@@ -342,10 +390,47 @@ mod enabled {
         }
     }
 
+    /// `quic: true` is the HTTP/3 transport, behind its own feature because
+    /// quiche is not in an H2-only build's dependency graph at all.
+    #[cfg(not(feature = "trusttunnel-h3"))]
+    #[test]
+    fn quic_names_the_feature_that_carries_it() {
+        let error = parse_proxy(&node("quic: true\n"), false).err().unwrap();
+        assert!(error.contains("HTTP/3"), "{error}");
+        assert!(error.contains("--features trusttunnel-h3"), "{error}");
+    }
+
+    #[cfg(feature = "trusttunnel-h3")]
+    #[test]
+    fn quic_nodes_parse_and_refuse_what_h3_cannot_honor() {
+        for extra in [
+            "quic: true\n",
+            "quic: true\nalpn: [h3]\nudp: true\nsni: vpn.example.test\nskip-cert-verify: true\n",
+            "quic: true\nmax-connections: 2\nmin-streams: 1\nplatform: ios\napp-name: Surge\n",
+        ] {
+            assert!(parse_proxy(&node(extra), false).is_ok(), "{extra}");
+        }
+        // The transport decides the ALPN, so each one rejects the other's.
+        for (extra, expected) in [
+            ("quic: true\nalpn: [h2]\n", "alpn: [h3]"),
+            ("alpn: [h3]\n", "alpn: [h2]"),
+            (
+                "quic: true\nclient-fingerprint: chrome\n",
+                "client-fingerprint",
+            ),
+            (
+                "quic: true\nname-cert-verify: other.test\n",
+                "name-cert-verify",
+            ),
+        ] {
+            let error = parse_proxy(&node(extra), false).err().unwrap();
+            assert!(error.contains(expected), "{extra}: {error}");
+        }
+    }
+
     #[test]
     fn unsupported_transport_and_tls_policies_are_explicit_errors() {
         for (extra, expected) in [
-            ("quic: true\n", "HTTP/3"),
             ("alpn: [http/1.1]\n", "alpn"),
             ("fingerprint: 00\n", "fingerprint"),
             ("ech-opts: {enable: true}\n", "ech-opts"),

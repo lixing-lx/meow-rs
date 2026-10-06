@@ -158,6 +158,13 @@ cargo test -p meow-proxy --no-default-features --features trusttunnel --test tru
 cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
 cargo test -p meow-config --no-default-features --test trusttunnel_config_test
 cargo test -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider
+# `trusttunnel-h3` (the `quic: true` transport) is a second opt-in feature on
+# top: the quiche driver, its in-tree HTTP/3 peer tests, the official
+# endpoint's `[listen_protocols.quic]` interop leg and the `quic:` parser
+# contract never compile under the runs above.
+cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel
+cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e
+cargo test -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test
 
 # The official TrustTunnel test peer is required for the e2e target.
 # Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,
