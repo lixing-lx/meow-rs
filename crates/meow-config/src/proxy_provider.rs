@@ -48,7 +48,7 @@ pub struct ProxyProvider {
     /// this handle is republished on every routing install, so provider
     /// nodes — which outlive individual config builds — always resolve the
     /// *current* route map, matching mihomo's by-name-at-dial-time model.
-    dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    dialer_registry: ProxyRegistry,
     /// `proxy:` — the name this provider's HTTP fetches resolve against the
     /// same republished cell at fetch time (upstream resolves the vehicle's
     /// proxy per request). `None` = direct (`proxy:` absent, empty, or
@@ -472,10 +472,7 @@ impl ProxyProvider {
     /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
     /// a 200-OK garbage body can't durably poison the fallback cache.
     async fn fetch_source(&self) -> Result<String, String> {
-        self.fetch_source_with_registry(&self.dialer_registry).await
-    }
-
-    async fn fetch_source_with_registry(&self, registry: &ProxyRegistry) -> Result<String, String> {
+        let registry = &self.dialer_registry;
         match &self.vehicle {
             Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
                 format!(
@@ -522,15 +519,7 @@ impl ProxyProvider {
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
     async fn fetch_content(&self) -> Result<(String, bool), String> {
-        self.fetch_content_with_registry(&self.dialer_registry)
-            .await
-    }
-
-    async fn fetch_content_with_registry(
-        &self,
-        registry: &ProxyRegistry,
-    ) -> Result<(String, bool), String> {
-        match self.fetch_source_with_registry(registry).await {
+        match self.fetch_source().await {
             Ok(text) => Ok((text, true)),
             Err(e) => match &self.vehicle {
                 Vehicle::Http { cache_path, .. } => {
@@ -705,7 +694,11 @@ impl ProxyProvider {
                         raw_name
                     };
                     warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable trusttunnel node so nothing can dial past it");
-                    result.push(crate::unavailable_placeholder(label, &e));
+                    result.push(crate::unavailable_placeholder(
+                        label,
+                        &e,
+                        meow_common::AdapterType::TrustTunnel,
+                    ));
                 }
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -898,10 +891,7 @@ impl ProxyProvider {
     /// `declared_dialers` from different payloads.
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, from_remote) = self
-            .fetch_content_with_registry(&self.dialer_registry)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let (content, from_remote) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
         self.ingest(content, from_remote).await.map(|_| ())
     }
 

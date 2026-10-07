@@ -73,17 +73,39 @@ impl StreamConnector for Mock {
                     });
                     continue;
                 }
-                let status = if reject { 407 } else { 200 };
+                if authority == "silent.test:443" {
+                    // The CONNECT is accepted and never answered. A pooled
+                    // connection whose peer went away without saying so —
+                    // an expired NAT entry, a slept laptop — looks exactly
+                    // like this from the client's side: no error, no
+                    // response, just the dial deadline.
+                    tokio::spawn(async move {
+                        let _request = request;
+                        let _response = response;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
+                // A refusal the endpoint *answers*: the target could not be
+                // reached, which says nothing about this connection.
+                let refused = authority == "refuse.test:443";
+                let status = if reject {
+                    407
+                } else if refused {
+                    502
+                } else {
+                    200
+                };
                 let reply = http::Response::builder().status(status).body(()).unwrap();
                 let mut send = response
-                    .send_response(reply, reject || authority == "_check")
+                    .send_response(reply, reject || refused || authority == "_check")
                     .unwrap();
                 let mut recv = request.into_body();
                 if goaway && authority == "drain.test:443" {
                     server.graceful_shutdown();
                 }
                 tokio::spawn(async move {
-                    if reject || authority == "_check" {
+                    if reject || refused || authority == "_check" {
                         return;
                     }
                     if authority == "hold.test:443" {
@@ -783,6 +805,97 @@ async fn a_configured_user_agent_replaces_the_spec_shaped_one() {
     let _tunnel = client.tcp("example.test:443").await.unwrap();
     assert_eq!(agent(&mock, "_check"), "ios AdGuard/2.1");
     assert_eq!(agent(&mock, "example.test:443"), "ios AdGuard/2.1");
+}
+
+/// A CONNECT that never gets its response headers retires the connection it
+/// was sent on.
+///
+/// Nothing else can: a silent peer errors nothing, so `admit` grants and the
+/// request lands in the kernel buffer. If only the caller's deadline ended
+/// the dial, the session would stay pooled and `existing()` would elect it
+/// again — with no active streams it is the *least loaded* candidate — so
+/// every subsequent dial would burn its whole deadline too, until the
+/// kernel's retransmit timeout finally errored the socket. Each failure is an
+/// ordinary `TimedOut`, which is what `DialFailureTracker` dead-marks a
+/// healthy node over.
+#[tokio::test]
+async fn an_unanswered_connect_retires_the_connection_it_was_sent_on() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 2;
+    options.timeout = Duration::from_millis(300);
+    let (client, mock) = with_options(options);
+    let error = client.tcp("silent.test:443").await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        client.session_count(),
+        0,
+        "a connection that never answered must stop attracting dials"
+    );
+    // The next dial therefore handshakes a fresh connection instead of
+    // paying the deadline again on the dead one.
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), client.tcp("next.test:80"))
+        .await
+        .expect("the dial must not re-elect the silent connection")
+        .expect("a fresh connection must carry it");
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
+    stream.write_all(b"alive").await.unwrap();
+    let mut bytes = [0; 5];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"alive");
+    assert_eq!(client.session_count(), 1);
+}
+
+/// The opposite case, so the retire above is not simply "any failed dial
+/// kills the connection": a CONNECT the endpoint *answers* with a refusal
+/// says nothing bad about the connection, and the stream it was refused on
+/// is the only thing lost.
+#[tokio::test]
+async fn an_answered_refusal_keeps_the_connection_pooled() {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    let (client, mock) = with_options(options);
+    let _live = client.tcp("first.test:443").await.unwrap();
+    let error = client.tcp("refuse.test:443").await.err().unwrap();
+    assert!(error.to_string().contains("502"), "{error}");
+    assert_eq!(client.session_count(), 1);
+    let _reused = client.tcp("second.test:443").await.unwrap();
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 1);
+}
+
+/// `Connector::connect` promises that everything the connection owns stops
+/// when its token fires, and the pool owes that token a `cancel()` however
+/// the dial ends — including the caller's deadline dropping the future
+/// mid-handshake. Dropping a `CancellationToken` does not cancel it, and a
+/// transport that spawns before its handshake resolves (the H3 driver does)
+/// would otherwise be left running with nobody to retire it.
+#[tokio::test]
+async fn a_dial_abandoned_mid_handshake_cancels_the_connections_token() {
+    struct Stalling {
+        token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    }
+    #[async_trait]
+    impl super::Connector for Stalling {
+        async fn connect(
+            &self,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> io::Result<Box<dyn super::Connection>> {
+            *self.token.lock().unwrap() = Some(cancel);
+            std::future::pending().await
+        }
+    }
+    let connector = Arc::new(Stalling {
+        token: std::sync::Mutex::new(None),
+    });
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.timeout = Duration::from_millis(200);
+    let client = Client::new(Arc::<Stalling>::clone(&connector), options).unwrap();
+    let error = client.tcp("example.test:443").await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let token = connector.token.lock().unwrap().clone().unwrap();
+    assert!(
+        token.is_cancelled(),
+        "an abandoned dial must still retire whatever its connector started"
+    );
 }
 
 /// The credential header is the adapter's own; a config that could overwrite

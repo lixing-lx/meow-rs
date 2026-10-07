@@ -34,6 +34,15 @@ fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
 /// names the node without quoting its credentials.
 async fn assert_unavailable(proxy: &std::sync::Arc<dyn meow_common::Proxy>) {
     assert!(!proxy.alive(), "a placeholder must never look usable");
+    // The declared type, dead — not `Reject`. Reporting `Reject` would make
+    // the misconfiguration this placeholder exists to surface look like an
+    // intentional one in `/proxies`, in the tunnel's match statistics, and in
+    // the group dial-failure exemptions.
+    assert_eq!(
+        proxy.adapter_type(),
+        meow_common::AdapterType::TrustTunnel,
+        "a placeholder must keep the node's own type"
+    );
     let error = proxy
         .dial_tcp(&meow_common::Metadata::default())
         .await
@@ -82,6 +91,23 @@ fn malformed_user_agent_and_header_fields_name_the_defect() {
             "set by the adapter itself",
         ),
         ("headers:\n  \"bad name\": ok\n", "is not a header name"),
+        // Connection-specific headers are illegal on HTTP/2 and HTTP/3
+        // (RFC 9113 §8.2.2 / RFC 9114 §4.2) — and `connection: keep-alive`
+        // is exactly what gets added to "look like a browser". A receiver
+        // resets the stream, which would surface as this node failing.
+        (
+            "headers:\n  Connection: keep-alive\n",
+            "would treat the CONNECT as malformed",
+        ),
+        (
+            "headers:\n  Transfer-Encoding: chunked\n",
+            "would treat the CONNECT as malformed",
+        ),
+        // One header, two spellings: it would be sent twice.
+        (
+            "headers:\n  User-Agent: a\n  user-agent: b\n",
+            "declared twice",
+        ),
     ] {
         let error = meow_config::proxy_parser::parse_proxy(&node(extra), false)
             .err()

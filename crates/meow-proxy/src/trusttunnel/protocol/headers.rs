@@ -41,6 +41,34 @@ const CLOSE: &str = ")>";
 /// it wholesale is the point of the knob.
 const RESERVED: &[&str] = &["proxy-authorization"];
 
+/// Header names no HTTP/2 or HTTP/3 request may carry.
+///
+/// Both versions removed the connection-specific headers (RFC 9113 §8.2.2,
+/// RFC 9114 §4.2): a receiver treats a request carrying one as malformed and
+/// resets the stream, which this client reports as a dial failure and
+/// `DialFailureTracker` eventually dead-marks the node over. `connection:
+/// keep-alive` is exactly what someone adds to "look like a browser", and
+/// neither h2 nor the HTTP/3 encoder strips it for us — so the name is
+/// refused at config load, where the mistake is still visible.
+///
+/// `te` is listed even though `te: trailers` is the one legal form, because a
+/// CONNECT tunnel has no trailers to ask for; `host` and `content-length`
+/// describe a message body a CONNECT does not have.
+const UNSENDABLE: &[&str] = &[
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Random bytes drawn at a time while rendering a placeholder. One stack
+/// buffer, so the rendered `String` stays the only allocation per CONNECT.
+const RANDOM_CHUNK: usize = 64;
+
 /// One header value, split into its literal and random runs.
 ///
 /// Parsed once at config load so a defect is reported against the node that
@@ -129,13 +157,19 @@ impl Template {
                         min + rand::rng().next_u32() as usize % (span + 1)
                     };
                     let start = out.len();
-                    out.reserve(length);
-                    // Fill in place: the alphabet index is the low 6 bits of
-                    // each random byte, so one pass of entropy is enough.
-                    let mut bytes = vec![0u8; length];
-                    rand::rng().fill_bytes(&mut bytes);
-                    for byte in &bytes {
-                        out.push(ALPHABET[(byte & 0x3f) as usize] as char);
+                    // The alphabet index is the low 6 bits of each random
+                    // byte, so one pass of entropy is enough — drawn a
+                    // stack buffer at a time rather than into a throwaway
+                    // `Vec` per placeholder per request.
+                    let mut chunk = [0u8; RANDOM_CHUNK];
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        let bytes = &mut chunk[..remaining.min(RANDOM_CHUNK)];
+                        rand::rng().fill_bytes(bytes);
+                        for byte in &*bytes {
+                            out.push(ALPHABET[(byte & 0x3f) as usize] as char);
+                        }
+                        remaining -= bytes.len();
                     }
                     debug_assert_eq!(out.len() - start, length);
                 }
@@ -215,6 +249,18 @@ impl ExtraHeaders {
                 .map_err(|_| format!("'{name}' is not a header name"))?;
             if RESERVED.contains(&name.as_str()) {
                 return Err(format!("header '{name}' is set by the adapter itself"));
+            }
+            if UNSENDABLE.contains(&name.as_str()) {
+                return Err(format!(
+                    "header '{name}' cannot be sent on an HTTP/2 or HTTP/3 request; \
+                     the endpoint would treat the CONNECT as malformed"
+                ));
+            }
+            // `HeaderName` is case-insensitive, so `User-Agent` and
+            // `user-agent` are one header — declaring both would send it
+            // twice, which is itself a thing to match on.
+            if entries.iter().any(|(seen, _)| *seen == name) {
+                return Err(format!("header '{name}' is declared twice"));
             }
             let template = Template::parse(value).map_err(|e| format!("header '{name}': {e}"))?;
             overrides_user_agent |= name == http::header::USER_AGENT;
@@ -322,6 +368,22 @@ mod tests {
         );
     }
 
+    /// Rendering draws entropy a stack buffer at a time, so a run longer than
+    /// one draw has to come out exactly as long — and still inside the
+    /// alphabet.
+    #[test]
+    fn a_placeholder_longer_than_one_random_draw_renders_exactly() {
+        let length = RANDOM_CHUNK * 3 + 7;
+        let template = Template::parse(&format!("<random-string({length})>")).unwrap();
+        let rendered = template.render();
+        assert_eq!(rendered.len(), length);
+        assert!(
+            rendered.bytes().all(|b| ALPHABET.contains(&b)),
+            "{rendered}"
+        );
+        assert_ne!(rendered, template.render());
+    }
+
     #[test]
     fn a_range_placeholder_stays_inside_its_range() {
         let template = Template::parse("p=<random-string(4-9)>;q").unwrap();
@@ -340,9 +402,12 @@ mod tests {
 
     #[test]
     fn several_placeholders_in_one_value_are_independent() {
-        let template = Template::parse("<random-string(16)>-<random-string(16)>").unwrap();
+        // Separated by a character the alphabet cannot produce: `-` and `_`
+        // are both URL-safe, so splitting on either would land inside a run
+        // roughly two renders in five.
+        let template = Template::parse("<random-string(16)>.<random-string(16)>").unwrap();
         let rendered = template.render();
-        let (left, right) = rendered.split_once('-').unwrap();
+        let (left, right) = rendered.split_once('.').unwrap();
         assert_eq!((left.len(), right.len()), (16, 16));
         assert_ne!(left, right);
     }
@@ -388,6 +453,41 @@ mod tests {
         assert!(set(":method").contains("is not a header name"));
         assert!(set("bad header").contains("is not a header name"));
         assert!(ExtraHeaders::new(&[], 8).unwrap().iter().next().is_none());
+    }
+
+    /// `headers: {connection: keep-alive}` is exactly what an operator adds
+    /// to look like a browser — and exactly what makes an HTTP/2 or HTTP/3
+    /// receiver treat the CONNECT as malformed and reset the stream, which
+    /// this client would report as a dial failure against a working node. The
+    /// name has to be refused where the operator can still see it.
+    #[test]
+    fn headers_that_no_h2_or_h3_request_may_carry_are_rejected() {
+        for name in UNSENDABLE {
+            let error = ExtraHeaders::new(&[((*name).to_string(), "x".to_string())], 8)
+                .err()
+                .unwrap_or_else(|| panic!("'{name}' must not be accepted"));
+            assert!(error.contains("malformed"), "{name}: {error}");
+        }
+        // Case is irrelevant — `HeaderName` normalises before the check.
+        assert!(ExtraHeaders::new(&[("Connection".into(), "close".into())], 8).is_err());
+        // Nothing adjacent got caught in the net.
+        assert!(ExtraHeaders::new(&[("accept-encoding".into(), "gzip".into())], 8).is_ok());
+    }
+
+    /// Two spellings of one header name would be sent twice, which is its own
+    /// distinguishing mark — and for `user-agent` it would also fight the
+    /// override the knob exists to allow.
+    #[test]
+    fn a_header_declared_twice_is_rejected() {
+        let error = ExtraHeaders::new(
+            &[
+                ("User-Agent".into(), "first".into()),
+                ("user-agent".into(), "second".into()),
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(error.contains("declared twice"), "{error}");
     }
 
     #[test]

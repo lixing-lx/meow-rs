@@ -28,13 +28,15 @@ use meow_common::{
 pub struct UnavailableAdapter {
     name: String,
     reason: String,
+    declared: AdapterType,
     health: ProxyHealth,
 }
 
 impl UnavailableAdapter {
     /// `reason` is rendered into every dial error, so it must not carry
-    /// anything from the node's credential fields.
-    pub fn new(name: impl Into<String>, reason: impl Into<String>) -> Self {
+    /// anything from the node's credential fields. `declared` is the type the
+    /// node asked to be — see [`UnavailableAdapter::adapter_type`].
+    pub fn new(name: impl Into<String>, reason: impl Into<String>, declared: AdapterType) -> Self {
         let health = ProxyHealth::new();
         // Dead from birth: this adapter has no connection to lose, and a
         // group must treat it as unusable without having to probe it first.
@@ -42,6 +44,7 @@ impl UnavailableAdapter {
         Self {
             name: name.into(),
             reason: reason.into(),
+            declared,
             health,
         }
     }
@@ -60,11 +63,17 @@ impl ProxyAdapter for UnavailableAdapter {
         &self.name
     }
 
-    /// Reported as `Reject` rather than a new tag: it is the existing type
-    /// whose contract ("this outbound never carries traffic") matches, so
-    /// the API's proxy listing and the rule engine need no new arm.
+    /// The type the node *declared*, with `alive = false` — not `Reject`.
+    ///
+    /// Reporting `Reject` would make a misconfigured node indistinguishable
+    /// from an intentional one everywhere the type is consumed: `/proxies`
+    /// would list it as `type: Reject`, the tunnel would bucket rule hits on
+    /// it as action `REJECT` in match statistics, and `record_dial_failure`
+    /// would exempt it as a type whose errors describe the target. The whole
+    /// purpose of this adapter is to make the misconfiguration visible, so it
+    /// keeps the declared type and lets `alive = false` carry the bad news.
     fn adapter_type(&self) -> AdapterType {
-        AdapterType::Reject
+        self.declared
     }
 
     fn addr(&self) -> &str {
@@ -104,7 +113,11 @@ mod tests {
     use super::*;
 
     fn fixture() -> UnavailableAdapter {
-        UnavailableAdapter::new("vpn-tokyo", "trusttunnel is not compiled into this build")
+        UnavailableAdapter::new(
+            "vpn-tokyo",
+            "trusttunnel is not compiled into this build",
+            AdapterType::TrustTunnel,
+        )
     }
 
     #[test]
@@ -113,7 +126,10 @@ mod tests {
         assert_eq!(adapter.name(), "vpn-tokyo");
         assert!(!adapter.health().alive());
         assert!(!adapter.support_udp());
-        assert_eq!(adapter.adapter_type(), AdapterType::Reject);
+        // The declared type, not `Reject`: a node that failed to parse must
+        // not read as an intentional reject in the API listing, in match
+        // statistics, or in the group dial-failure exemptions.
+        assert_eq!(adapter.adapter_type(), AdapterType::TrustTunnel);
     }
 
     #[tokio::test]

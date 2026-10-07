@@ -134,7 +134,7 @@ impl TrustTunnelAdapter {
                 tls.sni.as_deref().unwrap_or(server),
                 tls.skip_cert_verify,
                 options.timeout,
-            )) as Arc<dyn protocol::Connector>,
+            )?) as Arc<dyn protocol::Connector>,
         };
         let client = Client::new(connector, options)?;
         Ok(Self {

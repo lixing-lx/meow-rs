@@ -36,8 +36,12 @@ pub struct QuicConnector {
     /// SNI, and the name the certificate is verified against: quiche binds
     /// the two together, which is why `name-cert-verify` is refused here.
     server_name: String,
-    insecure: bool,
-    idle: Duration,
+    /// Built once, as the H2 path builds its `TlsLayer` once at config load:
+    /// seeding the verify store parses the whole webpki root bundle (~140 DER
+    /// certificates) into a fresh `X509Store`, which is not work a dial
+    /// should repeat. `quiche::connect` needs `&mut Config` but holds no
+    /// reference afterwards, so one mutex over the whole call is enough.
+    config: std::sync::Mutex<quiche::Config>,
 }
 
 impl QuicConnector {
@@ -51,14 +55,13 @@ impl QuicConnector {
         server_name: &str,
         insecure: bool,
         timeout: Duration,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        Ok(Self {
             host: host.to_owned(),
             port,
             server_name: server_name.to_owned(),
-            insecure,
-            idle: timeout.saturating_mul(4),
-        }
+            config: std::sync::Mutex::new(tls::build(insecure, timeout.saturating_mul(4))?),
+        })
     }
 
     async fn dial(
@@ -73,19 +76,24 @@ impl QuicConnector {
         };
         let socket = meow_common::bind_udp(bind).await?;
         let local = socket.local_addr()?;
-        let mut config = tls::build(self.insecure, self.idle)?;
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
         for byte in &mut scid {
             *byte = rand::random();
         }
-        let conn = quiche::connect(
-            Some(&self.server_name),
-            &quiche::ConnectionId::from_ref(&scid),
-            local,
-            peer,
-            &mut config,
-        )
-        .map_err(|e| io::Error::other(format!("TrustTunnel QUIC setup: {e}")))?;
+        let conn = {
+            let mut config = self
+                .config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            quiche::connect(
+                Some(&self.server_name),
+                &quiche::ConnectionId::from_ref(&scid),
+                local,
+                peer,
+                &mut config,
+            )
+            .map_err(|e| io::Error::other(format!("TrustTunnel QUIC setup: {e}")))?
+        };
         let (cmd_tx, shared) = driver::spawn(socket, local, conn, cancel).await?;
         Ok(Box::new(H3Connection { cmd_tx, shared }))
     }

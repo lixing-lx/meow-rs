@@ -138,7 +138,8 @@ fn connect(endpoint: &Endpoint, options: Options) -> Client {
         "localhost",
         true,
         options.timeout,
-    );
+    )
+    .unwrap();
     Client::new(Arc::new(connector), options).unwrap()
 }
 
@@ -542,6 +543,53 @@ async fn an_endpoint_that_does_not_speak_h3_is_refused() {
     assert_ne!(error.kind(), io::ErrorKind::TimedOut, "{error}");
     assert_eq!(client.session_count(), 0);
     assert_eq!(endpoint.connections(), 1);
+}
+
+/// A dial that gives up while the QUIC handshake is still pending must take
+/// its driver task with it.
+///
+/// This transport spawns the driver *before* the handshake resolves — it is
+/// what drives the handshake — so an abandoned dial is the one case where the
+/// task outlives every handle to it. Nothing else would retire it: dropping
+/// the `CancellationToken` does not cancel it, and quiche keeps retransmitting
+/// Initial packets at an endpoint nobody is dialling any more. A silent
+/// endpoint makes that visible as packets arriving after the dial has failed.
+#[tokio::test]
+async fn a_dial_abandoned_mid_handshake_leaves_no_driver_behind() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = silent.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&seen);
+    let sink = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 2048];
+        while silent.recv_from(&mut buffer).await.is_ok() {
+            counting.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let mut options = options();
+    options.timeout = Duration::from_millis(300);
+    let connector = QuicConnector::new(
+        &addr.ip().to_string(),
+        addr.port(),
+        "localhost",
+        true,
+        options.timeout,
+    )
+    .unwrap();
+    let client = Client::new(Arc::new(connector), options).unwrap();
+    let error = client.tcp("example.test:443").await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    let settled = seen.load(Ordering::SeqCst);
+    assert!(settled > 0, "the dial never reached the endpoint");
+    // Past quiche's first PTO (~1 s, from its 333 ms initial RTT estimate):
+    // a driver still dialling would have retransmitted by now.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        settled,
+        "an abandoned dial's driver is still talking to the endpoint"
+    );
+    sink.abort();
 }
 
 #[tokio::test]

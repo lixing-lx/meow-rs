@@ -218,6 +218,13 @@ async fn run(
 ) {
     let mut ready_tx = Some(ready_tx);
     let mut http3: Option<h3::Connection> = None;
+    // Set once every command sender is gone. A closed `mpsc::Receiver`
+    // resolves `Ready(None)` on every poll, so leaving that `select!` arm
+    // enabled would spin the whole drain period (3×PTO) on a worker thread,
+    // re-closing an already-closing connection each turn. Reachable today: a
+    // dial whose deadline drops `spawn` while it awaits `ready_rx` drops the
+    // only strong `cmd_tx`.
+    let mut commands_done = false;
     let mut recv_buf = vec![0u8; 65535];
     let mut send_buf = vec![0u8; 1500];
     let mut body_buf = vec![0u8; BODY_CHUNK_BYTES];
@@ -239,10 +246,15 @@ async fn run(
                 }
                 Err(error) => break 'driver error,
             },
-            cmd = st.cmd_rx.recv() => match cmd {
+            cmd = st.cmd_rx.recv(), if !commands_done => match cmd {
                 Some(cmd) => handle_cmd(&mut st, cmd),
-                // Every handle is gone, including the pool's.
-                None => { let _ = conn.close(true, H3_NO_ERROR, b""); }
+                // Every handle is gone, including the pool's. Say goodbye
+                // once and stop polling this arm; the loop now wakes only on
+                // socket and timer events until the drain completes.
+                None => {
+                    commands_done = true;
+                    let _ = conn.close(true, H3_NO_ERROR, b"");
+                }
             },
             () = sleep_opt(timeout) => conn.on_timeout(),
             () = st.read_notify.notified() => {}

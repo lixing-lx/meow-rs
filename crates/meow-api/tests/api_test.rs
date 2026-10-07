@@ -4944,6 +4944,15 @@ async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecti
         .find(|proxy| proxy.name() == "bad")
         .expect("the unparseable node keeps its slot");
     assert!(!bad.alive(), "a placeholder must never look usable");
+    // Listed as the type it declared, dead — not as `Reject`, which would
+    // make a misconfigured node indistinguishable from one the operator
+    // rejected on purpose in every consumer of the type: this listing, the
+    // tunnel's match statistics, and a group's dial-failure exemptions.
+    assert_eq!(
+        bad.adapter_type().to_string(),
+        "TrustTunnel",
+        "the placeholder must name the node's own type"
+    );
     let error = bad
         .dial_tcp(&meow_common::Metadata::default())
         .await

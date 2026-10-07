@@ -1716,9 +1716,16 @@ fn has_unresolved_group_dependency(
 /// same hole, but it also fires for a protocol the running binary simply does
 /// not contain — which the operator cannot repair by editing anything — and on
 /// a provider payload it hands a third party a daemon-wide kill switch.
-pub(crate) fn unavailable_placeholder(name: &str, reason: &str) -> Arc<dyn Proxy> {
+/// `declared` keeps the node's own type in the registry, so the placeholder
+/// reads as "the node you asked for, dead" rather than as a REJECT the
+/// operator wrote on purpose.
+pub(crate) fn unavailable_placeholder(
+    name: &str,
+    reason: &str,
+    declared: meow_common::AdapterType,
+) -> Arc<dyn Proxy> {
     Arc::new(proxy_parser::WrappedProxy::new(Box::new(
-        meow_proxy::UnavailableAdapter::new(name, reason),
+        meow_proxy::UnavailableAdapter::new(name, reason, declared),
     )))
 }
 
@@ -1757,7 +1764,7 @@ fn insert_parsed_leaves(
                     "proxies: '{name}' failed to parse ({e}); keeping the name bound \
                      to an unavailable node so no dial can fall back past it"
                 );
-                unavailable_placeholder(name, &e)
+                unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
             }
             Err(e) => {
                 warn!("Failed to parse proxy: {}", e);

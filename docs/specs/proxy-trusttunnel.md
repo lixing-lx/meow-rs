@@ -125,6 +125,25 @@ transient fetch failures retain existing offline-bootstrap behavior.
   below covers a request that reached the peer, not one that never left.
 - No application request or payload is automatically replayed. Authentication
   failure retires its session. Reset invalidates in-flight pool creation.
+- A CONNECT that never receives its response headers retires the connection it
+  was sent on. A connection whose peer has silently gone away (an expired NAT
+  entry, a slept laptop, a half-open peer) reports nothing: admission is
+  granted, the request lands in the kernel's send buffer, and only the dial
+  deadline ends the wait. Left pooled it would be re-elected by the *next*
+  dial — with no active streams it is the least loaded candidate — until the
+  kernel's retransmit timeout finally errored the socket, and each of those
+  `TimedOut` failures is exactly what `DialFailureTracker` dead-marks a
+  healthy node over. The connection leaves the admission pool rather than
+  being cancelled: a CONNECT can also go unanswered because the *target* is
+  slow, and the streams already running on that connection are not the
+  dial's business. An answered refusal (any status) keeps the connection.
+- New-connection dials are serialised: one `creating` lock covers the whole
+  dial, TLS/H2 or QUIC/H3 handshake and optional `_check`, so concurrent
+  dials that each need a *new* connection complete at 1×…N× handshake
+  latency rather than in parallel, and that wait counts against each
+  caller's own deadline. Deliberate for now — it keeps `max_connections`
+  exact without counting in-flight dials — and it only applies while the
+  pool has no connection able to take another stream.
 - Per-pool connections are capped at 16, per-session stream counts at 512,
   and UDP associations at 128. The effective per-connection ceiling is the
   lesser of the configured one and the peer's acknowledged
@@ -208,6 +227,20 @@ that is the credential. `user-agent` deliberately *can*: overriding it
 wholesale is the point of the knob, and a config that does so suppresses the
 three spec-shaped values entirely rather than sending two.
 
+Two further name rules, both enforced at config load:
+
+- The connection-specific headers (`connection`, `keep-alive`,
+  `proxy-connection`, `transfer-encoding`, `upgrade`, `te`) plus `host` and
+  `content-length` are refused. They are illegal on an HTTP/2 or HTTP/3
+  request (RFC 9113 §8.2.2, RFC 9114 §4.2) and neither h2 nor the HTTP/3
+  encoder strips them client-side, so a receiver would treat the CONNECT as
+  malformed and reset the stream — which this client reports as a dial
+  failure against a node that is fine. `connection: keep-alive` is exactly
+  what gets added to make a request "look like a browser", so the mistake is
+  reported where it is still visible.
+- A name declared twice (in any case — header names are case-insensitive) is
+  refused rather than sent twice.
+
 ## HTTP/3 transport
 
 `quic: true` selects HTTP/3 over QUIC (§3.2) instead of HTTP/2 over TLS. The
@@ -239,6 +272,13 @@ differs.
 - A handshake that fails (untrusted leaf, refused ALPN) is reported as soon
   as the connection starts draining, instead of parking the dial until its
   deadline.
+- The QUIC config — including the verify store, which parses the whole webpki
+  root bundle — is built once per adapter, as the HTTP/2 path builds its
+  `TlsLayer` once at config load, not per dial.
+- The connection's driver task is spawned *before* its handshake resolves (it
+  is what drives the handshake), so a dial abandoned by its deadline must
+  still cancel the token the connection was given; dropping a cancellation
+  token does not cancel it. The pool guarantees that on every exit path.
 
 ## Intentional divergences (ADR-0002)
 

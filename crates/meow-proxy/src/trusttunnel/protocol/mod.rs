@@ -229,6 +229,46 @@ impl Drop for Lease {
     }
 }
 
+/// Armed while a CONNECT is in flight, so a connection that never answers one
+/// leaves the pool.
+///
+/// A pooled connection whose peer has gone silent — an expired NAT entry, a
+/// laptop that slept, a half-open peer — reports nothing: `admit` grants (h2
+/// has seen no connection error), the request lands in the kernel's send
+/// buffer, and the response simply never arrives. Only the caller's deadline
+/// ends that wait, and with the session still marked reusable the *next* dial
+/// elects the very same one — it has no active streams, so it is the least
+/// loaded candidate — and pays the same deadline again, for as long as the
+/// kernel's retransmit timeout takes to error the socket. Each of those
+/// failures is an ordinary `TimedOut`, which is exactly what
+/// `DialFailureTracker` dead-marks a healthy node over.
+///
+/// Retire rather than cancel: a CONNECT can also go unanswered because the
+/// *target* is slow, and the streams already running on that connection are
+/// no business of this dial's. Leaving the admission pool costs one later
+/// handshake; cancelling would cost every live flow on it.
+struct InFlight(Option<Arc<Session>>);
+
+impl InFlight {
+    fn arm(session: &Arc<Session>) -> Self {
+        Self(Some(Arc::clone(session)))
+    }
+
+    /// The response headers arrived (whatever their status): the connection
+    /// demonstrably works.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            session.reusable.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client(Arc<Inner>);
 
@@ -305,11 +345,14 @@ impl Client {
         }
     }
 
+    /// Sessions the pool can still elect — retired ones (cancelled, or marked
+    /// unusable by [`InFlight`]) are left for the next `existing()` sweep to
+    /// drop, so counting the vector itself would not say what a dial sees.
     #[cfg(test)]
     pub fn session_count(&self) -> usize {
         lock(&self.0.sessions)
             .iter()
-            .filter(|s| !s.cancel.is_cancelled())
+            .filter(|s| !s.cancel.is_cancelled() && s.reusable.load(Ordering::Acquire))
             .count()
     }
 
@@ -372,15 +415,14 @@ impl Client {
             return Ok(lease);
         }
         let cancel = lock(&self.0.network_cancel).child_token();
-        let link = match self.0.connector.connect(cancel.clone()).await {
-            Ok(link) => link,
-            Err(error) => {
-                // A half-established connection owns tasks keyed on this
-                // token; nothing else will ever retire them.
-                cancel.cancel();
-                return Err(error);
-            }
-        };
+        // A half-established connection owns tasks keyed on this token, and
+        // nothing else will ever retire them. The guard covers every way out
+        // of the await, including the caller's deadline dropping this future
+        // — dropping a `CancellationToken` does not cancel it, and the H3
+        // driver task is spawned before its handshake resolves.
+        let guard = cancel.clone().drop_guard();
+        let link = self.0.connector.connect(cancel.clone()).await?;
+        guard.disarm();
         let session = Arc::new(Session {
             link,
             cancel,
@@ -428,7 +470,15 @@ impl Client {
     /// itself gone leaves the admission pool, so the caller's retry picks a
     /// different one.
     async fn admit(lease: &Lease) -> Admission {
+        // `existing()` only elects a connection below the peer's acknowledged
+        // stream ceiling, so h2's `ready()` has a slot waiting for it: a wait
+        // that outlives the caller's deadline means the connection stopped
+        // answering. (If the peer shrank its limit under live streams the wait
+        // is legitimate — retiring the connection is still the conservative
+        // answer, and costs one later handshake.)
+        let inflight = InFlight::arm(&lease.0);
         let admission = lease.0.link.admit().await;
+        inflight.disarm();
         if matches!(admission, Admission::Closed) {
             lease.0.reusable.store(false, Ordering::Release);
         }
@@ -513,7 +563,13 @@ impl Client {
             .body(())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid CONNECT request"))?;
         let end = authority == "_check";
+        // From here to the response headers the connection is on trial: this
+        // future is dropped by the caller's deadline (`tcp`/`udp` own the only
+        // one), and a silent peer is otherwise indistinguishable from an idle
+        // connection. See [`InFlight`].
+        let inflight = InFlight::arm(&lease.0);
         let (status, stream) = opener.open(request, end).await?;
+        inflight.disarm();
         if status != StatusCode::OK {
             // Dropping the stream resets it, on either transport.
             drop(stream);
