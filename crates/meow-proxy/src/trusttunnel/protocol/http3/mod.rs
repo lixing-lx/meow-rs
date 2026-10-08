@@ -105,9 +105,23 @@ impl super::Connector for QuicConnector {
         let peers = meow_common::resolve_host_all(&self.host, self.port).await?;
         let mut last = None;
         for peer in peers {
-            match self.dial(peer, cancel.clone()).await {
-                Ok(connection) => return Ok(connection),
-                Err(error) => last = Some(error),
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "TrustTunnel QUIC dial was cancelled",
+                ));
+            }
+            // A failed driver cancels only this address's attempt. The
+            // session token must remain live for the next address. The
+            // guard also stops the driver if the caller drops this await.
+            let attempt = cancel.child_token();
+            let guard = attempt.clone().drop_guard();
+            match self.dial(peer, attempt).await {
+                Ok(connection) => {
+                    guard.disarm();
+                    return Ok(connection);
+                }
+                Err(error) => last = meow_common::MeowError::prefer_errno_io(last, error),
             }
         }
         Err(last.unwrap_or_else(|| {
@@ -126,8 +140,14 @@ struct H3Connection {
 
 #[async_trait]
 impl Connection for H3Connection {
+    fn is_reusable(&self) -> bool {
+        self.shared.accepting.load(Ordering::Acquire)
+            && !self.shared.closed.load(Ordering::Relaxed)
+            && !self.cmd_tx.is_closed()
+    }
+
     async fn admit(&self) -> Admission {
-        if self.shared.closed.load(Ordering::Relaxed) || self.cmd_tx.is_closed() {
+        if !self.is_reusable() {
             return Admission::Closed;
         }
         // Out of stream credit: the connection is healthy, so it stays

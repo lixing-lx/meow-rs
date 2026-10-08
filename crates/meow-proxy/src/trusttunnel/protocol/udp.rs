@@ -29,6 +29,7 @@ struct Packet {
 
 pub(crate) struct Mux {
     cancel: CancellationToken,
+    retiring: CancellationToken,
     send: mpsc::Sender<Bytes>,
     peers: Mutex<HashMap<SocketAddr, mpsc::Sender<Packet>>>,
     next_port: AtomicU16,
@@ -39,10 +40,15 @@ pub(crate) struct Mux {
 }
 
 impl Mux {
-    pub(crate) fn new(stream: TunnelStream, parent: &CancellationToken) -> Arc<Self> {
+    pub(crate) fn new(
+        stream: TunnelStream,
+        parent: &CancellationToken,
+        retiring: &CancellationToken,
+    ) -> Arc<Self> {
         let (send, mut queue) = mpsc::channel::<Bytes>(32);
         let mux = Arc::new(Self {
             cancel: parent.child_token(),
+            retiring: retiring.clone(),
             send,
             peers: Mutex::new(HashMap::new()),
             next_port: AtomicU16::new(1024),
@@ -53,9 +59,24 @@ impl Mux {
         });
         let (mut reader, mut writer) = tokio::io::split(stream);
         let cancel = mux.cancel.clone();
+        let retiring = retiring.clone();
+        let weak = Arc::downgrade(&mux);
         super::spawn_scoped(async move {
+            let mut retirement_seen = false;
             loop {
-                let frame = tokio::select! { _ = cancel.cancelled() => break, frame = queue.recv() => frame };
+                let frame = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = retiring.cancelled(), if !retirement_seen => {
+                        // The signal stays ready after retirement: observe
+                        // it once, then let the last association stop us.
+                        retirement_seen = true;
+                        if let Some(mux) = weak.upgrade() {
+                            mux.stop_if_retired_and_idle();
+                        }
+                        continue;
+                    }
+                    frame = queue.recv() => frame,
+                };
                 let Some(frame) = frame else {
                     break;
                 };
@@ -149,6 +170,15 @@ impl Mux {
     pub(crate) fn is_closed(&self) -> bool {
         self.cancel.is_cancelled()
     }
+
+    fn stop_if_retired_and_idle(&self) {
+        if self.retiring.is_cancelled() && lock(&self.peers).is_empty() {
+            // The split stream owns a session lease. Stopping both tasks
+            // releases that lease, breaking the session -> cached mux ->
+            // writer/reader -> session lifetime cycle after retirement.
+            self.cancel.cancel();
+        }
+    }
     /// Open an association, minting its own wire source tuple.
     ///
     /// The source address in an outbound frame is echoed back by the endpoint
@@ -162,7 +192,7 @@ impl Mux {
     /// only the port carries the per-association identity.
     pub(crate) fn associate(self: &Arc<Self>) -> io::Result<UdpAssociation> {
         let mut peers = lock(&self.peers);
-        if self.is_closed() {
+        if self.is_closed() || self.retiring.is_cancelled() {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         if peers.len() >= 128 {
@@ -208,6 +238,9 @@ impl UdpAssociation {
         self.source
     }
     pub async fn send_to(&self, payload: &[u8], destination: SocketAddr) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         if payload.len() > MAX_SEND_PAYLOAD {
             // Drop it, do not fail the write. `handle_udp` evicts the NAT
             // entry on *any* `write_packet` error, so reporting this one
@@ -229,9 +262,6 @@ impl UdpAssociation {
                 );
             }
             return Ok(payload.len());
-        }
-        if self.cancel.is_cancelled() {
-            return Err(io::ErrorKind::BrokenPipe.into());
         }
         // Reserve a bounded queue slot before allocating/copying a frame.
         // Concurrent callers waiting for capacity retain no packet copy.
@@ -263,6 +293,7 @@ impl UdpAssociation {
     pub fn close(&self) {
         self.cancel.cancel();
         lock(&self.mux.peers).remove(&self.source);
+        self.mux.stop_if_retired_and_idle();
     }
 }
 impl Drop for UdpAssociation {

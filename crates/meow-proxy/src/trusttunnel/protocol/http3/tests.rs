@@ -61,6 +61,9 @@ struct Behaviour {
     stream_limit: Option<u64>,
     /// Negotiate this ALPN instead of `h3`.
     alpn: Option<&'static [u8]>,
+    bind: Option<SocketAddr>,
+    goaway: bool,
+    first_packet_delay: Option<Duration>,
 }
 
 struct Endpoint {
@@ -103,7 +106,13 @@ impl Drop for Endpoint {
 }
 
 async fn endpoint(behaviour: Behaviour) -> Endpoint {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind(
+        behaviour
+            .bind
+            .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+    )
+    .await
+    .unwrap();
     let addr = socket.local_addr().unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(AtomicUsize::new(0));
@@ -243,6 +252,9 @@ impl Peer {
                     if !fin {
                         streams.insert(id, ServerStream::new(authority == "_udp2"));
                     }
+                    if behaviour.goaway && authority == "drain.test:443" {
+                        http3.send_goaway(conn, id + 4).expect("send GOAWAY");
+                    }
                 }
                 Ok((id, h3::Event::Data)) => loop {
                     match http3.recv_body(conn, id, body) {
@@ -339,6 +351,9 @@ async fn serve(
             result = socket.recv_from(&mut incoming) => {
                 let Ok((n, from)) = result else { continue };
                 if let Entry::Vacant(slot) = peers.entry(from) {
+                    if let Some(delay) = behaviour.first_packet_delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     let Ok(header) =
                         quiche::Header::from_slice(&mut incoming[..n], quiche::MAX_CONN_ID_LEN)
                     else {
@@ -614,4 +629,258 @@ async fn reset_closes_live_streams_and_the_next_dial_redials() {
     );
     let _new = client.tcp("example.test:80").await.unwrap();
     assert_eq!(endpoint.connections(), 2);
+}
+
+#[tokio::test]
+async fn retirement_h3_goaway_keeps_live_flows_and_moves_new_dials() {
+    let endpoint = endpoint(Behaviour {
+        goaway: true,
+        ..Behaviour::default()
+    })
+    .await;
+    let client = connect(&endpoint, options());
+    let association = client.udp().await.unwrap();
+    let retired = Arc::downgrade(&crate::trusttunnel::protocol::lock(&client.0.sessions)[0]);
+    let mut old = client.tcp("drain.test:443").await.unwrap();
+    old.write_all(b"before").await.unwrap();
+    let mut bytes = [0; 6];
+    old.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"before");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("received GOAWAY did not stop pool admission");
+    let mut new = client
+        .tcp("after.test:443")
+        .await
+        .expect("GOAWAY must not fail the next dial");
+    new.write_all(b"new").await.unwrap();
+    let mut fresh = [0; 3];
+    new.read_exact(&mut fresh).await.unwrap();
+    assert_eq!(&fresh, b"new");
+    assert_eq!(endpoint.connections(), 2);
+    assert_eq!(endpoint.captures("after.test:443").len(), 1);
+    old.write_all(b"after!").await.unwrap();
+    old.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"after!");
+    let target = "192.0.2.1:53".parse().unwrap();
+    association.send_to(b"udp", target).await.unwrap();
+    let mut packet = [0; 8];
+    let (n, from) =
+        tokio::time::timeout(Duration::from_secs(1), association.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(from, target);
+    assert_eq!(&packet[..n], b"udp");
+    drop(association);
+    drop(old);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("GOAWAY session retained its idle UDP mux");
+    let _reused = client.tcp("reuse.test:443").await.unwrap();
+    assert_eq!(
+        endpoint.connections(),
+        2,
+        "retired state must not poison the new connection"
+    );
+}
+
+static FALLBACK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+struct FixtureResolver(Vec<std::net::IpAddr>);
+#[async_trait::async_trait]
+impl meow_common::HostResolver for FixtureResolver {
+    async fn resolve(&self, _: &str) -> io::Result<std::net::IpAddr> {
+        Ok(self.0[0])
+    }
+    async fn resolve_all(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        Ok(self.0.clone())
+    }
+}
+struct ResolverGuard(Option<Arc<dyn meow_common::HostResolver>>);
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            meow_common::set_host_resolver(previous);
+        } else {
+            meow_common::clear_host_resolver();
+        }
+    }
+}
+fn fixture_resolver(ips: &[&str]) -> ResolverGuard {
+    let previous = meow_common::host_resolver();
+    meow_common::set_host_resolver(Arc::new(FixtureResolver(
+        ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+    )));
+    ResolverGuard(previous)
+}
+fn fallback_client(port: u16, timeout: Duration) -> Client {
+    let mut opts = options();
+    opts.timeout = timeout;
+    Client::new(
+        Arc::new(QuicConnector::new("fallback.fixture", port, "localhost", true, timeout).unwrap()),
+        opts,
+    )
+    .unwrap()
+}
+async fn fallback_echo(client: &Client, endpoint: &Endpoint) {
+    let mut stream = client.tcp("target.test:443").await.unwrap();
+    stream.write_all(b"winner").await.unwrap();
+    let mut bytes = [0; 6];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"winner");
+    assert_eq!(
+        endpoint.captures("target.test:443").len(),
+        1,
+        "only the winning connection may send CONNECT"
+    );
+}
+
+#[tokio::test]
+async fn retirement_h3_failed_handshake_falls_back_without_cancelling_the_winner() {
+    let _lock = FALLBACK_TEST_LOCK.lock().await;
+    let bad = endpoint(Behaviour {
+        bind: Some("127.0.0.2:0".parse().unwrap()),
+        alpn: Some(b"http/1.1"),
+        ..Behaviour::default()
+    })
+    .await;
+    let healthy = endpoint(Behaviour {
+        bind: Some(SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            bad.addr.port(),
+        )),
+        ..Behaviour::default()
+    })
+    .await;
+    let _resolver = fixture_resolver(&["127.0.0.2", "127.0.0.1"]);
+    fallback_echo(
+        &fallback_client(bad.addr.port(), Duration::from_secs(3)),
+        &healthy,
+    )
+    .await;
+    assert!(bad.captured.lock().unwrap().is_empty());
+}
+
+/// Sequential address selection retains the one outer dial deadline. A
+/// silent first peer is a dial-policy limitation, not permission to invent
+/// a shorter per-address deadline or start speculative attempts.
+#[tokio::test]
+async fn retirement_h3_silent_first_address_keeps_the_outer_deadline() {
+    let _lock = FALLBACK_TEST_LOCK.lock().await;
+    let blackhole = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let port = blackhole.local_addr().unwrap().port();
+    let healthy = endpoint(Behaviour {
+        bind: Some(SocketAddr::new("127.0.0.1".parse().unwrap(), port)),
+        ..Behaviour::default()
+    })
+    .await;
+    let _resolver = fixture_resolver(&["127.0.0.2", "127.0.0.1"]);
+    let client = fallback_client(port, Duration::from_millis(400));
+    let started = tokio::time::Instant::now();
+    let error = client.tcp("target.test:443").await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(
+        healthy.connections(),
+        0,
+        "sequential selection unexpectedly raced another address"
+    );
+    let mut packet = [0; 2048];
+    assert!(blackhole.try_recv_from(&mut packet).is_ok());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while blackhole.try_recv_from(&mut packet).is_ok() {}
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), blackhole.recv_from(&mut packet))
+            .await
+            .is_err(),
+        "deadline left the handshake driver sending packets"
+    );
+}
+
+/// Four candidates must not divide a 3-second handshake deadline into four
+/// 750ms deadlines: the healthy primary below answers at 1.2 seconds. This
+/// regression failed the earlier experimental address scheduler.
+#[tokio::test]
+async fn retirement_h3_slow_primary_preserves_the_full_deadline() {
+    let _lock = FALLBACK_TEST_LOCK.lock().await;
+    let healthy = endpoint(Behaviour {
+        bind: Some("127.0.0.2:0".parse().unwrap()),
+        first_packet_delay: Some(Duration::from_millis(1200)),
+        ..Behaviour::default()
+    })
+    .await;
+    let port = healthy.addr.port();
+    let blackhole = UdpSocket::bind(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+        .await
+        .unwrap();
+    let _third = endpoint(Behaviour {
+        bind: Some(SocketAddr::new("127.0.0.3".parse().unwrap(), port)),
+        alpn: Some(b"http/1.1"),
+        ..Behaviour::default()
+    })
+    .await;
+    let _fourth = endpoint(Behaviour {
+        bind: Some(SocketAddr::new("127.0.0.4".parse().unwrap(), port)),
+        alpn: Some(b"http/1.1"),
+        ..Behaviour::default()
+    })
+    .await;
+    let _resolver = fixture_resolver(&["127.0.0.2", "127.0.0.1", "127.0.0.3", "127.0.0.4"]);
+    fallback_echo(&fallback_client(port, Duration::from_secs(3)), &healthy).await;
+    let mut packet = [0; 2048];
+    assert!(
+        blackhole.try_recv_from(&mut packet).is_err(),
+        "a healthy primary should not start alternate handshakes"
+    );
+}
+
+#[tokio::test]
+async fn retirement_h3_cancelled_second_attempt_stops_and_allows_retry() {
+    let _lock = FALLBACK_TEST_LOCK.lock().await;
+    let bad = endpoint(Behaviour {
+        bind: Some("127.0.0.2:0".parse().unwrap()),
+        alpn: Some(b"http/1.1"),
+        ..Behaviour::default()
+    })
+    .await;
+    let port = bad.addr.port();
+    let blackhole = UdpSocket::bind(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+        .await
+        .unwrap();
+    let _resolver = fixture_resolver(&["127.0.0.2", "127.0.0.1"]);
+    let client = fallback_client(port, Duration::from_secs(3));
+    let dialing = client.clone();
+    let task = tokio::spawn(async move { dialing.tcp("cancelled.test:443").await });
+    let mut packet = [0; 2048];
+    tokio::time::timeout(Duration::from_secs(1), blackhole.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.err().unwrap().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while blackhole.try_recv_from(&mut packet).is_ok() {}
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), blackhole.recv_from(&mut packet))
+            .await
+            .is_err(),
+        "cancelled address attempt kept sending packets"
+    );
+    assert_eq!(client.session_count(), 0);
+    drop(blackhole);
+    let healthy = endpoint(Behaviour {
+        bind: Some(SocketAddr::new("127.0.0.1".parse().unwrap(), port)),
+        ..Behaviour::default()
+    })
+    .await;
+    fallback_echo(&client, &healthy).await;
+    assert!(bad.captured.lock().unwrap().is_empty());
 }

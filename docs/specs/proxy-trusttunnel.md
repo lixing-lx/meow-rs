@@ -125,6 +125,14 @@ transient fetch failures retain existing offline-bootstrap behavior.
   below covers a request that reached the peer, not one that never left.
 - No application request or payload is automatically replayed. Authentication
   failure retires its session. Reset invalidates in-flight pool creation.
+- Retirement also stops new UDP associations. Existing associations and TCP
+  streams may drain; when the last UDP association closes, the retired mux
+  stops its reader/writer tasks and releases its session lease. A mux that
+  was already idle is stopped by the retirement notification. This breaks
+  the cached-mux lifetime cycle without requiring a network reset or closing
+  unrelated TCP streams. A closed UDP association reports `BrokenPipe` even
+  for an oversized payload; the oversized-drop policy applies to live flows.
+
 - A CONNECT that never receives its response headers retires the connection it
   was sent on. A connection whose peer has silently gone away (an expired NAT
   entry, a slept laptop, a half-open peer) reports nothing: admission is
@@ -255,6 +263,19 @@ differs.
 - The QUIC idle timeout is the spec's `2 × (connection_timeout +
   health_check_timeout)`; this client uses the one configured `timeout` for
   both, so the idle timeout is `4 × timeout`.
+- HTTP/3 GOAWAY permanently stops admission on that connection. Subsequent
+  stream-credit publication cannot make it reusable; the pool retires it
+  before its next capacity decision and opens a fresh connection. Established
+  TCP and UDP streams can still complete on the retiring connection.
+- Endpoint addresses remain sequential and in resolver order. Each attempt
+  has its own child cancellation token: a failed handshake cannot cancel
+  later candidates, and caller cancellation stops the current attempt.
+  The winner retains the session token's cancellation ancestry. The existing
+  one outer CONNECT deadline is unchanged; there is no per-address deadline
+  slicing or speculative parallel dial. A silent first address can still
+  exhaust that total deadline before later addresses are tried. Address
+  racing and blackhole fallback are separate future dial-policy work.
+
 - All traffic rides HTTP/3 streams. QUIC DATAGRAM is *not* enabled: the
   protocol carries UDP on `_udp2` streams, so advertising the extension
   would be a capability nothing uses — and one browsers do not send.

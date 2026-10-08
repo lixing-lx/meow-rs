@@ -75,6 +75,8 @@ pub(super) struct Shared {
     /// The peer's remaining bidirectional stream credit.
     pub(super) credit: AtomicUsize,
     pub(super) closed: AtomicBool,
+    /// Sticky admission state: stream credit cannot undo a GOAWAY.
+    pub(super) accepting: AtomicBool,
 }
 
 struct WriteChunk {
@@ -179,6 +181,7 @@ pub(super) async fn spawn(
         ceiling: AtomicUsize::new(usize::MAX),
         credit: AtomicUsize::new(usize::MAX),
         closed: AtomicBool::new(false),
+        accepting: AtomicBool::new(true),
     });
     let state = State {
         socket,
@@ -199,6 +202,7 @@ pub(super) async fn spawn(
             () = run(state, conn, ready_tx) => {}
         }
         driving.closed.store(true, Ordering::Relaxed);
+        driving.accepting.store(false, Ordering::Release);
         canceled.cancel();
     });
     match ready_rx.await {
@@ -374,6 +378,7 @@ fn poll_events(
                 // No new request may be sent after a GOAWAY. Established
                 // streams keep running; the pool stops electing this
                 // connection as soon as it sees no credit.
+                st.shared.accepting.store(false, Ordering::Release);
                 st.shared.credit.store(0, Ordering::Relaxed);
                 st.shared.ceiling.store(0, Ordering::Relaxed);
                 for open in st.queued.drain(..) {
@@ -674,6 +679,11 @@ fn cleanup(st: &mut State, conn: &mut quiche::Connection) {
 
 /// Publish what the pool reads between dials.
 fn publish(st: &mut State, conn: &quiche::Connection) {
+    if !st.shared.accepting.load(Ordering::Acquire) {
+        st.shared.credit.store(0, Ordering::Relaxed);
+        st.shared.ceiling.store(0, Ordering::Relaxed);
+        return;
+    }
     let credit = usize::try_from(conn.peer_streams_left_bidi()).unwrap_or(usize::MAX);
     let queued = st.queued.len();
     // Opens still waiting for credit have no stream of their own yet, so

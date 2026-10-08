@@ -60,6 +60,11 @@ pub trait Connection: Send + Sync {
     /// Reserve room for exactly one more CONNECT stream, before any byte of
     /// the request is written.
     async fn admit(&self) -> Admission;
+    /// Whether this connection still accepts new streams, independently of
+    /// its remaining capacity. A GOAWAY retires admission, not live streams.
+    fn is_reusable(&self) -> bool {
+        true
+    }
     /// The peer's advertised concurrent-stream ceiling, or `usize::MAX`
     /// while it is unknown. Transports whose refusal is observable up front
     /// report it through [`Admission::Full`] instead and keep this at the
@@ -192,11 +197,18 @@ struct Session {
     link: Box<dyn Connection>,
     cancel: CancellationToken,
     reusable: AtomicBool,
+    /// Stop creating UDP associations and release the cached mux once its
+    /// last association closes, without cancelling established TCP flows.
+    retiring: CancellationToken,
     active: AtomicUsize,
     udp: AsyncMutex<Option<Arc<udp::Mux>>>,
 }
 
 impl Session {
+    fn retire(&self) {
+        self.reusable.store(false, Ordering::Release);
+        self.retiring.cancel();
+    }
     /// How many streams this connection may carry: our own configured
     /// ceiling, capped by the peer's.
     fn ceiling(&self, options: &Options) -> usize {
@@ -264,7 +276,7 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if let Some(session) = self.0.take() {
-            session.reusable.store(false, Ordering::Release);
+            session.retire();
         }
     }
 }
@@ -352,7 +364,11 @@ impl Client {
     pub fn session_count(&self) -> usize {
         lock(&self.0.sessions)
             .iter()
-            .filter(|s| !s.cancel.is_cancelled() && s.reusable.load(Ordering::Acquire))
+            .filter(|s| {
+                !s.cancel.is_cancelled()
+                    && s.reusable.load(Ordering::Acquire)
+                    && s.link.is_reusable()
+            })
             .count()
     }
 
@@ -364,7 +380,13 @@ impl Client {
     fn existing(&self, avoid: Option<&Arc<Session>>) -> io::Result<Option<Lease>> {
         let mut pool = lock(&self.0.sessions);
         pool.retain(|session| {
-            !session.cancel.is_cancelled() && session.reusable.load(Ordering::Acquire)
+            let reusable = !session.cancel.is_cancelled()
+                && session.reusable.load(Ordering::Acquire)
+                && session.link.is_reusable();
+            if !reusable {
+                session.retire();
+            }
+            reusable
         });
         // Measured over the whole pool, not the filtered candidates: a
         // skipped or full session still occupies a connection slot.
@@ -427,6 +449,7 @@ impl Client {
             link,
             cancel,
             reusable: AtomicBool::new(true),
+            retiring: CancellationToken::new(),
             active: AtomicUsize::new(1),
             udp: AsyncMutex::new(None),
         });
@@ -480,7 +503,7 @@ impl Client {
         let admission = lease.0.link.admit().await;
         inflight.disarm();
         if matches!(admission, Admission::Closed) {
-            lease.0.reusable.store(false, Ordering::Release);
+            lease.0.retire();
         }
         admission
     }
@@ -617,7 +640,7 @@ impl Client {
                 match Self::admit(&lease).await {
                     Admission::Granted(opener) => {
                         let stream = self.open(opener, lease, "_udp2").await?;
-                        let mux = udp::Mux::new(stream, &session.cancel);
+                        let mux = udp::Mux::new(stream, &session.cancel, &session.retiring);
                         *slot = Some(Arc::clone(&mux));
                         return mux.associate();
                     }

@@ -918,3 +918,151 @@ fn an_unsendable_platform_token_is_refused() {
     let error = client(mock, options).err().unwrap();
     assert!(error.to_string().contains("platform"), "{error}");
 }
+
+async fn retirement_echo(client: &Client) {
+    let mut stream = client.tcp("fresh.test:443").await.unwrap();
+    retirement_tcp_echo(&mut stream).await;
+}
+
+async fn retirement_tcp_echo(stream: &mut super::TunnelStream) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        stream.write_all(b"alive").await.unwrap();
+        let mut bytes = [0; 5];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"alive");
+    })
+    .await
+    .expect("established TCP stream stopped during retirement");
+}
+
+async fn retirement_udp_echo(association: &super::UdpAssociation) {
+    let target = "192.0.2.1:53".parse().unwrap();
+    association.send_to(b"alive", target).await.unwrap();
+    let mut bytes = [0; 16];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(1), association.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(from, target);
+    assert_eq!(&bytes[..n], b"alive");
+}
+
+fn retirement_options() -> Options {
+    let mut options = Options::new("fixture".into(), "secret".into());
+    options.max_connections = 1;
+    options.timeout = Duration::from_millis(400);
+    options
+}
+
+#[tokio::test]
+async fn retirement_releases_udp_mux_after_last_association() {
+    let mock = Arc::new(Mock::default());
+    let client = client(Arc::clone(&mock), retirement_options()).unwrap();
+    let association = client.udp().await.unwrap();
+    retirement_udp_echo(&association).await;
+    let retired = Arc::downgrade(&super::lock(&client.0.sessions)[0]);
+    assert_eq!(
+        client.tcp("silent.test:443").await.err().unwrap().kind(),
+        io::ErrorKind::TimedOut
+    );
+    retirement_echo(&client).await;
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
+    retirement_udp_echo(&association).await;
+    drop(association);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retired UDP session required reset to release its last lease");
+}
+
+#[tokio::test]
+async fn retirement_releases_an_already_idle_udp_mux() {
+    let mock = Arc::new(Mock::default());
+    let client = client(Arc::clone(&mock), retirement_options()).unwrap();
+    let association = client.udp().await.unwrap();
+    retirement_udp_echo(&association).await;
+    drop(association);
+    let retired = Arc::downgrade(&super::lock(&client.0.sessions)[0]);
+    assert_eq!(
+        client.tcp("silent.test:443").await.err().unwrap().kind(),
+        io::ErrorKind::TimedOut
+    );
+    retirement_echo(&client).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle cached UDP mux kept the retired session alive");
+}
+
+#[tokio::test]
+async fn retirement_preserves_other_associations_and_tcp_until_they_close() {
+    let mock = Arc::new(Mock::default());
+    let client = client(Arc::clone(&mock), retirement_options()).unwrap();
+    let first = client.udp().await.unwrap();
+    let second = client.udp().await.unwrap();
+    let mut tcp = client.tcp("held.test:443").await.unwrap();
+    let retired = Arc::downgrade(&super::lock(&client.0.sessions)[0]);
+    let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
+    let mux = Arc::clone(session.udp.lock().await.as_ref().unwrap());
+    drop(session);
+    assert_eq!(
+        client.tcp("silent.test:443").await.err().unwrap().kind(),
+        io::ErrorKind::TimedOut
+    );
+    retirement_echo(&client).await;
+    assert!(
+        mux.associate().is_err(),
+        "retired mux accepted a new association"
+    );
+    drop(first);
+    retirement_udp_echo(&second).await;
+    retirement_tcp_echo(&mut tcp).await;
+    second.close();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !mux.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last association did not stop the retired UDP tasks");
+    retirement_tcp_echo(&mut tcp).await;
+    drop(tcp);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TCP completed but the retired session stayed alive");
+}
+
+#[tokio::test]
+async fn retirement_closed_udp_rejects_oversized_packets() {
+    let (client, _) = setup(false, false);
+    let association = client.udp().await.unwrap();
+    let target = "192.0.2.1:53".parse().unwrap();
+    let jumbo = vec![0; 65_435];
+    assert_eq!(
+        association.send_to(&jumbo, target).await.unwrap(),
+        jumbo.len()
+    );
+    retirement_udp_echo(&association).await;
+    association.close();
+    for payload in [&b"closed"[..], &jumbo[..]] {
+        assert_eq!(
+            association
+                .send_to(payload, target)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+}
