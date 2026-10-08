@@ -145,6 +145,9 @@ transient fetch failures retain existing offline-bootstrap behavior.
   being cancelled: a CONNECT can also go unanswered because the *target* is
   slow, and the streams already running on that connection are not the
   dial's business. An answered refusal (any status) keeps the connection.
+  On H3, an open admitted on stale stream credit can stay queued on a
+  saturated connection until the deadline and retire that connection too,
+  preserving its established streams at the cost of a later handshake.
 - New-connection dials are serialised: one `creating` lock covers the whole
   dial, TLS/H2 or QUIC/H3 handshake and optional `_check`, so concurrent
   dials that each need a *new* connection complete at 1×…N× handshake

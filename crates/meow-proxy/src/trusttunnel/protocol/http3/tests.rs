@@ -743,6 +743,10 @@ async fn fallback_echo(client: &Client, endpoint: &Endpoint) {
     );
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires 127.0.0.2-4 loopback aliases on lo0"
+)]
 #[tokio::test]
 async fn retirement_h3_failed_handshake_falls_back_without_cancelling_the_winner() {
     let _lock = FALLBACK_TEST_LOCK.lock().await;
@@ -772,6 +776,10 @@ async fn retirement_h3_failed_handshake_falls_back_without_cancelling_the_winner
 /// Sequential address selection retains the one outer dial deadline. A
 /// silent first peer is a dial-policy limitation, not permission to invent
 /// a shorter per-address deadline or start speculative attempts.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires 127.0.0.2-4 loopback aliases on lo0"
+)]
 #[tokio::test]
 async fn retirement_h3_silent_first_address_keeps_the_outer_deadline() {
     let _lock = FALLBACK_TEST_LOCK.lock().await;
@@ -808,6 +816,10 @@ async fn retirement_h3_silent_first_address_keeps_the_outer_deadline() {
 /// Four candidates must not divide a 3-second handshake deadline into four
 /// 750ms deadlines: the healthy primary below answers at 1.2 seconds. This
 /// regression failed the earlier experimental address scheduler.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires 127.0.0.2-4 loopback aliases on lo0"
+)]
 #[tokio::test]
 async fn retirement_h3_slow_primary_preserves_the_full_deadline() {
     let _lock = FALLBACK_TEST_LOCK.lock().await;
@@ -842,6 +854,10 @@ async fn retirement_h3_slow_primary_preserves_the_full_deadline() {
     );
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires 127.0.0.2-4 loopback aliases on lo0"
+)]
 #[tokio::test]
 async fn retirement_h3_cancelled_second_attempt_stops_and_allows_retry() {
     let _lock = FALLBACK_TEST_LOCK.lock().await;
