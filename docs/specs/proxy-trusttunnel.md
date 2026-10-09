@@ -89,6 +89,16 @@ bound, to a permanently dead placeholder
 every dial fails naming the node and the reason. Runtime rebuilds and
 provider payloads apply the same rule.
 
+The placeholder advertises UDP support even though its UDP dial always
+fails. The rule engine skips a UDP target that lacks UDP support, and an
+exhausted scan dials DIRECT, so a placeholder that declined UDP would let a
+flow's UDP/QUIC leave in the clear while the same flow's TCP failed closed.
+Groups that pick by liveness already route around it, since it is dead from
+birth. `load-balance` is the one pre-existing exception: it filters picks on
+liveness for every member type, so a load-balance group with no live
+UDP-capable member is skipped for UDP, exactly as it is when its members are
+ordinary down nodes.
+
 The damage is deliberately scoped to the node rather than the enclosing
 `proxies:` block or provider payload. Rejecting the payload closes the same
 hole, but it also fires for a protocol the running binary simply does not
@@ -224,7 +234,8 @@ accordingly.
   of what a protocol designed to look like ordinary HTTPS wants. Operators
   who need to match a specific client set both fields.
 - Both are validated at config load against the header-value grammar
-  (`app-name` may contain spaces, `platform` may not), bounded at 64 bytes.
+  (`app-name` may contain inner spaces but cannot start or end with one,
+  `platform` may contain none), bounded at 64 bytes.
 
 `headers` declares extra request headers, applied to every CONNECT. Values
 may carry `<random-string(N)>` or `<random-string(MIN-MAX)>` placeholders,
@@ -252,6 +263,12 @@ Two further name rules, both enforced at config load:
 - A name declared twice (in any case — header names are case-insensitive) is
   refused rather than sent twice.
 
+A value that could render with a leading or trailing space or tab is refused
+as well: RFC 9110 §5.5 excludes that whitespace from a field value, and
+RFC 9113 §8.2.1 has the receiver treat it as malformed. The check covers
+every rendering, so a literal edge behind a placeholder whose minimum is zero
+(`abc <random-string(0-8)>`) is refused too.
+
 ## HTTP/3 transport
 
 `quic: true` selects HTTP/3 over QUIC (§3.2) instead of HTTP/2 over TLS. The
@@ -263,6 +280,10 @@ differs.
   re-checked on the established connection before HTTP/3 is created. The
   request is a CONNECT field section with `:method` and `:authority` and no
   `:scheme` or `:path` (RFC 9114 §4.4).
+- An IP-literal server name — the `sni` default when `server` is an
+  address — is handled as on HTTP/2: it is not sent as SNI (RFC 6066 §3),
+  and the leaf is verified against its `iPAddress` SAN instead of being
+  compared as a DNS name.
 - The QUIC idle timeout is the spec's `2 × (connection_timeout +
   health_check_timeout)`; this client uses the one configured `timeout` for
   both, so the idle timeout is `4 × timeout`.

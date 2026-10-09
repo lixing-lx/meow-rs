@@ -11,6 +11,7 @@
 
 use super::QuicConnector;
 use crate::trusttunnel::protocol::{Client, ExtraHeaders, Options};
+use meow_transport::tls::TlsConfig;
 use quiche::h3::{self, NameValue as _};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -36,6 +37,8 @@ const HEADER: usize = 36;
 struct Capture {
     authority: String,
     headers: Vec<(String, String)>,
+    /// The SNI of the connection the request arrived on.
+    server_name: Option<String>,
 }
 
 impl Capture {
@@ -64,10 +67,15 @@ struct Behaviour {
     bind: Option<SocketAddr>,
     goaway: bool,
     first_packet_delay: Option<Duration>,
+    /// Present a certificate naming only `127.0.0.1` (an `iPAddress` SAN)
+    /// instead of `localhost`.
+    ip_san: bool,
 }
 
 struct Endpoint {
     addr: SocketAddr,
+    /// The endpoint's self-signed leaf (DER), for a client that trusts it.
+    cert: Vec<u8>,
     captured: Arc<Mutex<Vec<Capture>>>,
     connections: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
@@ -114,16 +122,25 @@ async fn endpoint(behaviour: Behaviour) -> Endpoint {
     .await
     .unwrap();
     let addr = socket.local_addr().unwrap();
+    let name = if behaviour.ip_san {
+        "127.0.0.1"
+    } else {
+        "localhost"
+    };
+    let key = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+    let cert = key.cert.der().to_vec();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(AtomicUsize::new(0));
     let task = tokio::spawn(serve(
         socket,
         behaviour,
+        (cert.clone(), key.key_pair.serialize_der()),
         Arc::clone(&captured),
         Arc::clone(&connections),
     ));
     Endpoint {
         addr,
+        cert,
         captured,
         connections,
         task,
@@ -137,15 +154,24 @@ fn options() -> Options {
     options
 }
 
-/// A client whose pooled connections are QUIC connections to `endpoint`. The
-/// certificate is self-signed, hence `skip-cert-verify`; the server name is
-/// still sent, and still what quiche would verify against.
+/// The certificate is self-signed, hence `skip-cert-verify`; the server name
+/// is still sent, and still what quiche would verify against.
+fn insecure_tls() -> TlsConfig {
+    let mut tls = TlsConfig::new("localhost");
+    tls.skip_cert_verify = true;
+    tls
+}
+
+/// A client whose pooled connections are QUIC connections to `endpoint`.
 fn connect(endpoint: &Endpoint, options: Options) -> Client {
+    connect_with(endpoint, options, &insecure_tls())
+}
+
+fn connect_with(endpoint: &Endpoint, options: Options, tls: &TlsConfig) -> Client {
     let connector = QuicConnector::new(
         &endpoint.addr.ip().to_string(),
         endpoint.addr.port(),
-        "localhost",
-        true,
+        tls,
         options.timeout,
     )
     .unwrap();
@@ -231,6 +257,7 @@ impl Peer {
                     assert_eq!(text(&list, b":method"), "CONNECT");
                     let authority = text(&list, b":authority");
                     captured.lock().unwrap().push(Capture {
+                        server_name: conn.server_name().map(str::to_owned),
                         authority: authority.clone(),
                         headers: list
                             .iter()
@@ -305,15 +332,12 @@ fn text(list: &[h3::Header], name: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-fn server_config(behaviour: Behaviour) -> quiche::Config {
-    let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+fn server_config(behaviour: Behaviour, (cert, key): &(Vec<u8>, Vec<u8>)) -> quiche::Config {
     let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
-    ssl.set_certificate(&boring::x509::X509::from_der(key.cert.der()).unwrap())
+    ssl.set_certificate(&boring::x509::X509::from_der(cert).unwrap())
         .unwrap();
-    ssl.set_private_key(
-        &boring::pkey::PKey::private_key_from_der(&key.key_pair.serialize_der()).unwrap(),
-    )
-    .unwrap();
+    ssl.set_private_key(&boring::pkey::PKey::private_key_from_der(key).unwrap())
+        .unwrap();
     let mut config =
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
     config
@@ -332,11 +356,12 @@ fn server_config(behaviour: Behaviour) -> quiche::Config {
 async fn serve(
     socket: UdpSocket,
     behaviour: Behaviour,
+    identity: (Vec<u8>, Vec<u8>),
     captured: Arc<Mutex<Vec<Capture>>>,
     connections: Arc<AtomicUsize>,
 ) {
     let local = socket.local_addr().unwrap();
-    let mut config = server_config(behaviour);
+    let mut config = server_config(behaviour, &identity);
     let h3_config = h3::Config::new().unwrap();
     // Keyed on the client's address: every connection this client dials owns
     // its own socket, so one entry per connection — which is what lets the
@@ -464,6 +489,48 @@ async fn connect_requests_carry_the_credential_user_agent_and_extra_headers() {
     assert_eq!(endpoint.connections(), 1);
 }
 
+/// `server: 127.0.0.1` with no `sni:` — the parser defaults the name to the
+/// literal. The HTTP/2 transport's `TlsLayer` sends no SNI for it (RFC 6066
+/// §3) and verifies the leaf's `iPAddress` SAN; this transport must accept
+/// the same certificate the same way, rather than sending the address as SNI
+/// and comparing it as a DNS name. The HTTP/2 half of the pair is
+/// `an_ip_literal_server_verifies_against_its_ip_san` in
+/// `tests/trusttunnel_integration.rs`.
+#[tokio::test]
+async fn an_ip_literal_server_verifies_against_its_ip_san() {
+    let endpoint = endpoint(Behaviour {
+        ip_san: true,
+        ..Behaviour::default()
+    })
+    .await;
+    let mut tls = TlsConfig::new(endpoint.addr.ip().to_string());
+    tls.additional_roots.push(endpoint.cert.clone());
+    let client = connect_with(&endpoint, options(), &tls);
+    let _tunnel = client
+        .tcp("example.test:443")
+        .await
+        .expect("an iPAddress SAN must satisfy an IP-literal server name");
+    assert_eq!(
+        endpoint.capture("example.test:443").server_name,
+        None,
+        "an IP literal must not be sent as SNI"
+    );
+
+    // Verification is still on: the same name without the trusted root
+    // fails, and so does a trusted leaf for a different address — the SAN
+    // is checked, not merely the chain.
+    let untrusted = connect_with(
+        &endpoint,
+        options(),
+        &TlsConfig::new(endpoint.addr.ip().to_string()),
+    );
+    assert!(untrusted.tcp("example.test:443").await.is_err());
+    let mut other = TlsConfig::new("127.0.0.2");
+    other.additional_roots.push(endpoint.cert.clone());
+    let mismatched = connect_with(&endpoint, options(), &other);
+    assert!(mismatched.tcp("example.test:443").await.is_err());
+}
+
 #[tokio::test]
 async fn refused_credentials_report_an_authentication_failure() {
     let endpoint = endpoint(Behaviour {
@@ -586,8 +653,7 @@ async fn a_dial_abandoned_mid_handshake_leaves_no_driver_behind() {
     let connector = QuicConnector::new(
         &addr.ip().to_string(),
         addr.port(),
-        "localhost",
-        true,
+        &insecure_tls(),
         options.timeout,
     )
     .unwrap();
@@ -725,7 +791,7 @@ fn fallback_client(port: u16, timeout: Duration) -> Client {
     let mut opts = options();
     opts.timeout = timeout;
     Client::new(
-        Arc::new(QuicConnector::new("fallback.fixture", port, "localhost", true, timeout).unwrap()),
+        Arc::new(QuicConnector::new("fallback.fixture", port, &insecure_tls(), timeout).unwrap()),
         opts,
     )
     .unwrap()

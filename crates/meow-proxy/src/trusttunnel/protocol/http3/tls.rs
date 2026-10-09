@@ -6,7 +6,7 @@
 //! library, and the same Mozilla root bundle the `TlsLayer` uses.
 
 use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
-use std::{io, time::Duration};
+use std::{io, net::IpAddr, time::Duration};
 
 /// The only protocol this transport may negotiate (PROTOCOL.md §3.2).
 pub(super) const ALPN_H3: &[u8] = b"h3";
@@ -24,9 +24,19 @@ const PEER_STREAMS: u64 = 16;
 
 /// Build the client QUIC config for one TrustTunnel endpoint.
 ///
-/// `idle` is the QUIC idle timeout; see [`super::QuicConnector`] for how the
-/// spec's `2 × (connection_timeout + health_check_timeout)` is derived.
-pub(super) fn build(insecure: bool, idle: Duration) -> io::Result<quiche::Config> {
+/// `ip` is set when the endpoint is named by an IP literal: the connector
+/// then gives quiche no server name, and the certificate is checked against
+/// that address's `iPAddress` SAN here instead. `extra_roots` are DER
+/// certificates trusted beside the webpki bundle, as `TlsConfig`'s
+/// `additional_roots` are on the HTTP/2 path. `idle` is the QUIC idle
+/// timeout; see [`super::QuicConnector`] for how the spec's
+/// `2 × (connection_timeout + health_check_timeout)` is derived.
+pub(super) fn build(
+    insecure: bool,
+    ip: Option<IpAddr>,
+    extra_roots: &[Vec<u8>],
+    idle: Duration,
+) -> io::Result<quiche::Config> {
     let mut ssl = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io::Error::other(format!("TrustTunnel BoringSSL context: {e}")))?;
     if insecure {
@@ -36,16 +46,31 @@ pub(super) fn build(insecure: bool, idle: Duration) -> io::Result<quiche::Config
         // explicitly or every chain fails.
         let mut store = boring::x509::store::X509StoreBuilder::new()
             .map_err(|e| io::Error::other(format!("TrustTunnel X509StoreBuilder: {e}")))?;
-        for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-            let parsed = boring::x509::X509::from_der(cert.as_ref())
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(extra_roots.iter().map(Vec::as_slice));
+        for cert in roots {
+            let parsed = boring::x509::X509::from_der(cert)
                 .map_err(|e| io::Error::other(format!("TrustTunnel root cert: {e}")))?;
             store
                 .add_cert(parsed)
                 .map_err(|e| io::Error::other(format!("TrustTunnel root store: {e}")))?;
         }
+        // For a DNS name, quiche installs the server name as the verify-param
+        // hostname per connection, so `PEER` covers the chain *and* the name.
+        // An IP literal is never handed to quiche (it would be compared as a
+        // DNS name and never match an `iPAddress` SAN), so it is pinned on
+        // this connector's own store instead: every chain verification
+        // inherits the store's param, and the per-connection param, which
+        // carries no address, cannot clear it.
+        if let Some(ip) = ip {
+            store
+                .verify_param_mut()
+                .set_ip(ip)
+                .map_err(|e| io::Error::other(format!("TrustTunnel verify address: {e}")))?;
+        }
         ssl.set_cert_store_builder(store);
-        // quiche installs the server name as the verify-param hostname per
-        // connection, so this covers the chain *and* the hostname.
         ssl.set_verify(SslVerifyMode::PEER);
     }
 

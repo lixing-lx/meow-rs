@@ -35,7 +35,10 @@ pub struct QuicConnector {
     port: u16,
     /// SNI, and the name the certificate is verified against: quiche binds
     /// the two together, which is why `name-cert-verify` is refused here.
-    server_name: String,
+    /// `None` for an IP literal, which RFC 6066 §3 keeps out of SNI and
+    /// which is verified against an `iPAddress` SAN instead (see
+    /// [`tls::build`]) — the same split the HTTP/2 path's `TlsLayer` makes.
+    server_name: Option<String>,
     /// Built once, as the H2 path builds its `TlsLayer` once at config load:
     /// seeding the verify store parses the whole webpki root bundle (~140 DER
     /// certificates) into a fresh `X509Store`, which is not work a dial
@@ -45,6 +48,11 @@ pub struct QuicConnector {
 }
 
 impl QuicConnector {
+    /// `tls` is the same policy the HTTP/2 path hands its `TlsLayer`; of it,
+    /// this transport reads the server name (`sni`, else `host`), the
+    /// `skip-cert-verify` switch and the extra roots. The parser refuses the
+    /// fields quiche cannot honor for a `quic` node.
+    ///
     /// `timeout` is the per-dial deadline the pool enforces; the spec derives
     /// the QUIC idle timeout from it as
     /// `2 × (connection_timeout + health_check_timeout)` (§3.2), and this
@@ -52,15 +60,25 @@ impl QuicConnector {
     pub fn new(
         host: &str,
         port: u16,
-        server_name: &str,
-        insecure: bool,
+        tls: &meow_transport::tls::TlsConfig,
         timeout: Duration,
     ) -> io::Result<Self> {
+        let name = tls.sni.as_deref().unwrap_or(host);
+        // `server: 1.2.3.4` defaults `sni` to the literal. Handed to quiche
+        // as a server name it would go out as SNI and be compared as a DNS
+        // name, failing a certificate the HTTP/2 transport accepts.
+        let ip = meow_common::metadata_ip_literal(name);
+        let config = tls::build(
+            tls.skip_cert_verify,
+            ip,
+            &tls.additional_roots,
+            timeout.saturating_mul(4),
+        )?;
         Ok(Self {
             host: host.to_owned(),
             port,
-            server_name: server_name.to_owned(),
-            config: std::sync::Mutex::new(tls::build(insecure, timeout.saturating_mul(4))?),
+            server_name: ip.is_none().then(|| name.to_owned()),
+            config: std::sync::Mutex::new(config),
         })
     }
 
@@ -86,7 +104,7 @@ impl QuicConnector {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             quiche::connect(
-                Some(&self.server_name),
+                self.server_name.as_deref(),
                 &quiche::ConnectionId::from_ref(&scid),
                 local,
                 peer,

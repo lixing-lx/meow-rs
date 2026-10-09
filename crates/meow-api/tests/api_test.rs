@@ -4963,6 +4963,62 @@ async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecti
     assert!(!error.contains("test-only"), "{error}");
 }
 
+/// An unavailable TrustTunnel node must fail a UDP flow closed through rule
+/// resolution, not only at `dial_udp`. The rule engine skips a UDP target
+/// that does not support UDP, and an exhausted scan dials DIRECT — so a
+/// placeholder that declined UDP sent the flow's UDP/QUIC out in the clear
+/// while the same flow's TCP failed closed: directly under `MATCH`, and
+/// through a group with nothing live to prefer over the node.
+#[tokio::test]
+async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution() {
+    // Unavailable on every build: without `--features trusttunnel` the
+    // protocol is missing, and with it `fingerprint` is a TLS policy the
+    // parser refuses.
+    let node = "{name: TT, type: trusttunnel, server: vpn.example.test, port: 443, \
+                username: fixture, password: test-only, udp: true, fingerprint: '00'}";
+    for (groups, target) in [
+        ("", "TT"),
+        (
+            "proxy-groups:\n  - {name: G, type: select, proxies: [TT]}\n",
+            "G",
+        ),
+        (
+            "proxy-groups:\n  - {name: G, type: fallback, proxies: [TT]}\n",
+            "G",
+        ),
+        (
+            "proxy-groups:\n  - {name: G, type: url-test, proxies: [TT]}\n",
+            "G",
+        ),
+    ] {
+        let yaml =
+            format!("mode: rule\nproxies:\n  - {node}\n{groups}rules:\n  - MATCH,{target}\n");
+        let state = test_state(meow_config::parse_raw_yaml(&yaml).unwrap());
+        let metadata = meow_common::Metadata {
+            host: "example.test".into(),
+            dst_port: 443,
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        let ResolvedTarget {
+            adapter, rule_name, ..
+        } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+        assert_eq!(
+            rule_name, "MATCH",
+            "{target}: the UDP flow was skipped past the unavailable node"
+        );
+        assert_eq!(adapter.name(), target);
+        let error = adapter
+            .dial_udp(&metadata)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{target}: the UDP dial must fail closed"))
+            .to_string();
+        assert!(error.contains("TT"), "{target}: {error}");
+        assert!(!error.contains("test-only"), "{target}: {error}");
+    }
+}
+
 /// PUT /configs commits must publish the rebuilt rule-provider map into the
 /// live registry — previously only the DNS reconcile path wrote the
 /// registry, so this PUT left `GET /providers/rules` and

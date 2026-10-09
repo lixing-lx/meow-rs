@@ -35,6 +35,9 @@ const MAX_TOKEN_BYTES: usize = 64;
 const OPEN: &str = "<random-string(";
 const CLOSE: &str = ")>";
 
+/// SP and HTAB: the only whitespace the field-value grammar admits.
+const WHITESPACE: [char; 2] = [' ', '\t'];
+
 /// Header names this adapter owns. Letting a config overwrite them would
 /// either break authentication or put the credential somewhere it was never
 /// meant to go; `user-agent` is deliberately *not* here, because overriding
@@ -133,6 +136,16 @@ impl Template {
         if parts.is_empty() {
             return Err("header value is empty".into());
         }
+        // RFC 9110 §5.5 excludes leading and trailing whitespace from a field
+        // value, and RFC 9113 §8.2.1 has the receiver treat a value that
+        // starts or ends with SP/HTAB as malformed: the stream is reset, and
+        // the dial counts against a node that is fine.
+        if can_render_edge_whitespace(parts.iter(), |text| text.starts_with(WHITESPACE)) {
+            return Err("header value cannot start with a space or tab".into());
+        }
+        if can_render_edge_whitespace(parts.iter().rev(), |text| text.ends_with(WHITESPACE)) {
+            return Err("header value cannot end with a space or tab".into());
+        }
         if widest > MAX_VALUE_BYTES {
             return Err(format!(
                 "header value can render {widest} bytes (max {MAX_VALUE_BYTES})"
@@ -207,8 +220,26 @@ fn parse_range(body: &str) -> Result<(usize, usize), String> {
     Ok((min, max))
 }
 
+/// Whether some rendering of `parts`, walked inward from one edge, puts
+/// whitespace at that edge. A random run never renders whitespace — the
+/// alphabet has none — so it settles the question, unless its minimum is zero:
+/// then it can render empty and expose the part behind it.
+fn can_render_edge_whitespace<'a>(
+    mut parts: impl Iterator<Item = &'a Part>,
+    at_edge: impl Fn(&str) -> bool,
+) -> bool {
+    parts
+        .find_map(|part| match part {
+            Part::Literal(text) => Some(at_edge(text)),
+            Part::Random { min: 0, .. } => None,
+            Part::Random { .. } => Some(false),
+        })
+        .unwrap_or(false)
+}
+
 /// The `http` crate's header-value grammar: visible ASCII, plus space and
-/// horizontal tab. Checked here so [`Template::render`] cannot fail.
+/// horizontal tab. Checked here so [`Template::render`] cannot fail; the
+/// placement of that whitespace is [`Template::parse`]'s concern.
 fn validate_literal(text: &str) -> Result<(), String> {
     match text
         .bytes()
@@ -312,7 +343,9 @@ pub fn default_platform() -> &'static str {
 ///
 /// `platform` is the first whitespace-delimited field of every user-agent, so
 /// a space inside it would make the endpoint read the next field as the
-/// application name. `app_name` is last and may contain spaces.
+/// application name. `app_name` is last and may contain spaces, but not at
+/// either end: a trailing one would end the whole `user-agent` value in
+/// whitespace, which RFC 9113 §8.2.1 makes malformed.
 pub fn validate_token(label: &str, token: &str, spaces: bool) -> Result<(), String> {
     if token.is_empty() {
         return Err(format!("{label} is empty"));
@@ -324,8 +357,11 @@ pub fn validate_token(label: &str, token: &str, spaces: bool) -> Result<(), Stri
         ));
     }
     validate_literal(token).map_err(|e| format!("{label}: {e}"))?;
-    if !spaces && token.bytes().any(|byte| matches!(byte, b' ' | b'\t')) {
+    if !spaces && token.contains(WHITESPACE) {
         return Err(format!("{label} cannot contain whitespace"));
+    }
+    if token.starts_with(WHITESPACE) || token.ends_with(WHITESPACE) {
+        return Err(format!("{label} cannot start or end with whitespace"));
     }
     Ok(())
 }
@@ -520,5 +556,57 @@ mod tests {
         assert!(validate_token("app-name", "", true).is_err());
         assert!(validate_token("app-name", &"x".repeat(65), true).is_err());
         assert!(validate_token("app-name", "bad\nname", true).is_err());
+        assert!(validate_token("platform", "\tios", false).is_err());
+    }
+
+    /// RFC 9113 §8.2.1: a value that starts or ends with SP/HTAB is malformed,
+    /// so the endpoint would reset the CONNECT. `app-name` ends the
+    /// `user-agent`, so its edges are the value's edge.
+    #[test]
+    fn app_name_whitespace_is_inner_only() {
+        for padded in ["AdGuard ", " AdGuard", "AdGuard\t", "\tAdGuard"] {
+            let error = validate_token("app-name", padded, true).unwrap_err();
+            assert!(
+                error.contains("cannot start or end with whitespace"),
+                "{padded:?} -> {error}"
+            );
+        }
+        assert!(validate_token("app-name", "Ad\tGuard VPN", true).is_ok());
+    }
+
+    #[test]
+    fn header_values_cannot_render_edge_whitespace() {
+        for (raw, edge) in [
+            (" abc", "start"),
+            ("\tabc", "start"),
+            ("abc ", "end"),
+            ("abc\t", "end"),
+            (" ", "start"),
+            // A placeholder that may render empty exposes its literal
+            // neighbour — and two of them in a row expose the next one.
+            ("<random-string(0-4)> abc", "start"),
+            ("abc <random-string(0-4)>", "end"),
+            ("<random-string(0-2)><random-string(0-2)>\tabc", "start"),
+        ] {
+            let error = Template::parse(raw).unwrap_err();
+            assert!(
+                error.contains(&format!("cannot {edge} with a space or tab")),
+                "{raw:?} -> {error}"
+            );
+        }
+        // Inner whitespace is fine, and so is an edge literal shielded by a
+        // run that always renders at least one character.
+        for raw in [
+            "a b",
+            "a\tb",
+            "abc <random-string(1-4)>",
+            "<random-string(2)> abc",
+            "<random-string(0-4)>",
+        ] {
+            let template = Template::parse(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            let rendered = template.render();
+            assert!(!rendered.starts_with(WHITESPACE), "{rendered:?}");
+            assert!(!rendered.ends_with(WHITESPACE), "{rendered:?}");
+        }
     }
 }

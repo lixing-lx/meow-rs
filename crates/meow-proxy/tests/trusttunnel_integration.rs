@@ -38,8 +38,14 @@ impl Drop for Endpoint {
 
 impl Endpoint {
     async fn start(h2_alpn: bool) -> Self {
+        Self::start_for(h2_alpn, "localhost").await
+    }
+
+    /// `name` is the certificate's only SAN: a DNS name, or an IP literal,
+    /// which rcgen encodes as an `iPAddress` SAN.
+    async fn start_for(h2_alpn: bool, name: &str) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
         let cert = generated.cert.der().to_vec();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()),
@@ -225,6 +231,32 @@ async fn untrusted_root_and_wrong_certificate_name_fail() {
             .expect("must classify the actual certificate verification failure");
         assert_eq!(certificate.code(), expected);
     }
+}
+
+/// `server: 127.0.0.1` with no `sni:` — the parser defaults the TLS name to
+/// the literal, which `TlsLayer` keeps out of SNI (RFC 6066 §3) and verifies
+/// against the leaf's `iPAddress` SAN. The HTTP/3 transport must accept the
+/// same certificate; its half of the pair is the same-named test in
+/// `src/trusttunnel/protocol/http3/tests.rs`.
+#[tokio::test]
+async fn an_ip_literal_server_verifies_against_its_ip_san() {
+    let endpoint = Endpoint::start_for(true, "127.0.0.1").await;
+    let proxy = endpoint.adapter(
+        endpoint.tls(true, "127.0.0.1"),
+        "secret",
+        Arc::new(DirectDialer),
+    );
+    proxy
+        .dial_tcp(&destination())
+        .await
+        .expect("an iPAddress SAN must satisfy an IP-literal server name");
+    // The SAN is checked, not merely the chain.
+    let mismatched = endpoint.adapter(
+        endpoint.tls(true, "127.0.0.2"),
+        "secret",
+        Arc::new(DirectDialer),
+    );
+    assert!(mismatched.dial_tcp(&destination()).await.is_err());
 }
 
 #[tokio::test]

@@ -51,6 +51,21 @@ async fn assert_unavailable(proxy: &std::sync::Arc<dyn meow_common::Proxy>) {
         .to_string();
     assert!(error.contains(proxy.name()), "{error}");
     assert!(!error.contains("test-only"), "{error}");
+    // UDP included: a target without UDP support is *skipped* by the rule
+    // engine, which then falls through to a later rule or DIRECT. So the
+    // placeholder advertises UDP and refuses the association instead.
+    assert!(
+        proxy.support_udp(),
+        "a placeholder that declines UDP lets the rule engine skip it to DIRECT"
+    );
+    let error = proxy
+        .dial_udp(&meow_common::Metadata::default())
+        .await
+        .err()
+        .expect("a placeholder must fail the UDP dial too")
+        .to_string();
+    assert!(error.contains(proxy.name()), "{error}");
+    assert!(!error.contains("test-only"), "{error}");
 }
 
 #[cfg(feature = "trusttunnel")]
@@ -79,6 +94,25 @@ fn malformed_user_agent_and_header_fields_name_the_defect() {
     for (extra, needle) in [
         ("platform: \"i os\"\n", "platform cannot contain whitespace"),
         ("app-name: \"\"\n", "app-name is empty"),
+        // A field value that starts or ends with SP/HTAB is malformed
+        // (RFC 9113 §8.2.1); `app-name` ends the `user-agent` value.
+        (
+            "app-name: \"AdGuard \"\n",
+            "app-name cannot start or end with whitespace",
+        ),
+        (
+            "headers:\n  X-Pad: \" abc\"\n",
+            "cannot start with a space or tab",
+        ),
+        (
+            "headers:\n  X-Pad: \"abc\\t\"\n",
+            "cannot end with a space or tab",
+        ),
+        // A placeholder that can render empty exposes its neighbour's edge.
+        (
+            "headers:\n  X-Pad: \"abc <random-string(0-8)>\"\n",
+            "cannot end with a space or tab",
+        ),
         ("headers: [one, two]\n", "headers must be a map"),
         ("headers:\n  X-Pad: 7\n", "header 'X-Pad' must be a string"),
         (

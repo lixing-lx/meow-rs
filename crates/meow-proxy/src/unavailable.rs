@@ -17,8 +17,15 @@
 //! already uses for a malformed `dialer-proxy` (`MALFORMED_DIALER_PREFIX`):
 //! the name stays bound, every dial fails loudly naming the node and the
 //! reason, and health reports dead so `url-test` / `fallback` route around it
-//! the same way they route around any down node. No dial can ever leak past
-//! it, and one bad entry costs exactly that entry.
+//! the same way they route around any down node. A rule, or a group with
+//! nothing live to prefer over it, that resolves to it fails the dial — TCP
+//! and UDP alike — instead of skipping past it, and one bad entry costs
+//! exactly that entry.
+//!
+//! One pre-existing exception is not this type's to close: `load-balance`
+//! filters its picks on liveness for every member type, so a load-balance
+//! group with no live UDP-capable member declines UDP and the rule scan moves
+//! on — exactly as it does when every member is an ordinary down node.
 
 use async_trait::async_trait;
 use meow_common::{
@@ -80,11 +87,22 @@ impl ProxyAdapter for UnavailableAdapter {
         ""
     }
 
-    /// Never advertise UDP: `dial_udp` cannot succeed, and an honest `false`
-    /// lets a group's UDP member selection skip this entry instead of
-    /// picking it and failing the association (issue #700's rule).
+    /// Always advertise UDP, even though `dial_udp` can never succeed — the
+    /// one deliberate exception to issue #700's "only advertise what
+    /// `dial_udp` implements" rule.
+    ///
+    /// The rule engine treats a UDP target without UDP support as absent: it
+    /// skips the rule and keeps scanning, and an exhausted scan dials DIRECT
+    /// (mihomo's `!SupportUDP()` continue). An honest `false` here would turn
+    /// this placeholder into exactly the hole it exists to close — the TCP
+    /// dial fails closed while the same flow's UDP/QUIC leaves in the clear.
+    /// Advertising UDP keeps the rule, and its `dial_udp` refuses the
+    /// association. The groups that pick by liveness (`url-test`,
+    /// `fallback`, `load-balance`) already route around this entry, because
+    /// it is dead from birth, so the advertisement never wins a live
+    /// sibling's slot.
     fn support_udp(&self) -> bool {
-        false
+        true
     }
 
     async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -125,7 +143,9 @@ mod tests {
         let adapter = fixture();
         assert_eq!(adapter.name(), "vpn-tokyo");
         assert!(!adapter.health().alive());
-        assert!(!adapter.support_udp());
+        // Advertised so the rule engine keeps the match and fails the UDP
+        // dial, instead of skipping past the node to DIRECT.
+        assert!(adapter.support_udp());
         // The declared type, not `Reject`: a node that failed to parse must
         // not read as an intentional reject in the API listing, in match
         // statistics, or in the group dial-failure exemptions.

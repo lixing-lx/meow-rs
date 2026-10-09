@@ -131,8 +131,7 @@ impl TrustTunnelAdapter {
             Transport::H3 => Arc::new(protocol::QuicConnector::new(
                 server,
                 port,
-                tls.sni.as_deref().unwrap_or(server),
-                tls.skip_cert_verify,
+                &tls,
                 options.timeout,
             )?) as Arc<dyn protocol::Connector>,
         };
