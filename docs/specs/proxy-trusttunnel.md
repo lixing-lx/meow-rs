@@ -142,6 +142,10 @@ transient fetch failures retain existing offline-bootstrap behavior.
   the cached-mux lifetime cycle without requiring a network reset or closing
   unrelated TCP streams. A closed UDP association reports `BrokenPipe` even
   for an oversized payload; the oversized-drop policy applies to live flows.
+  A UDP dial whose elected connection is retired before it associates —
+  by a concurrent dial's unanswered CONNECT — counts that as a refused
+  admission and takes the one retry, rather than surfacing the retired
+  mux's `BrokenPipe`.
 
 - A CONNECT that never receives its response headers retires the connection it
   was sent on. A connection whose peer has silently gone away (an expired NAT

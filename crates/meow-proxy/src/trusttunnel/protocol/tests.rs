@@ -1042,6 +1042,45 @@ async fn retirement_preserves_other_associations_and_tcp_until_they_close() {
     .expect("TCP completed but the retired session stayed alive");
 }
 
+/// `existing()` elects only reusable sessions, but a concurrent dial's
+/// `InFlight` can retire the elected one before `udp()` takes its mux slot.
+/// The cached mux is then still open — a live association holds it — yet
+/// refuses new ones, and the link underneath may still admit, so neither
+/// check notices. The dial must take the same single retry a refused
+/// admission gets instead of surfacing the mux's `BrokenPipe`.
+#[tokio::test]
+async fn retirement_between_election_and_mux_reuse_retries_the_dial() {
+    let mock = Arc::new(Mock::default());
+    let client = client(Arc::clone(&mock), retirement_options()).unwrap();
+    let held = client.udp().await.unwrap();
+    let session = Arc::clone(&super::lock(&client.0.sessions)[0]);
+    // Park the next dial between election and the slot.
+    let slot = session.udp.lock().await;
+    let leased = session.active.load(Ordering::Acquire);
+    let dial = tokio::spawn({
+        let client = client.clone();
+        async move { client.udp().await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while session.active.load(Ordering::Acquire) == leased {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the dial never elected the pooled session");
+    // What the concurrent dial's dropped `InFlight` does.
+    session.retire();
+    drop(slot);
+    let association = tokio::time::timeout(Duration::from_secs(3), dial)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a retirement between election and reuse must cost the retry, not the dial");
+    assert_eq!(mock.connections.load(Ordering::SeqCst), 2);
+    retirement_udp_echo(&association).await;
+    retirement_udp_echo(&held).await;
+}
+
 #[tokio::test]
 async fn retirement_closed_udp_rejects_oversized_packets() {
     let (client, _) = setup(false, false);

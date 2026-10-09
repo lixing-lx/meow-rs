@@ -634,27 +634,37 @@ impl Client {
                 let lease = self.session(declined.as_ref()).await?;
                 let session = Arc::clone(&lease.0);
                 let mut slot = session.udp.lock().await;
-                if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
+                // `existing()` elected a reusable session, but a concurrent
+                // dial's `InFlight` can retire it at any await from there on.
+                // Retirement is pool-side only — the link may still admit —
+                // so neither `admit` nor the cached mux's `is_closed()`
+                // notices, and `associate()` would refuse with `BrokenPipe`.
+                // A retired session is a refusal, and earns the same retry.
+                let admission = if session.retiring.is_cancelled() {
+                    Admission::Closed
+                } else if let Some(mux) = slot.as_ref().filter(|m| !m.is_closed()) {
                     return mux.associate();
-                }
-                match Self::admit(&lease).await {
+                } else {
+                    Self::admit(&lease).await
+                };
+                refusal = match admission {
                     Admission::Granted(opener) => {
                         let stream = self.open(opener, lease, "_udp2").await?;
-                        let mux = udp::Mux::new(stream, &session.cancel, &session.retiring);
-                        *slot = Some(Arc::clone(&mux));
-                        return mux.associate();
-                    }
-                    other => {
-                        refusal = other;
-                        drop(slot);
-                        drop(lease);
-                        if attempt == 0 {
-                            declined = Some(session);
-                            continue;
+                        if !session.retiring.is_cancelled() {
+                            let mux = udp::Mux::new(stream, &session.cancel, &session.retiring);
+                            *slot = Some(Arc::clone(&mux));
+                            return mux.associate();
                         }
-                        break;
+                        Admission::Closed
                     }
+                    other => other,
+                };
+                drop(slot);
+                if attempt == 0 {
+                    declined = Some(session);
+                    continue;
                 }
+                break;
             }
             Err(Self::refused(&refusal))
         })
